@@ -161,6 +161,38 @@ echo "=== Static exports SELinux ==="
     sed -i 's/^static struct security_operations selinux_ops/struct security_operations selinux_ops/' security/selinux/hooks.c
 }
 
+# ==================== 4b. FIX MODULE_IMPORT_NS POUR 4.19 ====================
+echo ""
+echo "=== Fix MODULE_IMPORT_NS (noyaux < 5.0) ==="
+python3 - <<'PYEOF'
+import re, os
+
+files = [
+    'drivers/kernelsu/core/init.c',
+    'drivers/kernelsu/ksu.c',
+    'drivers/kernelsu/ksu_main.c',
+]
+for path in files:
+    if not os.path.exists(path):
+        continue
+    with open(path) as f:
+        c = f.read()
+    if 'MODULE_IMPORT_NS' not in c:
+        continue
+    if 'LINUX_VERSION_CODE >= KERNEL_VERSION(5,0,0)' in c and 'MODULE_IMPORT_NS' in c:
+        # déjà patché
+        continue
+    # Enveloppe chaque MODULE_IMPORT_NS dans #if LINUX_VERSION_CODE
+    c = re.sub(
+        r'^(\s*)(MODULE_IMPORT_NS\([^)]*\);)',
+        r'\1#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,0,0)\n\1\2\n\1#endif',
+        c, flags=re.M
+    )
+    with open(path, 'w') as f:
+        f.write(c)
+    print(f"  ✅ {path} : MODULE_IMPORT_NS protégé")
+PYEOF
+
 # ==================== 3h. FIX O_CLOEXEC ====================
 echo ""
 echo "=== Fix O_CLOEXEC dans TOUS les fichiers (détection Manager) ==="
