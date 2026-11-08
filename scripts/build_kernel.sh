@@ -33,6 +33,74 @@ mkdir -p "$GITHUB_WORKSPACE/output"
 AUDIT="$GITHUB_WORKSPACE/output/audit-${VER}.txt"
 : > "$AUDIT"
 
+# ---------- Résumé du build : écrit même si le script s'arrête n'importe où ----------
+summarize() {
+    local rc=$?
+    set +e
+    local BL="$GITHUB_WORKSPACE/kernel_sources/build.log"
+    local SUM="$GITHUB_WORKSPACE/output/build-summary.txt"
+    {
+        echo "=== RÉSUMÉ DU BUILD (code de sortie $rc) ==="
+        if [ -f "$BL" ]; then
+            python3 - "$BL" <<'SUMEOF'
+import re, sys
+from collections import Counter, OrderedDict
+txt = open(sys.argv[1], encoding='utf-8', errors='replace').read().split('\n')
+err = re.compile(r'^(?:\.\./)*(\S+?):(\d+):(\d+): (?:fatal )?error: (.*)$')
+per_file, per_msg, first_msg, first_loc = Counter(), Counter(), OrderedDict(), {}
+undefined, targets, total = Counter(), [], 0
+for l in txt:
+    m = err.match(l.strip())
+    if m:
+        f, ln, col, msg = m.groups()
+        total += 1
+        per_file[f] += 1
+        key = re.sub(r"\s*\[-W[^\]]*\]", "", msg)[:110]
+        per_msg[key] += 1
+        first_loc.setdefault(key, f"{f}:{ln}")
+        first_msg.setdefault(f, f"{ln}: {key}")
+        continue
+    u = re.search(r'undefined (?:symbol|reference to)[: ]+[`\']?([^\s\'`]+)', l)
+    if u:
+        undefined[u.group(1)] += 1
+    t = re.search(r'\*\*\* \[[^\]]*?:(\d+): ([^\]]+)\] Error', l)
+    if t and t.group(2) not in targets:
+        targets.append(t.group(2))
+print(f"erreurs : {total}   fichiers touchés : {len(per_file)}   messages distincts : {len(per_msg)}")
+print("\n-- Erreurs par fichier (haut de liste) --")
+for f, n in per_file.most_common(25):
+    print(f"{n:4d}  {f}")
+print("\n-- Types d'erreurs (compte, premier emplacement) --")
+for k, n in per_msg.most_common(25):
+    print(f"{n:4d}  {k}   [{first_loc[k]}]")
+print("\n-- Première erreur de chaque fichier --")
+for f, v in list(first_msg.items())[:40]:
+    print(f"{f}:{v}"[:170])
+if undefined:
+    print("\n-- Symboles non définis (édition de liens) --")
+    for k, n in undefined.most_common(30):
+        print(f"{n:4d}  {k}")
+if targets:
+    print("\n-- Cibles make en échec --")
+    for t in targets[:20]:
+        print("   " + t)
+SUMEOF
+        else
+            echo "pas de build.log : le script s'est arrêté AVANT la compilation du noyau"
+        fi
+        echo ""
+        echo "=== 20 DERNIÈRES LIGNES DE L'AUDIT ==="
+        tail -n 20 "$AUDIT" 2>/dev/null
+    } > "$SUM" 2>&1
+    cat "$SUM"
+    if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+        { echo '```'; cat "$SUM"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+    fi
+    [ -f "$BL" ] && gzip -c "$BL" > "$GITHUB_WORKSPACE/output/build.log.gz"
+    return $rc
+}
+trap summarize EXIT
+
 sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc 2>/dev/null || true
 sudo apt-get clean 2>/dev/null || true
 sudo sed -i 's/azure.archive.ubuntu.com/archive.ubuntu.com/g' /etc/apt/sources.list 2>/dev/null || true
@@ -183,6 +251,74 @@ if [ -n "$FILES_ANON_INODE" ]; then
     done
 fi
 
+
+# ==================== 4b. PORTAGE 4.19 DU DRIVER FinaSU (erreurs observées) ====================
+python3 - "$KSU_DIR" <<'PORTEOF' 2>&1 | tee -a "$AUDIT"
+import os, re, sys
+root = sys.argv[1]
+
+def find_matching(c, i, open_ch, close_ch):
+    depth = 0
+    for k in range(i, len(c)):
+        if c[k] == open_ch: depth += 1
+        elif c[k] == close_ch:
+            depth -= 1
+            if depth == 0: return k
+    return -1
+
+def wrap_function(c, name, cond):
+    """Entoure la DÉFINITION de la fonction `name` d'un #if."""
+    for m in re.finditer(r'\b' + re.escape(name) + r'\s*\(', c):
+        po = m.end() - 1
+        pc = find_matching(c, po, '(', ')')
+        if pc < 0: continue
+        j = pc + 1
+        while j < len(c) and c[j] in ' \t\r\n': j += 1
+        if j >= len(c) or c[j] != '{': continue          # appel ou prototype, pas une définition
+        end = find_matching(c, j, '{', '}')
+        if end < 0: continue
+        start = c.rfind('\n', 0, m.start()) + 1           # début de la ligne du nom
+        while start > 0:                                   # remonter jusqu'au début de la déclaration
+            prev = c.rfind('\n', 0, start - 1) + 1
+            line = c[prev:start - 1].strip()
+            if line == '' or line.endswith(';') or line.endswith('}') or line.startswith('#'):
+                break
+            start = prev
+        return c[:start] + f"#if {cond}\n" + c[start:end + 1] + "\n#endif\n" + c[end + 1:], True
+    return c, False
+
+def wrap_lines(c, pattern, cond):
+    out, n = [], 0
+    for line in c.split('\n'):
+        if re.search(pattern, line) and not line.lstrip().startswith(('#', '//')):
+            out.append(f"#if {cond}"); out.append(line); out.append("#endif"); n += 1
+        else:
+            out.append(line)
+    return '\n'.join(out), n
+
+total = 0
+for dp, dn, fn in os.walk(root):
+    for f in fn:
+        if not f.endswith(('.c', '.h')): continue
+        p = os.path.join(dp, f)
+        c = open(p, encoding='utf-8', errors='replace').read()
+        o = c
+        # MODULE_IMPORT_NS n'existe pas avant le 5.4
+        c = re.sub(r'^([ \t]*MODULE_IMPORT_NS\([^\n]*\);[ \t]*)$', r'#ifdef MODULE_IMPORT_NS\n\1\n#endif', c, flags=re.M)
+        if f == 'file_wrapper.c':
+            V51 = 'LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)'
+            V420 = 'LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)'
+            c, a = wrap_function(c, 'ksu_wrapper_iopoll', V51)
+            c, b = wrap_function(c, 'ksu_wrapper_remap_file_range', V420)
+            c, l1 = wrap_lines(c, r'\.iopoll\s*=', V51)
+            c, l2 = wrap_lines(c, r'\.remap_file_range\s*=', V420)
+            if '#include <linux/version.h>' not in c:
+                c = '#include <linux/version.h>\n' + c
+            print(f"  file_wrapper.c : iopoll/remap_file_range protégés (fonctions {int(a)}+{int(b)}, affectations {l1}+{l2})")
+        if c != o:
+            open(p, 'w', encoding='utf-8').write(c); total += 1
+print(f"  ✅ portage 4.19 : {total} fichier(s) modifié(s)")
+PORTEOF
 
 # ==================== 5. CONFIGURATION ====================
 echo ""
@@ -431,4 +567,3 @@ cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
 echo "=== BUILD TERMINÉ ${VER} (FinaSU $KSU_REF, Tracepoint, sans SuSFS) ==="
 ls -lh output/
-
