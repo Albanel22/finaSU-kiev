@@ -4,14 +4,6 @@ set -euo pipefail
 # =============================================================================
 # FinaSU (LyraVoid) en dur dans le noyau 4.19 — ÉTAPE A : FinaSU seul, hooks Tracepoint, SANS SuSFS
 # Motorola One 5G Ace (kiev) — LineageOS 23.2
-#
-# Objectif : voir si le driver FinaSU compile et démarre sur ce noyau 4.19 (compatibilité NON démontrée).
-# Réutilise : source du noyau épinglée, garde-fou clang, make -k + build-errors.txt, audits, ksud, repack.
-#
-# SIGNATURE DU MANAGER : le noyau vérifie l'APK du manager (taille + SHA-256 du certificat compilés).
-#   1) Place l'APK du manager FinaSU dans patches/manager.apk -> le script calcule les valeurs, OU
-#   2) FINASU_EXPECTED_SIZE=0x... FINASU_EXPECTED_HASH=<sha256> en variables d'environnement.
-#   Sans l'un ni l'autre, le noyau garde les valeurs « placeholder » : le manager ne sera pas reconnu.
 # =============================================================================
 
 FINASU_URL="${FINASU_URL:-https://github.com/LyraVoid/FinaSU.git}"
@@ -32,6 +24,74 @@ DTBO_GDRIVE_ID="11451aa0CCzyVtNTYOK2n6oH6E0PT-2NX"
 mkdir -p "$GITHUB_WORKSPACE/output"
 AUDIT="$GITHUB_WORKSPACE/output/audit-${VER}.txt"
 : > "$AUDIT"
+
+# ---------- Résumé du build : écrit même si le script s'arrête n'importe où ----------
+summarize() {
+    local rc=$?
+    set +e
+    local BL="$GITHUB_WORKSPACE/kernel_sources/build.log"
+    local SUM="$GITHUB_WORKSPACE/output/build-summary.txt"
+    {
+        echo "=== RÉSUMÉ DU BUILD (code de sortie $rc) ==="
+        if [ -f "$BL" ]; then
+            python3 - "$BL" <<'SUMEOF'
+import re, sys
+from collections import Counter, OrderedDict
+txt = open(sys.argv[1], encoding='utf-8', errors='replace').read().split('\n')
+err = re.compile(r'^(?:\.\./)*(\S+?):(\d+):(\d+): (?:fatal )?error: (.*)$')
+per_file, per_msg, first_msg, first_loc = Counter(), Counter(), OrderedDict(), {}
+undefined, targets, total = Counter(), [], 0
+for l in txt:
+    m = err.match(l.strip())
+    if m:
+        f, ln, col, msg = m.groups()
+        total += 1
+        per_file[f] += 1
+        key = re.sub(r"\s*\[-W[^\]]*\]", "", msg)[:110]
+        per_msg[key] += 1
+        first_loc.setdefault(key, f"{f}:{ln}")
+        first_msg.setdefault(f, f"{ln}: {key}")
+        continue
+    u = re.search(r'undefined (?:symbol|reference to)[: ]+[`\']?([^\s\'`]+)', l)
+    if u:
+        undefined[u.group(1)] += 1
+    t = re.search(r'\*\*\* \[[^\]]*?:(\d+): ([^\]]+)\] Error', l)
+    if t and t.group(2) not in targets:
+        targets.append(t.group(2))
+print(f"erreurs : {total}   fichiers touchés : {len(per_file)}   messages distincts : {len(per_msg)}")
+print("\n-- Erreurs par fichier (haut de liste) --")
+for f, n in per_file.most_common(25):
+    print(f"{n:4d}  {f}")
+print("\n-- Types d'erreurs (compte, premier emplacement) --")
+for k, n in per_msg.most_common(25):
+    print(f"{n:4d}  {k}   [{first_loc[k]}]")
+print("\n-- Première erreur de chaque fichier --")
+for f, v in list(first_msg.items())[:40]:
+    print(f"{f}:{v}"[:170])
+if undefined:
+    print("\n-- Symboles non définis (édition de liens) --")
+    for k, n in undefined.most_common(30):
+        print(f"{n:4d}  {k}")
+if targets:
+    print("\n-- Cibles make en échec --")
+    for t in targets[:20]:
+        print("   " + t)
+SUMEOF
+        else
+            echo "pas de build.log : le script s'est arrêté AVANT la compilation du noyau"
+        fi
+        echo ""
+        echo "=== 20 DERNIÈRES LIGNES DE L'AUDIT ==="
+        tail -n 20 "$AUDIT" 2>/dev/null
+    } > "$SUM" 2>&1
+    cat "$SUM"
+    if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+        { echo '```'; cat "$SUM"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+    fi
+    [ -f "$BL" ] && gzip -c "$BL" > "$GITHUB_WORKSPACE/output/build.log.gz"
+    return $rc
+}
+trap summarize EXIT
 
 sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc 2>/dev/null || true
 sudo apt-get clean 2>/dev/null || true
@@ -90,18 +150,16 @@ echo "✅ FinaSU intégré ($KSU_DIR -> $(readlink drivers/kernelsu || echo '?')
     true
 } 2>&1 | tee -a "$AUDIT"
 
-# ==================== 3. SIGNATURE DU MANAGER (taille + SHA-256 du certificat) ====================
+# ==================== 3. SIGNATURE DU MANAGER ====================
 MGR_APK="$GITHUB_WORKSPACE/patches/manager.apk"
 if [ -z "$FINASU_EXPECTED_SIZE" ] && [ -f "$MGR_APK" ]; then
     SIG_OUT=$(python3 - "$MGR_APK" <<'PYEOF' || true
 import hashlib, struct, sys
 data = open(sys.argv[1], 'rb').read()
 e = data.rfind(b'PK\x05\x06')
-if e < 0:
-    sys.exit(2)
+if e < 0: sys.exit(2)
 cd_off = struct.unpack_from('<I', data, e + 16)[0]
-if data[cd_off - 16:cd_off] != b'APK Sig Block 42':
-    sys.exit(3)
+if data[cd_off - 16:cd_off] != b'APK Sig Block 42': sys.exit(3)
 blk_size = struct.unpack_from('<Q', data, cd_off - 24)[0]
 pos = cd_off - blk_size - 8 + 8
 end = cd_off - 24
@@ -109,20 +167,15 @@ cert = None
 while pos < end and cert is None:
     pair_len = struct.unpack_from('<Q', data, pos)[0]
     pid = struct.unpack_from('<I', data, pos + 8)[0]
-    if pid in (0x7109871a, 0xf05368c0):          # schéma de signature v2 ou v3
-        p = pos + 12
-        p += 4                                   # longueur de la séquence des signataires
-        p += 4                                   # longueur du premier signataire
-        p += 4                                   # longueur des données signées
+    if pid in (0x7109871a, 0xf05368c0):
+        p = pos + 12 + 4 + 4 + 4
         dg_len = struct.unpack_from('<I', data, p)[0]
-        p += 4 + dg_len                          # on saute les digests
-        p += 4                                   # longueur de la séquence de certificats
+        p += 4 + dg_len + 4
         c_len = struct.unpack_from('<I', data, p)[0]
         p += 4
         cert = data[p:p + c_len]
     pos += 8 + pair_len
-if cert is None:
-    sys.exit(4)
+if cert is None: sys.exit(4)
 print("0x%x" % len(cert))
 print(hashlib.sha256(cert).hexdigest())
 PYEOF
@@ -131,7 +184,7 @@ PYEOF
         FINASU_EXPECTED_SIZE=$(echo "$SIG_OUT" | sed -n '1p')
         FINASU_EXPECTED_HASH=$(echo "$SIG_OUT" | sed -n '2p')
     else
-        echo "⚠️ signature de patches/manager.apk illisible (schéma v2/v3 absent ?)" | tee -a "$AUDIT"
+        echo "⚠️ signature de patches/manager.apk illisible" | tee -a "$AUDIT"
     fi
 fi
 SIG_ARGS=""
@@ -139,10 +192,10 @@ if [ -n "$FINASU_EXPECTED_SIZE" ] && [ -n "$FINASU_EXPECTED_HASH" ]; then
     SIG_ARGS="KSU_EXPECTED_SIZE=$FINASU_EXPECTED_SIZE KSU_EXPECTED_HASH=$FINASU_EXPECTED_HASH"
     echo "Signature du manager : taille $FINASU_EXPECTED_SIZE, sha256 $FINASU_EXPECTED_HASH" | tee -a "$AUDIT"
 else
-    echo "⚠️ AUCUNE signature de manager fournie : valeurs par défaut du noyau (manager non reconnu)" | tee -a "$AUDIT"
+    echo "⚠️ AUCUNE signature de manager fournie : valeurs par défaut du noyau" | tee -a "$AUDIT"
 fi
 
-# ==================== 4. COMPATIBILITÉ NOYAU (comme pour KernelSU-Next) ====================
+# ==================== 4. COMPATIBILITÉ NOYAU ====================
 # ==================== 3g. STATIC EXPORTS SELINUX ====================
 echo "=== Static exports SELinux ==="
 [ -f "security/selinux/selinuxfs.c" ] && {
@@ -160,95 +213,6 @@ echo "=== Static exports SELinux ==="
 [ -f "security/selinux/hooks.c" ] && {
     sed -i 's/^static struct security_operations selinux_ops/struct security_operations selinux_ops/' security/selinux/hooks.c
 }
-
-# ==================== 4b. FIX MODULE_IMPORT_NS POUR 4.19 ====================
-echo ""
-echo "=== Fix MODULE_IMPORT_NS (noyaux < 5.0) ==="
-python3 - <<'PYEOF'
-import re, os
-
-files = [
-    'drivers/kernelsu/core/init.c',
-    'drivers/kernelsu/ksu.c',
-    'drivers/kernelsu/ksu_main.c',
-]
-for path in files:
-    if not os.path.exists(path):
-        continue
-    with open(path) as f:
-        c = f.read()
-    if 'MODULE_IMPORT_NS' not in c:
-        continue
-    if 'LINUX_VERSION_CODE >= KERNEL_VERSION(5,0,0)' in c and 'MODULE_IMPORT_NS' in c:
-        # déjà patché
-        continue
-    # Enveloppe chaque MODULE_IMPORT_NS dans #if LINUX_VERSION_CODE
-    c = re.sub(
-        r'^(\s*)(MODULE_IMPORT_NS\([^)]*\);)',
-        r'\1#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,0,0)\n\1\2\n\1#endif',
-        c, flags=re.M
-    )
-    with open(path, 'w') as f:
-        f.write(c)
-    print(f"  ✅ {path} : MODULE_IMPORT_NS protégé")
-PYEOF
-
-# ==================== 4c. FIX FILE_WRAPPER.C (compatibilité 4.19) ====================
-echo ""
-echo "=== Fix file_wrapper.c (iopoll, remap_file_range) ==="
-python3 - <<'PYEOF'
-import re, os
-
-files = [
-    'drivers/kernelsu/infra/file_wrapper.c',
-    'drivers/kernelsu/file_wrapper.c',
-]
-for path in files:
-    if not os.path.exists(path):
-        continue
-    with open(path) as f:
-        c = f.read()
-    if 'FILE_WRAPPER_4_19_FIX' in c:
-        continue
-    
-    # 1. iopoll (noyau 5.1+)
-    c = c.replace(
-        'return orig->f_op->iopoll(kiocb, spin);',
-        '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n        return orig->f_op->iopoll(kiocb, spin);\n#else\n        return -EOPNOTSUPP;\n#endif'
-    )
-    c = c.replace(
-        'p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;',
-        '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n    p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;\n#endif'
-    )
-    
-    # 2. remap_file_range (noyau 4.20+)
-    c = c.replace(
-        'if (remap_flags & REMAP_FILE_DEDUP) {',
-        '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n    if (remap_flags & REMAP_FILE_DEDUP) {\n#else\n    if (0) {\n#endif'
-    )
-    c = c.replace(
-        'return orig->f_op->remap_file_range(file_in, pos_in, orig, pos_out, len, remap_flags);',
-        '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n        return orig->f_op->remap_file_range(file_in, pos_in, orig, pos_out, len, remap_flags);\n#else\n        return -EOPNOTSUPP;\n#endif'
-    )
-    c = c.replace(
-        'return orig->f_op->remap_file_range(orig, pos_in, file_out, pos_out, len, remap_flags);',
-        '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n        return orig->f_op->remap_file_range(orig, pos_in, file_out, pos_out, len, remap_flags);\n#else\n        return -EOPNOTSUPP;\n#endif'
-    )
-    c = c.replace(
-        'p->ops.remap_file_range = fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;',
-        '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n    p->ops.remap_file_range = fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;\n#endif'
-    )
-    
-    # 3. Supprimer les warnings "unused"
-    c = c.replace('struct file *orig = data->orig;', 'struct file *orig __maybe_unused = data->orig;')
-    
-    # Marqueur
-    c = '/* FILE_WRAPPER_4_19_FIX */\n' + c
-    
-    with open(path, 'w') as f:
-        f.write(c)
-    print(f"  ✅ {path} : corrigé (iopoll, remap_file_range)")
-PYEOF
 
 # ==================== 3h. FIX O_CLOEXEC ====================
 echo ""
@@ -269,107 +233,107 @@ if [ -n "$FILES_ANON_INODE" ]; then
         sed -i 's/O_RDWR|O_CLOEXEC/O_RDWR/g' "$f"
         sed -i 's/, O_CLOEXEC)/)/g' "$f"
         echo "  ✅ anon_inode_getfile nettoyé dans $f"
-    doPYEOF
+    done
+fi
 
-    # ==================== 4d. FIX SECCOMP_CACHE, SU_MOUNT_NS, PKG_OBSERVER, DYNAMIC_MANAGER ====================
+# ==================== 4b. PORTAGE 4.19 COMPLET DU DRIVER FinaSU ====================
 echo ""
-echo "=== Fix divers (seccomp_cache, su_mount_ns, pkg_observer, dynamic_manager) ==="
-python3 - <<'PYEOF'
-import re, os
+echo "=== Portage 4.19 complet de FinaSU (SELinux, macros, headers) ==="
+python3 - "$KSU_DIR" <<'PORTEOF' 2>&1 | tee -a "$AUDIT"
+import os, re, sys
+root = sys.argv[1]
 
-# 1. seccomp_cache.c : SECCOMP_ARCH_NATIVE_NR n'existe pas sur 4.19
-files = [
-    'drivers/kernelsu/infra/seccomp_cache.c',
-    'drivers/kernelsu/seccomp_cache.c',
-]
-for path in files:
-    if not os.path.exists(path):
-        continue
-    with open(path) as f:
-        c = f.read()
-    if 'SECCOMP_ARCH_NATIVE_NR' in c and '#ifndef SECCOMP_ARCH_NATIVE_NR' not in c:
-        # Ajoute les définitions après les includes
-        fallback = '''
-#ifndef SECCOMP_ARCH_NATIVE_NR
-#define SECCOMP_ARCH_NATIVE_NR NR_syscalls
-#endif
-#ifndef SECCOMP_ARCH_COMPAT_NR
-#define SECCOMP_ARCH_COMPAT_NR NR_syscalls
-#endif
+def find_matching(c, i, open_ch, close_ch):
+    depth = 0
+    for k in range(i, len(c)):
+        if c[k] == open_ch: depth += 1
+        elif c[k] == close_ch:
+            depth -= 1
+            if depth == 0: return k
+    return -1
+
+total = 0
+for dp, dn, fn in os.walk(root):
+    for f in fn:
+        if not f.endswith(('.c', '.h')): continue
+        p = os.path.join(dp, f)
+        c = open(p, encoding='utf-8', errors='replace').read()
+        o = c
+
+        # 1. MODULE_IMPORT_NS
+        c = re.sub(r'^([ \t]*MODULE_IMPORT_NS\([^\n]*\);[ \t]*)$', r'#ifdef MODULE_IMPORT_NS\n\1\n#endif', c, flags=re.M)
+
+        # 2. Header fix (compat)
+        if f == 'event.c' and 'sulog' in p:
+            c = c.replace('#include <linux/minmax.h>', '#include <linux/kernel.h>')
+        if f == 'su_mount_ns.c':
+            c = c.replace('#include <uapi/linux/mount.h>', '#include <linux/mount.h>')
+        if f in ('pkg_observer.c', 'dynamic_manager.c', 'allowlist.c', 'supercall.c', 'dispatch.c'):
+            if 'TWA_RESUME' in c and '#ifndef TWA_RESUME' not in c:
+                fb = '\n#ifndef TWA_RESUME\n#define TWA_RESUME 1\n#endif\n'
+                m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', c)
+                if m: c = c[:m.end()] + fb + c[m.end():]
+            if '#include <linux/sched/task.h>' not in c:
+                m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', c)
+                if m: c = c[:m.end()] + '#include <linux/sched/task.h>\n' + c[m.end():]
+            if f == 'dispatch.c':
+                if '#include <linux/sched/signal.h>' not in c:
+                    m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', c)
+                    if m: c = c[:m.end()] + '#include <linux/sched/signal.h>\n#include <linux/init_task.h>\n' + c[m.end():]
+            if f == 'pkg_observer.c':
+                c = c.replace('.handle_inode_event = ksu_handle_inode_event,', '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,9,0)\n\t.handle_inode_event = ksu_handle_inode_event,\n#endif')
+
+        # 3. seccomp_cache
+        if f == 'seccomp_cache.c':
+            if 'SECCOMP_ARCH_NATIVE_NR' in c and '#ifndef SECCOMP_ARCH_NATIVE_NR' not in c:
+                fb = '\n#ifndef SECCOMP_ARCH_NATIVE_NR\n#define SECCOMP_ARCH_NATIVE_NR NR_syscalls\n#endif\n#ifndef SECCOMP_ARCH_COMPAT_NR\n#define SECCOMP_ARCH_COMPAT_NR NR_syscalls\n#endif\n'
+                m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', c)
+                if m: c = c[:m.end()] + fb + c[m.end():]
+
+        # 4. app_profile
+        if f == 'app_profile.c':
+            c = c.replace('atomic_set(&current->seccomp.filter_count, 0);', '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,9,0)\n\tatomic_set(&current->seccomp.filter_count, 0);\n#endif')
+
+        # 5. file_wrapper (iopoll / remap)
+        if f == 'file_wrapper.c':
+            c = c.replace('return orig->f_op->iopoll(kiocb, spin);', '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,1,0)\n        return orig->f_op->iopoll(kiocb, spin);\n#else\n        return -EOPNOTSUPP;\n#endif')
+            c = c.replace('p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;', '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,1,0)\n    p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;\n#endif')
+
+        # 6. SELinux API Changes (rules.c)
+        if f == 'rules.c':
+            c = c.replace('selinux_state.policy', 'selinux_state.ss')
+            c = re.sub(r'struct selinux_policy', 'struct policydb', c)
+            c = c.replace('policy_mutex', 'policy_mutex_stub')
+            c = c.replace('return &selinux_state.ss;', 'return &rcu_dereference(selinux_state.ss)->policydb;')
+
+        # 7. SELinux API Changes (sepolicy.c)
+        if f == 'sepolicy.c':
+            c = re.sub(r'struct selinux_policy \*(\w+)', r'struct policydb *\1', c)
+            c = re.sub(r'(\w+)->policydb', r'\1', c)
+            c = re.sub(r'struct filename_trans_key', 'struct filename_trans', c)
+            c = re.sub(r'->stypes', '->ttypes', c)
+            c = c.replace('policydb_filenametr_search(db, &key)', 'hashtab_search(db->filename_trans, &key)')
+            c = c.replace('type_val_to_struct', 'type_val_to_struct_array')
+
+        # 8. selinux_hide.c (Trop complexe pour 4.19, on stub)
+        if f == 'selinux_hide.c':
+            if 'SELINUX_HIDE_4_19_STUB' not in c:
+                stubs = '''
+#include <linux/types.h>
+#include <linux/cred.h>
+void ksu_selinux_hide_handle_post_fs_data(void) { }
+void ksu_selinux_hide_handle_second_stage(void) { }
+void ksu_selinux_hide_drop_backup_if_unused(void) { }
+void ksu_selinux_hide_handle_umount(void) { }
+void ksu_selinux_hide_drop_backup_if_unused(void) { }
 '''
-        m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', c)
-        if m:
-            c = c[:m.end()] + fallback + c[m.end():]
-            with open(path, 'w') as f:
-                f.write(c)
-            print(f"  ✅ {path} : SECCOMP_ARCH_NATIVE_NR défini")
+                c = '/* SELINUX_HIDE_4_19_STUB */\n' + stubs
 
-# 2. su_mount_ns.c : uapi/linux/mount.h n'existe pas sur 4.19
-files = [
-    'drivers/kernelsu/infra/su_mount_ns.c',
-    'drivers/kernelsu/su_mount_ns.c',
-]
-for path in files:
-    if not os.path.exists(path):
-        continue
-    with open(path) as f:
-        c = f.read()
-    c = c.replace('#include <uapi/linux/mount.h>', '#include <linux/mount.h>')
-    with open(path, 'w') as f:
-        f.write(c)
-    print(f"  ✅ {path} : uapi/linux/mount.h -> linux/mount.h")
-
-# 3. pkg_observer.c : TWA_RESUME + handle_inode_event
-files = [
-    'drivers/kernelsu/manager/pkg_observer.c',
-    'drivers/kernelsu/pkg_observer.c',
-]
-for path in files:
-    if not os.path.exists(path):
-        continue
-    with open(path) as f:
-        c = f.read()
-    # TWA_RESUME (n'existe pas avant 5.x)
-    if 'TWA_RESUME' in c and '#ifndef TWA_RESUME' not in c:
-        fallback = '\n#ifndef TWA_RESUME\n#define TWA_RESUME 1\n#endif\n'
-        m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', c)
-        if m:
-            c = c[:m.end()] + fallback + c[m.end():]
-    # handle_inode_event (n'existe qu'à partir de 5.9)
-    c = c.replace(
-        '.handle_inode_event = ksu_handle_inode_event,',
-        '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n\t.handle_inode_event = ksu_handle_inode_event,\n#endif'
-    )
-    with open(path, 'w') as f:
-        f.write(c)
-    print(f"  ✅ {path} : TWA_RESUME + handle_inode_event protégés")
-
-# 4. dynamic_manager.c : TWA_RESUME + put_task_struct (header manquant)
-files = [
-    'drivers/kernelsu/manager/dynamic_manager.c',
-    'drivers/kernelsu/dynamic_manager.c',
-]
-for path in files:
-    if not os.path.exists(path):
-        continue
-    with open(path) as f:
-        c = f.read()
-    # TWA_RESUME
-    if 'TWA_RESUME' in c and '#ifndef TWA_RESUME' not in c:
-        fallback = '\n#ifndef TWA_RESUME\n#define TWA_RESUME 1\n#endif\n'
-        m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', c)
-        if m:
-            c = c[:m.end()] + fallback + c[m.end():]
-    # put_task_struct : inclure le bon header
-    if '#include <linux/sched/task.h>' not in c:
-        m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', c)
-        if m:
-            c = c[:m.end()] + '#include <linux/sched/task.h>\n' + c[m.end():]
-    with open(path, 'w') as f:
-        f.write(c)
-    print(f"  ✅ {path} : TWA_RESUME + put_task_struct corrigés")
-PYEOF
-
+        if c != o:
+            open(p, 'w', encoding='utf-8').write(c)
+            total += 1
+print(f"  ✅ portage 4.19 : {total} fichier(s) modifié(s)")
+PORTEOF
 
 # ==================== 5. CONFIGURATION ====================
 echo ""
@@ -378,7 +342,6 @@ export ARCH=arm64; export SUBARCH=arm64
 export CROSS_COMPILE=aarch64-linux-gnu-
 export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 
-# --- Compatibilité clang : le noyau peut passer des -Wno-... inconnus d'un clang ancien
 CLANG_MAJOR=$(clang --version | sed -n 's/.*clang version \([0-9]*\).*/\1/p' | head -1)
 echo "clang : $(command -v clang) -> $(readlink -f "$(command -v clang)")" | tee -a "$AUDIT"
 clang --version | head -2 | tee -a "$AUDIT"
@@ -400,7 +363,6 @@ WRAPEOF
     CC_ARGS="CC=$GITHUB_WORKSPACE/clang-wrap"
     echo "⚠️ clang < 16 : wrapper actif (flags inconnus ignorés)" | tee -a "$AUDIT"
 fi
-
 
 mkdir -p out
 make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 vendor/lito-perf_defconfig
@@ -448,7 +410,7 @@ sed -i 's/if (!check_version(/if (0 \&\& !check_version(/g' kernel/module.c
 printf "\n/* --- Début Patch Tactile --- */\n#include <linux/notifier.h>\n#include <linux/module.h>\nstatic BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);\nint panel_register_notifier(struct notifier_block *nb) {\n    return blocking_notifier_chain_register(&motorola_panel_notifier_list, nb);\n}\nEXPORT_SYMBOL(panel_register_notifier);\nint panel_unregister_notifier(struct notifier_block *nb) {\n    return blocking_notifier_chain_unregister(&motorola_panel_notifier_list, nb);\n}\nEXPORT_SYMBOL(panel_unregister_notifier);\nvoid touch_set_state(int state) { return; }\nEXPORT_SYMBOL(touch_set_state);\n/* --- Fin Patch Tactile --- */\n" >> techpack/display/msm/msm_drv.c
 echo "✅ Patchs Motorola appliqués"
 
-# ==================== 7. COMPILATION KERNEL (make -k : toutes les erreurs d'un coup) ====================
+# ==================== 7. COMPILATION KERNEL (make -k) ====================
 echo "=== Compilation du kernel ==="
 set +eo pipefail
 make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 \
@@ -484,12 +446,11 @@ cp out/System.map "$GITHUB_WORKSPACE/output/System.map-${VER}"
     true
 } 2>&1 | tee -a "$AUDIT"
 
-# ==================== 8. COMPILATION KSUD (même checkout que le driver) ====================
+# ==================== 8. COMPILATION KSUD ====================
 echo ""
 echo "=== Compilation ksud ==="
 cd "$GITHUB_WORKSPACE"
 
-# Source de ksud : on privilégie le checkout déjà utilisé pour le driver
 KSUD_DIR=""
 KSUD_ROOT=""
 if [ -n "$KSU_REPO_ROOT" ] && [ -f "$KSU_REPO_ROOT/userspace/ksud/Cargo.toml" ]; then
@@ -542,7 +503,7 @@ cp "$KSUD_BINARY" "$GITHUB_WORKSPACE/ksud"; chmod 755 "$GITHUB_WORKSPACE/ksud"
 echo "✅ ksud compilé ($KSUD_BINARY)"
 cd "$GITHUB_WORKSPACE"
 
-# ==================== 9. REPACK (MÉTHODE BACKSLASHXX) ====================
+# ==================== 9. REPACK ====================
 echo ""
 echo "=== Repack (méthode backslashxx : magiskboot cpio add) ==="
 
@@ -618,4 +579,3 @@ cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
 echo "=== BUILD TERMINÉ ${VER} (FinaSU $KSU_REF, Tracepoint, sans SuSFS) ==="
 ls -lh output/
-
