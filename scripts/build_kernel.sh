@@ -193,6 +193,63 @@ for path in files:
     print(f"  ✅ {path} : MODULE_IMPORT_NS protégé")
 PYEOF
 
+# ==================== 4c. FIX FILE_WRAPPER.C (compatibilité 4.19) ====================
+echo ""
+echo "=== Fix file_wrapper.c (iopoll, remap_file_range) ==="
+python3 - <<'PYEOF'
+import re, os
+
+files = [
+    'drivers/kernelsu/infra/file_wrapper.c',
+    'drivers/kernelsu/file_wrapper.c',
+]
+for path in files:
+    if not os.path.exists(path):
+        continue
+    with open(path) as f:
+        c = f.read()
+    if 'FILE_WRAPPER_4_19_FIX' in c:
+        continue
+    
+    # 1. iopoll (noyau 5.1+)
+    c = c.replace(
+        'return orig->f_op->iopoll(kiocb, spin);',
+        '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n        return orig->f_op->iopoll(kiocb, spin);\n#else\n        return -EOPNOTSUPP;\n#endif'
+    )
+    c = c.replace(
+        'p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;',
+        '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n    p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;\n#endif'
+    )
+    
+    # 2. remap_file_range (noyau 4.20+)
+    c = c.replace(
+        'if (remap_flags & REMAP_FILE_DEDUP) {',
+        '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n    if (remap_flags & REMAP_FILE_DEDUP) {\n#else\n    if (0) {\n#endif'
+    )
+    c = c.replace(
+        'return orig->f_op->remap_file_range(file_in, pos_in, orig, pos_out, len, remap_flags);',
+        '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n        return orig->f_op->remap_file_range(file_in, pos_in, orig, pos_out, len, remap_flags);\n#else\n        return -EOPNOTSUPP;\n#endif'
+    )
+    c = c.replace(
+        'return orig->f_op->remap_file_range(orig, pos_in, file_out, pos_out, len, remap_flags);',
+        '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n        return orig->f_op->remap_file_range(orig, pos_in, file_out, pos_out, len, remap_flags);\n#else\n        return -EOPNOTSUPP;\n#endif'
+    )
+    c = c.replace(
+        'p->ops.remap_file_range = fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;',
+        '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n    p->ops.remap_file_range = fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;\n#endif'
+    )
+    
+    # 3. Supprimer les warnings "unused"
+    c = c.replace('struct file *orig = data->orig;', 'struct file *orig __maybe_unused = data->orig;')
+    
+    # Marqueur
+    c = '/* FILE_WRAPPER_4_19_FIX */\n' + c
+    
+    with open(path, 'w') as f:
+        f.write(c)
+    print(f"  ✅ {path} : corrigé (iopoll, remap_file_range)")
+PYEOF
+
 # ==================== 3h. FIX O_CLOEXEC ====================
 echo ""
 echo "=== Fix O_CLOEXEC dans TOUS les fichiers (détection Manager) ==="
