@@ -269,8 +269,106 @@ if [ -n "$FILES_ANON_INODE" ]; then
         sed -i 's/O_RDWR|O_CLOEXEC/O_RDWR/g' "$f"
         sed -i 's/, O_CLOEXEC)/)/g' "$f"
         echo "  ✅ anon_inode_getfile nettoyé dans $f"
-    done
-fi
+    doPYEOF
+
+    # ==================== 4d. FIX SECCOMP_CACHE, SU_MOUNT_NS, PKG_OBSERVER, DYNAMIC_MANAGER ====================
+echo ""
+echo "=== Fix divers (seccomp_cache, su_mount_ns, pkg_observer, dynamic_manager) ==="
+python3 - <<'PYEOF'
+import re, os
+
+# 1. seccomp_cache.c : SECCOMP_ARCH_NATIVE_NR n'existe pas sur 4.19
+files = [
+    'drivers/kernelsu/infra/seccomp_cache.c',
+    'drivers/kernelsu/seccomp_cache.c',
+]
+for path in files:
+    if not os.path.exists(path):
+        continue
+    with open(path) as f:
+        c = f.read()
+    if 'SECCOMP_ARCH_NATIVE_NR' in c and '#ifndef SECCOMP_ARCH_NATIVE_NR' not in c:
+        # Ajoute les définitions après les includes
+        fallback = '''
+#ifndef SECCOMP_ARCH_NATIVE_NR
+#define SECCOMP_ARCH_NATIVE_NR NR_syscalls
+#endif
+#ifndef SECCOMP_ARCH_COMPAT_NR
+#define SECCOMP_ARCH_COMPAT_NR NR_syscalls
+#endif
+'''
+        m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', c)
+        if m:
+            c = c[:m.end()] + fallback + c[m.end():]
+            with open(path, 'w') as f:
+                f.write(c)
+            print(f"  ✅ {path} : SECCOMP_ARCH_NATIVE_NR défini")
+
+# 2. su_mount_ns.c : uapi/linux/mount.h n'existe pas sur 4.19
+files = [
+    'drivers/kernelsu/infra/su_mount_ns.c',
+    'drivers/kernelsu/su_mount_ns.c',
+]
+for path in files:
+    if not os.path.exists(path):
+        continue
+    with open(path) as f:
+        c = f.read()
+    c = c.replace('#include <uapi/linux/mount.h>', '#include <linux/mount.h>')
+    with open(path, 'w') as f:
+        f.write(c)
+    print(f"  ✅ {path} : uapi/linux/mount.h -> linux/mount.h")
+
+# 3. pkg_observer.c : TWA_RESUME + handle_inode_event
+files = [
+    'drivers/kernelsu/manager/pkg_observer.c',
+    'drivers/kernelsu/pkg_observer.c',
+]
+for path in files:
+    if not os.path.exists(path):
+        continue
+    with open(path) as f:
+        c = f.read()
+    # TWA_RESUME (n'existe pas avant 5.x)
+    if 'TWA_RESUME' in c and '#ifndef TWA_RESUME' not in c:
+        fallback = '\n#ifndef TWA_RESUME\n#define TWA_RESUME 1\n#endif\n'
+        m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', c)
+        if m:
+            c = c[:m.end()] + fallback + c[m.end():]
+    # handle_inode_event (n'existe qu'à partir de 5.9)
+    c = c.replace(
+        '.handle_inode_event = ksu_handle_inode_event,',
+        '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n\t.handle_inode_event = ksu_handle_inode_event,\n#endif'
+    )
+    with open(path, 'w') as f:
+        f.write(c)
+    print(f"  ✅ {path} : TWA_RESUME + handle_inode_event protégés")
+
+# 4. dynamic_manager.c : TWA_RESUME + put_task_struct (header manquant)
+files = [
+    'drivers/kernelsu/manager/dynamic_manager.c',
+    'drivers/kernelsu/dynamic_manager.c',
+]
+for path in files:
+    if not os.path.exists(path):
+        continue
+    with open(path) as f:
+        c = f.read()
+    # TWA_RESUME
+    if 'TWA_RESUME' in c and '#ifndef TWA_RESUME' not in c:
+        fallback = '\n#ifndef TWA_RESUME\n#define TWA_RESUME 1\n#endif\n'
+        m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', c)
+        if m:
+            c = c[:m.end()] + fallback + c[m.end():]
+    # put_task_struct : inclure le bon header
+    if '#include <linux/sched/task.h>' not in c:
+        m = re.search(r'((?:#include\s+[<"][^>"]+[>"]\n)+)', c)
+        if m:
+            c = c[:m.end()] + '#include <linux/sched/task.h>\n' + c[m.end():]
+    with open(path, 'w') as f:
+        f.write(c)
+    print(f"  ✅ {path} : TWA_RESUME + put_task_struct corrigés")
+PYEOF
 
 
 # ==================== 5. CONFIGURATION ====================
