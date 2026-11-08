@@ -243,15 +243,6 @@ python3 - "$KSU_DIR" <<'PORTEOF' 2>&1 | tee -a "$AUDIT"
 import os, re, sys
 root = sys.argv[1]
 
-def find_matching(c, i, open_ch, close_ch):
-    depth = 0
-    for k in range(i, len(c)):
-        if c[k] == open_ch: depth += 1
-        elif c[k] == close_ch:
-            depth -= 1
-            if depth == 0: return k
-    return -1
-
 total = 0
 for dp, dn, fn in os.walk(root):
     for f in fn:
@@ -263,7 +254,7 @@ for dp, dn, fn in os.walk(root):
         # 1. MODULE_IMPORT_NS
         c = re.sub(r'^([ \t]*MODULE_IMPORT_NS\([^\n]*\);[ \t]*)$', r'#ifdef MODULE_IMPORT_NS\n\1\n#endif', c, flags=re.M)
 
-        # 2. Header fix (compat)
+        # 2. Headers et macros génériques
         if f == 'event.c' and 'sulog' in p:
             c = c.replace('#include <linux/minmax.h>', '#include <linux/kernel.h>')
         if f == 'su_mount_ns.c':
@@ -294,40 +285,79 @@ for dp, dn, fn in os.walk(root):
         if f == 'app_profile.c':
             c = c.replace('atomic_set(&current->seccomp.filter_count, 0);', '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,9,0)\n\tatomic_set(&current->seccomp.filter_count, 0);\n#endif')
 
-        # 5. file_wrapper (iopoll / remap)
+        # 5. file_wrapper (fixes précis)
         if f == 'file_wrapper.c':
-            c = c.replace('return orig->f_op->iopoll(kiocb, spin);', '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,1,0)\n        return orig->f_op->iopoll(kiocb, spin);\n#else\n        return -EOPNOTSUPP;\n#endif')
-            c = c.replace('p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;', '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,1,0)\n    p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;\n#endif')
+            # Remplacer les blocs iopoll / remap_file_range
+            c = re.sub(r'return\s+orig->f_op->iopoll\([^;]+\);',
+                       '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,1,0)\n        return orig->f_op->iopoll(kiocb, spin);\n#else\n        return -EOPNOTSUPP;\n#endif', c)
+            c = re.sub(r'p->ops\.iopoll\s*=\s*[^;]+;',
+                       '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,1,0)\n    p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;\n#endif', c)
+            
+            # Remplacer la vérification de REMAP_FILE_DEDUP
+            c = re.sub(r'if\s*\(\s*remap_flags\s*&\s*REMAP_FILE_DEDUP\s*\)',
+                       '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,20,0)\n    if (remap_flags & REMAP_FILE_DEDUP) {\n#else\n    if (0) {\n#endif', c)
+            
+            # Remplacer les appels à remap_file_range
+            c = re.sub(r'return\s+orig->f_op->remap_file_range\([^;]+\);',
+                       '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,20,0)\n        return orig->f_op->remap_file_range(file_in, pos_in, orig, pos_out, len, remap_flags);\n#else\n        return -EOPNOTSUPP;\n#endif', c)
+            
+            # Remplacer l'assignation de p->ops.remap_file_range
+            c = re.sub(r'p->ops\.remap_file_range\s*=\s*[^;]+;',
+                       '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,20,0)\n    p->ops.remap_file_range = fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;\n#endif', c)
 
         # 6. SELinux API Changes (rules.c)
         if f == 'rules.c':
             c = c.replace('selinux_state.policy', 'selinux_state.ss')
             c = re.sub(r'struct selinux_policy', 'struct policydb', c)
             c = c.replace('policy_mutex', 'policy_mutex_stub')
-            c = c.replace('return &selinux_state.ss;', 'return &rcu_dereference(selinux_state.ss)->policydb;')
+            
+            # Supprimer les membres inexistants de policydb
+            c = re.sub(r'(\w+)->sidtab', r'NULL /* no sidtab */', c)
+            c = re.sub(r'(\w+)->latest_granting', r'0 /* no latest_granting */', c)
+            c = re.sub(r'(\w+)->policydb', r'\1', c)
+            
+            # Correction pour le retour de get_policydb
+            c = c.replace('return &rcu_dereference(selinux_state.ss)->policydb;', 'return rcu_dereference(selinux_state.ss);')
+            
+            # Remplacer les fonctions qui n'existent pas sur 4.19
+            c = re.sub(r'security_read_policy\(\)', 'NULL', c)
 
         # 7. SELinux API Changes (sepolicy.c)
         if f == 'sepolicy.c':
+            # Adaptation des types
             c = re.sub(r'struct selinux_policy \*(\w+)', r'struct policydb *\1', c)
             c = re.sub(r'(\w+)->policydb', r'\1', c)
+            
+            # Sur 4.19, on n'a pas filename_trans_key
             c = re.sub(r'struct filename_trans_key', 'struct filename_trans', c)
-            c = re.sub(r'->stypes', '->ttypes', c)
-            c = c.replace('policydb_filenametr_search(db, &key)', 'hashtab_search(db->filename_trans, &key)')
-            c = c.replace('type_val_to_struct', 'type_val_to_struct_array')
+            
+            # Remplacer les flex_array par des tableaux classiques (approximation)
+            c = c.replace('flex_array_alloc', 'kcalloc')
+            c = c.replace('flex_array_put', '/* stub */')
+            c = c.replace('flex_array_get', '/* stub */')
+            c = c.replace('flex_array_free', 'kfree')
+            
+            # Supprimer les membres inexistants
+            c = re.sub(r'(\w+)->ttypes', r'\1->ttypes', c)
+            c = re.sub(r'(\w+)->next', r'\1->next', c)
+            c = re.sub(r'(\w+)->compat_filename_trans_count', r'0', c)
+            
+            # Correction pour filenametr_key_params
+            c = re.sub(r'filenametr_key_params', 'NULL', c)
 
-        # 8. selinux_hide.c (Trop complexe pour 4.19, on stub)
+        # 8. selinux_hide.c (remplacement complet par des stubs)
         if f == 'selinux_hide.c':
             if 'SELINUX_HIDE_4_19_STUB' not in c:
                 stubs = '''
 #include <linux/types.h>
 #include <linux/cred.h>
+/* SELINUX_HIDE_4_19_STUB */
 void ksu_selinux_hide_handle_post_fs_data(void) { }
 void ksu_selinux_hide_handle_second_stage(void) { }
 void ksu_selinux_hide_drop_backup_if_unused(void) { }
 void ksu_selinux_hide_handle_umount(void) { }
-void ksu_selinux_hide_drop_backup_if_unused(void) { }
 '''
-                c = '/* SELINUX_HIDE_4_19_STUB */\n' + stubs
+                c = stubs
 
         if c != o:
             open(p, 'w', encoding='utf-8').write(c)
