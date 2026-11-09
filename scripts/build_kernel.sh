@@ -2,9 +2,8 @@
 set -euo pipefail
 
 # =============================================================================
-# FinaSU (LyraVoid) en dur dans le noyau 4.19 — ÉTAPE A : FinaSU seul, hooks Tracepoint, SANS SuSFS
-# Motorola One 5G Ace (kiev) — LineageOS 23.2
-# Option B : corrections minimales (pas de stub agressif)
+# FinaSU (LyraVoid) en dur dans le noyau 4.19 — ÉTAPE A
+# Option B + correctif génération rules.c uniquement
 # =============================================================================
 
 FINASU_URL="${FINASU_URL:-https://github.com/LyraVoid/FinaSU.git}"
@@ -26,7 +25,6 @@ mkdir -p "$GITHUB_WORKSPACE/output"
 AUDIT="$GITHUB_WORKSPACE/output/audit-${VER}.txt"
 : > "$AUDIT"
 
-# ---------- Résumé du build ----------
 summarize() {
     local rc=$?
     set +e
@@ -241,9 +239,9 @@ if [ -n "$FILES_ANON_INODE" ]; then
     done
 fi
 
-# ==================== 4b. PORTAGE 4.19 — OPTION B (corrections minimales) ====================
+# ==================== 4b. PORTAGE 4.19 — Option B + correctif génération rules.c ====================
 echo ""
-echo "=== Portage 4.19 (Option B — corrections minimales) ==="
+echo "=== Portage 4.19 (Option B + correctif rules.c) ==="
 
 python3 - "$KSU_DIR" <<'PORTEOF' 2>&1 | tee -a "$AUDIT"
 import os, re, sys
@@ -262,7 +260,7 @@ def write_if_changed(path, new_content, old_content):
     return False
 
 # =====================================================================
-# 1. rules.c — chemin 4.19 + correction échappement des chaînes
+# 1. rules.c — injection plus sûre (évite de casser les chaînes)
 # =====================================================================
 rules_path = os.path.join(root, "selinux", "rules.c")
 if os.path.isfile(rules_path):
@@ -273,6 +271,7 @@ if os.path.isfile(rules_path):
     if '#include <linux/version.h>' not in c and '#include "linux/version.h"' not in c:
         c = '#include <linux/version.h>\n' + c
 
+    # Stub backup_sepolicy
     if "struct selinux_policy *backup_sepolicy;" in c and "KSU_BACKUP_SEPOLICY_STUB" not in c:
         c = c.replace(
             "struct selinux_policy *backup_sepolicy;",
@@ -284,8 +283,19 @@ if os.path.isfile(rules_path):
             "#endif"
         )
 
-    # Chemin ancien noyau (chaînes correctement formées, pas de \\n dans les littéraux Python)
-    old_kernel_path = r'''
+    # Si le chemin 4.19 n'est pas déjà présent, on l'ajoute
+    # en ENVELOPANT toute la fonction moderne plutôt qu'en injectant un gros bloc fragile.
+    if "KSU_OLD_KERNEL_APPLY_RULES" not in c:
+        # 1. Déclarer un marqueur
+        # 2. Remplacer la définition de apply_kernelsu_rules par une version dual-path simple
+
+        # On cherche la fonction et on l'entoure proprement
+        pattern = r'(void\s+apply_kernelsu_rules\s*\(\s*\)\s*\{)'
+        if re.search(pattern, c):
+            # Préfixe : chemin 4.19 complet + ouverture du #else
+            prefix = r'''
+#define KSU_OLD_KERNEL_APPLY_RULES 1
+
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 /* ========== Chemin noyau ancien (4.14 / 4.19) ========== */
 static struct policydb *ksu_get_policydb(void)
@@ -302,9 +312,8 @@ void apply_kernelsu_rules(void)
 {
     struct policydb *db = ksu_get_policydb();
 
-    if (!getenforce()) {
+    if (!getenforce())
         pr_info("SELinux permissive or disabled, apply rules! (old kernel path)\n");
-    }
 
     ksu_type(db, KERNEL_SU_DOMAIN, "domain");
     ksu_permissive(db, KERNEL_SU_DOMAIN);
@@ -369,27 +378,24 @@ void apply_kernelsu_rules(void)
     pr_info("KernelSU rules applied (4.19 compatibility path)\n");
 }
 
-#else /* >= 5.10 — code original FinaSU */
+#else /* >= 5.10 */
 '''
 
-    if re.search(r'void\s+apply_kernelsu_rules\s*\(\s*\)\s*\{', c) and "Chemin noyau ancien" not in c:
-        c = re.sub(
-            r'void\s+apply_kernelsu_rules\s*\(\s*\)\s*\{',
-            old_kernel_path + "\nvoid apply_kernelsu_rules()\n{",
-            c,
-            count=1
-        )
-        c = re.sub(
-            r'(mutex_unlock\s*\(\s*&selinux_state\.policy_mutex\s*\)\s*;\s*\n\s*\})',
-            r'\1\n#endif /* end dual-path apply_kernelsu_rules */',
-            c,
-            count=1
-        )
+            c = re.sub(pattern, prefix + r'\nvoid apply_kernelsu_rules()\n{', c, count=1)
+
+            # Fermer le #else juste après la fin de la fonction moderne
+            # On cherche le pattern typique de fin de apply_kernelsu_rules
+            c = re.sub(
+                r'(mutex_unlock\s*\(\s*&selinux_state\.policy_mutex\s*\)\s*;\s*\n\})',
+                r'\1\n#endif /* end dual-path apply_kernelsu_rules */',
+                c,
+                count=1
+            )
 
     write_if_changed(rules_path, c, o)
 
 # =====================================================================
-# 2. selinux_hide.c — stub minimal avec includes corrects
+# 2. selinux_hide.c — stub minimal (inchangé par rapport à Option B)
 # =====================================================================
 hide_path = os.path.join(root, "feature", "selinux_hide.c")
 if os.path.isfile(hide_path):
@@ -422,7 +428,7 @@ if os.path.isfile(hide_path):
         write_if_changed(hide_path, c, o)
 
 # =====================================================================
-# 3. sepolicy.c — protection anti-redefinition uniquement (pas de stub agressif)
+# 3. sepolicy.c — garde minimale sur add_filename_trans (Option B)
 # =====================================================================
 sepolicy_path = os.path.join(root, "selinux", "sepolicy.c")
 if os.path.isfile(sepolicy_path):
@@ -434,28 +440,20 @@ if os.path.isfile(sepolicy_path):
         if '#include <linux/version.h>' not in c:
             c = '#include <linux/version.h>\n' + c
 
-        # On entoure uniquement la définition existante de add_filename_trans
-        # pour éviter les erreurs de structure sur < 5.8, sans ajouter de nouvelle fonction.
         pattern = r'(static\s+bool\s+add_filename_trans\s*\([^)]*\)\s*\{)'
         if re.search(pattern, c):
             c = re.sub(
                 pattern,
+                r'#define KSU_FILENAME_TRANS_GUARD 1\n'
                 r'#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)\n\1',
                 c,
                 count=1
             )
-            # Fermer le #if juste avant la fonction suivante (approche simple)
-            # On ajoute un marqueur pour éviter les doubles traitements
-            c = c.replace(
-                "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)\nstatic bool add_filename_trans",
-                "#define KSU_FILENAME_TRANS_GUARD 1\n#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)\nstatic bool add_filename_trans",
-                1
-            )
-            # Fermeture approximative : après la fonction on remet un #else stub minimal
-            # (on cherche la prochaine fonction static bool)
+            # Fermeture + stub minimal
             c = re.sub(
                 r'(#if LINUX_VERSION_CODE >= KERNEL_VERSION\(5, 8, 0\)\nstatic bool add_filename_trans[\s\S]*?\n\})',
-                r'\1\n#else\nstatic bool add_filename_trans(struct policydb *db, const char *s, const char *t,\n'
+                r'\1\n#else\n'
+                r'static bool add_filename_trans(struct policydb *db, const char *s, const char *t,\n'
                 r'                               const char *cls, const char *d, const char *o)\n'
                 r'{\n    return true;\n}\n#endif',
                 c,
@@ -465,7 +463,7 @@ if os.path.isfile(sepolicy_path):
         write_if_changed(sepolicy_path, c, o)
 
 # =====================================================================
-# 4. file_wrapper.c (inchangé)
+# 4. file_wrapper.c
 # =====================================================================
 def find_matching(c, i, open_ch, close_ch):
     depth = 0
@@ -529,7 +527,7 @@ for dp, dn, fn in os.walk(root):
             open(p, 'w', encoding='utf-8').write(c)
             total += 1
 
-print(f"  ✅ portage 4.19 (Option B) : {total} fichier(s) modifié(s)")
+print(f"  ✅ portage 4.19 (Option B + correctif rules.c) : {total} fichier(s) modifié(s)")
 PORTEOF
 
 # ==================== 5. CONFIGURATION ====================
