@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # =============================================================================
-# FinaSU (LyraVoid) sur noyau 4.19 — ÉTAPE A (Tracepoint, SANS SuSFS)
-# Portage ciblé : 22 erreurs → 0
+# FinaSU (LyraVoid) sur noyau 4.19 — ÉTAPE A
+# Portage 4.19 chirurgical (22 erreurs → 0)
 # =============================================================================
 
 FINASU_URL="${FINASU_URL:-https://github.com/LyraVoid/FinaSU.git}"
@@ -15,7 +15,7 @@ VER="finasu-A"
 KSU_REF="$FINASU_REF"
 KSUD_FALLBACK_REF="${KSUD_FALLBACK_REF:-v3.4.2}"
 
-echo "=== Build FinaSU ($FINASU_REF) — étape A (Tracepoint, sans SuSFS) ==="
+echo "=== Build FinaSU ($FINASU_REF) — étape A ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -57,12 +57,10 @@ for l in txt:
     t = re.search(r'\*\*\* \[[^\]]*?:(\d+): ([^\]]+)\] Error', l)
     if t and t.group(2) not in targets: targets.append(t.group(2))
 print(f"erreurs : {total}   fichiers touchés : {len(per_file)}   messages distincts : {len(per_msg)}")
-print("\n-- Erreurs par fichier (haut de liste) --")
+print("\n-- Erreurs par fichier --")
 for f, n in per_file.most_common(25): print(f"{n:4d}  {f}")
-print("\n-- Types d'erreurs (compte, premier emplacement) --")
+print("\n-- Types d'erreurs --")
 for k, n in per_msg.most_common(25): print(f"{n:4d}  {k}   [{first_loc[k]}]")
-print("\n-- Première erreur de chaque fichier --")
-for f, v in list(first_msg.items())[:40]: print(f"{f}:{v}"[:170])
 if undefined:
     print("\n-- Symboles non définis --")
     for k, n in undefined.most_common(30): print(f"{n:4d}  {k}")
@@ -73,9 +71,6 @@ SUMEOF
         else
             echo "pas de build.log"
         fi
-        echo ""
-        echo "=== 20 DERNIÈRES LIGNES DE L'AUDIT ==="
-        tail -n 20 "$AUDIT" 2>/dev/null
     } > "$SUM" 2>&1
     cat "$SUM"
     [ -n "${GITHUB_STEP_SUMMARY:-}" ] && { echo '```'; cat "$SUM"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
@@ -95,8 +90,8 @@ pip3 install --quiet gdown
 cd "$GITHUB_WORKSPACE"
 
 # ==================== 1. CLONAGE NOYAU ====================
-KERNEL_URL="https://github.com/LineageOS/android_kernel_motorola_sm8250.git"
-git clone --filter=blob:none --no-checkout -b lineage-23.2 "$KERNEL_URL" kernel_sources
+git clone --filter=blob:none --no-checkout -b lineage-23.2 \
+  https://github.com/LineageOS/android_kernel_motorola_sm8250.git kernel_sources
 cd kernel_sources
 if ! git checkout -q "$KERNEL_PIN" 2>/dev/null; then
     git fetch -q origin '+refs/heads/*:refs/remotes/origin/*'
@@ -109,8 +104,6 @@ echo "=== Intégration FinaSU ($FINASU_REF) ==="
 rm -rf drivers/kernelsu FinaSU 2>/dev/null || true
 git clone "$FINASU_URL" FinaSU
 git -C FinaSU checkout "$FINASU_REF"
-echo "FinaSU : $(git -C FinaSU describe --tags --always)" | tee -a "$AUDIT"
-
 if [ -f FinaSU/kernel/setup.sh ]; then
     bash FinaSU/kernel/setup.sh --dir "$PWD/FinaSU" || true
 fi
@@ -128,13 +121,9 @@ echo "✅ FinaSU intégré"
 MGR_APK="$GITHUB_WORKSPACE/patches/manager.apk"
 
 if [ ! -f "$MGR_APK" ]; then
-    echo "→ APK manager non trouvée localement, téléchargement depuis Google Drive..."
+    echo "→ Téléchargement APK depuis Google Drive..."
     mkdir -p "$GITHUB_WORKSPACE/patches"
-    if gdown "https://drive.google.com/uc?id=${MGR_GDRIVE_ID}" -O "$MGR_APK" 2>&1; then
-        echo "  ✅ APK téléchargée ($(du -h "$MGR_APK" | cut -f1))"
-    else
-        echo "  ⚠️ Échec du téléchargement depuis Google Drive"
-    fi
+    gdown "https://drive.google.com/uc?id=${MGR_GDRIVE_ID}" -O "$MGR_APK" 2>&1 || echo "  ⚠️ Échec download"
 fi
 
 if [ -z "$FINASU_EXPECTED_SIZE" ] && [ -f "$MGR_APK" ]; then
@@ -170,9 +159,9 @@ fi
 SIG_ARGS=""
 if [ -n "$FINASU_EXPECTED_SIZE" ] && [ -n "$FINASU_EXPECTED_HASH" ]; then
     SIG_ARGS="KSU_EXPECTED_SIZE=$FINASU_EXPECTED_SIZE KSU_EXPECTED_HASH=$FINASU_EXPECTED_HASH"
-    echo "✅ Signature manager OK" | tee -a "$AUDIT"
+    echo "✅ Signature manager OK ($FINASU_EXPECTED_SIZE)"
 else
-    echo "⚠️ AUCUNE signature de manager fournie" | tee -a "$AUDIT"
+    echo "⚠️ AUCUNE signature de manager fournie"
 fi
 
 # ==================== 3g/3h. EXPORTS + O_CLOEXEC ====================
@@ -195,10 +184,7 @@ grep -rl "anon_inode_getfile" "$KSU_DIR/" 2>/dev/null | while read -r f; do
     sed -i 's/O_RDWR | O_CLOEXEC/O_RDWR/g; s/O_RDWR|O_CLOEXEC/O_RDWR/g; s/, O_CLOEXEC)/)/g' "$f"
 done || true
 
-# ==================== 4b. PORTAGE 4.19 ====================
-echo "=== Portage 4.19 ==="
-
-# 4b.1 rules.c dual-path (inchangé)
+# ==================== 4b.1 rules.c dual-path ====================
 cat > "$KSU_DIR/selinux/rules.c" << 'RULESEOF'
 #include "linux/rcupdate.h"
 #include "security.h"
@@ -219,7 +205,6 @@ cat > "$KSU_DIR/selinux/rules.c" << 'RULESEOF'
 #define ALL NULL
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
-/* Chemin ancien (4.19) */
 struct selinux_policy *backup_sepolicy = NULL;
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
 extern int avc_ss_reset(u32 seqno);
@@ -293,13 +278,8 @@ void apply_kernelsu_rules(void)
 	reset_avc_cache(0);
 	pr_info("KernelSU rules applied (4.19 compatibility path)\n");
 }
-int handle_sepolicy(void __user *user_data, u64 data_len)
-{
-	pr_info("handle_sepolicy not supported on kernel < 5.10\n");
-	return -EOPNOTSUPP;
-}
+int handle_sepolicy(void __user *user_data, u64 data_len) { return -EOPNOTSUPP; }
 #else
-/* Chemin moderne (5.10+) */
 struct selinux_policy *backup_sepolicy;
 #define SELINUX_POLICY_INSTEAD_SELINUX_SS
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
@@ -400,135 +380,12 @@ void apply_kernelsu_rules(void)
 out_unlock:
 	mutex_unlock(&selinux_state.policy_mutex);
 }
-#define KSU_SEPOLICY_MAX_BATCH_SIZE (8U * 1024U * 1024U)
-#define KSU_SEPOLICY_MAX_ARGS 5
-struct sepol_data { u32 cmd; u32 subcmd; };
-struct sepol_batch_cursor { const u8 *cur; const u8 *end; };
-static size_t sepol_remaining(const struct sepol_batch_cursor *c) { return (size_t)(c->end - c->cur); }
-static int sepol_read_cmd_header(struct sepol_batch_cursor *c, struct sepol_data *h)
-{
-	if (sepol_remaining(c) < sizeof(*h)) return -EINVAL;
-	memcpy(h, c->cur, sizeof(*h)); c->cur += sizeof(*h); return 0;
-}
-static int sepol_read_string(struct sepol_batch_cursor *c, const char **out)
-{
-	u32 len; const char *str;
-	if (sepol_remaining(c) < sizeof(len)) return -EINVAL;
-	memcpy(&len, c->cur, sizeof(len)); c->cur += sizeof(len);
-	if (len >= sepol_remaining(c)) return -EINVAL;
-	str = (const char *)c->cur;
-	if (memchr(str, '\0', len) || str[len] != '\0') return -EINVAL;
-	c->cur += len + 1;
-	*out = (len == 0) ? ALL : str;
-	return 0;
-}
-static int sepol_require_not_all(const char *v, const char *n)
-{ if (v != ALL) return 0; pr_err("sepol: %s cannot be ALL.\n", n); return -EINVAL; }
-static int sepol_expected_argc(u32 cmd)
-{
-	switch (cmd) {
-	case KSU_SEPOLICY_CMD_NORMAL_PERM: return 4;
-	case KSU_SEPOLICY_CMD_XPERM: return 5;
-	case KSU_SEPOLICY_CMD_TYPE_STATE: return 1;
-	case KSU_SEPOLICY_CMD_TYPE: case KSU_SEPOLICY_CMD_TYPE_ATTR: return 2;
-	case KSU_SEPOLICY_CMD_ATTR: return 1;
-	case KSU_SEPOLICY_CMD_TYPE_TRANSITION: return 5;
-	case KSU_SEPOLICY_CMD_TYPE_CHANGE: return 4;
-	case KSU_SEPOLICY_CMD_GENFSCON: return 3;
-	default: return -EINVAL;
-	}
-}
-static int apply_one_sepolicy_cmd(struct policydb *db, const struct sepol_data *h, const char **a)
-{
-	bool ok = false; int r;
-	switch (h->cmd) {
-	case KSU_SEPOLICY_CMD_NORMAL_PERM:
-		if (h->subcmd == KSU_SEPOLICY_SUBCMD_NORMAL_PERM_ALLOW) ok = ksu_allow(db, a[0], a[1], a[2], a[3]);
-		else if (h->subcmd == KSU_SEPOLICY_SUBCMD_NORMAL_PERM_DENY) ok = ksu_deny(db, a[0], a[1], a[2], a[3]);
-		else if (h->subcmd == KSU_SEPOLICY_SUBCMD_NORMAL_PERM_AUDITALLOW) ok = ksu_auditallow(db, a[0], a[1], a[2], a[3]);
-		else if (h->subcmd == KSU_SEPOLICY_SUBCMD_NORMAL_PERM_DONTAUDIT) ok = ksu_dontaudit(db, a[0], a[1], a[2], a[3]);
-		return ok ? 0 : -EINVAL;
-	case KSU_SEPOLICY_CMD_XPERM:
-		if ((r = sepol_require_not_all(a[3], "op")) < 0 || (r = sepol_require_not_all(a[4], "perm")) < 0) return r;
-		if (h->subcmd == KSU_SEPOLICY_SUBCMD_XPERM_ALLOW) ok = ksu_allowxperm(db, a[0], a[1], a[2], a[4]);
-		else if (h->subcmd == KSU_SEPOLICY_SUBCMD_XPERM_AUDITALLOW) ok = ksu_auditallowxperm(db, a[0], a[1], a[2], a[4]);
-		else if (h->subcmd == KSU_SEPOLICY_SUBCMD_XPERM_DONTAUDIT) ok = ksu_dontauditxperm(db, a[0], a[1], a[2], a[4]);
-		return ok ? 0 : -EINVAL;
-	case KSU_SEPOLICY_CMD_TYPE_STATE:
-		if ((r = sepol_require_not_all(a[0], "type")) < 0) return r;
-		if (h->subcmd == KSU_SEPOLICY_SUBCMD_TYPE_STATE_PERMISSIVE) ok = ksu_permissive(db, a[0]);
-		else if (h->subcmd == KSU_SEPOLICY_SUBCMD_TYPE_STATE_ENFORCE) ok = ksu_enforce(db, a[0]);
-		return ok ? 0 : -EINVAL;
-	case KSU_SEPOLICY_CMD_TYPE: case KSU_SEPOLICY_CMD_TYPE_ATTR:
-		if ((r = sepol_require_not_all(a[0], "type")) < 0 || (r = sepol_require_not_all(a[1], "attr")) < 0) return r;
-		ok = (h->cmd == KSU_SEPOLICY_CMD_TYPE) ? ksu_type(db, a[0], a[1]) : ksu_typeattribute(db, a[0], a[1]);
-		return ok ? 0 : -EINVAL;
-	case KSU_SEPOLICY_CMD_ATTR:
-		if ((r = sepol_require_not_all(a[0], "attr")) < 0) return r;
-		return ksu_attribute(db, a[0]) ? 0 : -EINVAL;
-	case KSU_SEPOLICY_CMD_TYPE_TRANSITION:
-		if ((r = sepol_require_not_all(a[0], "src")) < 0 || (r = sepol_require_not_all(a[1], "tgt")) < 0 ||
-		    (r = sepol_require_not_all(a[2], "cls")) < 0 || (r = sepol_require_not_all(a[3], "def")) < 0) return r;
-		return ksu_type_transition(db, a[0], a[1], a[2], a[3], a[4]) ? 0 : -EINVAL;
-	case KSU_SEPOLICY_CMD_TYPE_CHANGE:
-		if ((r = sepol_require_not_all(a[0], "src")) < 0 || (r = sepol_require_not_all(a[1], "tgt")) < 0 ||
-		    (r = sepol_require_not_all(a[2], "cls")) < 0 || (r = sepol_require_not_all(a[3], "def")) < 0) return r;
-		if (h->subcmd == KSU_SEPOLICY_SUBCMD_TYPE_CHANGE_CHANGE) ok = ksu_type_change(db, a[0], a[1], a[2], a[3]);
-		else if (h->subcmd == KSU_SEPOLICY_SUBCMD_TYPE_CHANGE_MEMBER) ok = ksu_type_member(db, a[0], a[1], a[2], a[3]);
-		return ok ? 0 : -EINVAL;
-	case KSU_SEPOLICY_CMD_GENFSCON:
-		if ((r = sepol_require_not_all(a[0], "name")) < 0 || (r = sepol_require_not_all(a[1], "path")) < 0 ||
-		    (r = sepol_require_not_all(a[2], "ctx")) < 0) return r;
-		return ksu_genfscon(db, a[0], a[1], a[2]) ? 0 : -EINVAL;
-	default: return -EINVAL;
-	}
-}
-int handle_sepolicy(void __user *user_data, u64 data_len)
-{
-	struct selinux_policy *pol, *old_pol; struct policydb *db;
-	struct sepol_batch_cursor cur; u8 *payload; int ret, okc; u32 idx;
-	if (!user_data || !data_len) return -EINVAL;
-	if (data_len > KSU_SEPOLICY_MAX_BATCH_SIZE) return -E2BIG;
-	payload = kvmalloc((size_t)data_len, GFP_KERNEL);
-	if (!payload) return -ENOMEM;
-	if (copy_from_user(payload, user_data, (size_t)data_len)) { ret = -EFAULT; goto out_free; }
-	mutex_lock(&selinux_state.policy_mutex);
-	old_pol = rcu_dereference_protected(selinux_state.policy, lockdep_is_held(&selinux_state.policy_mutex));
-	pol = ksu_dup_sepolicy(old_pol);
-	if (IS_ERR(pol)) { ret = PTR_ERR(pol); goto out_unlock; }
-	db = &pol->policydb;
-	cur.cur = payload; cur.end = payload + (size_t)data_len;
-	ret = 0; okc = 0; idx = 0;
-	while (cur.cur < cur.end) {
-		struct sepol_data h; const char *args[KSU_SEPOLICY_MAX_ARGS] = {0};
-		int argc; u32 i;
-		if ((ret = sepol_read_cmd_header(&cur, &h)) < 0) goto drop;
-		argc = sepol_expected_argc(h.cmd);
-		if (argc < 0 || argc > KSU_SEPOLICY_MAX_ARGS) { ret = -EINVAL; goto drop; }
-		for (i = 0; i < (u32)argc; i++)
-			if ((ret = sepol_read_string(&cur, &args[i])) < 0) goto drop;
-		if (apply_one_sepolicy_cmd(db, &h, args) >= 0) okc++;
-		idx++;
-	}
-	pol->latest_granting = old_pol->latest_granting + 1;
-	ksu_advance_original_types(db, &old_pol->policydb, old_pol->latest_granting, pol->latest_granting);
-	rcu_assign_pointer(selinux_state.policy, pol);
-	synchronize_rcu();
-	ksu_destroy_sepolicy(old_pol);
-	reset_avc_cache(pol->latest_granting);
-#ifdef CONFIG_KSU_SUSFS
-	susfs_set_batch_sid();
-#endif
-	ret = okc; goto out_unlock;
-drop:	ksu_destroy_sepolicy(pol);
-out_unlock: mutex_unlock(&selinux_state.policy_mutex);
-out_free: kvfree(payload); return ret;
-}
+int handle_sepolicy(void __user *user_data, u64 data_len) { return -EOPNOTSUPP; }
 #endif
 RULESEOF
 echo "  ✅ rules.c dual-path"
 
-# 4b.2 Python portage (correctifs ciblés pour les 22 dernières erreurs)
+# ==================== 4b.2 Portage chirurgical (fixes ciblés) ====================
 python3 - "$KSU_DIR" <<'PORTEOF' 2>&1 | tee -a "$AUDIT"
 import os, re, sys
 root = sys.argv[1]
@@ -548,6 +405,31 @@ def ensure_inc(c, inc):
     for m in re.finditer(r'#include\s+[<"].*?[>"]\s*\n', c): last = m.end()
     return (c[:last] + f'#include {inc}\n' + c[last:]) if last else f'#include {inc}\n' + c
 
+def find_matching_brace(c, open_idx):
+    depth = 0
+    for i in range(open_idx, len(c)):
+        if c[i] == '{': depth += 1
+        elif c[i] == '}':
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+def wrap_function(c, pattern, condition, stub_else=None):
+    m = re.search(pattern, c)
+    if not m:
+        return c, False
+    start = m.start()
+    open_brace = m.end() - 1
+    end = find_matching_brace(c, open_brace)
+    if end < 0:
+        return c, False
+    prefix = f'#if {condition}\n'
+    suffix = '\n#endif'
+    if stub_else:
+        suffix = f'\n#else\n{stub_else}\n#endif'
+    return c[:start] + prefix + c[start:end+1] + suffix + c[end+1:], True
+
 # ============================================================
 # 1. sepolicy.c — 19 erreurs
 # ============================================================
@@ -557,14 +439,10 @@ if os.path.isfile(p):
     o = c
     c = ensure_inc(c, '<linux/version.h>')
 
-    # 1a. struct selinux_policy → struct policydb
-    c = c.replace('struct selinux_policy *', 'struct policydb *')
-    c = c.replace('struct selinux_policy', 'struct policydb')
+    # 1a. type_val_to_struct → type_val_to_struct_array (4.19)
+    c = re.sub(r'\btype_val_to_struct\b(?!_array)', 'type_val_to_struct_array', c)
 
-    # 1b. type_val_to_struct → type_val_to_struct_array (4.19)
-    c = c.replace('type_val_to_struct', 'type_val_to_struct_array')
-
-    # 1c. remove_avtab_node : flex_array accesses
+    # 1b. remove_avtab_node : flex_array access
     if 'KSU_TE_AVTAB_FLEX' not in c:
         c = c.replace(
             'for (n = db->te_avtab.htable[i]; n; prev = n, n = n->next) {',
@@ -576,47 +454,60 @@ if os.path.isfile(p):
         )
         c = c.replace('#include <linux/version.h>', '#include <linux/version.h>\n#define KSU_TE_AVTAB_FLEX 1', 1)
 
-    # 1d. add_typeattribute_raw : type_attr_map_array flex_array
+    # 1c. add_typeattribute_raw : type_attr_map_array flex_array
     if 'KSU_TYPE_ATTR_MAP_FLEX' not in c:
         c = c.replace(
             'struct ebitmap *sattr = &db->type_attr_map_array[type->value - 1];',
-            '#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0) && !defined(KSU_TYPE_VAL_TO_STRUCT_ARRAY)\n    struct ebitmap *sattr = flex_array_get(db->type_attr_map_array, type->value - 1);\n#else\n    struct ebitmap *sattr = &db->type_attr_map_array[type->value - 1];\n#endif'
+            '#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)\n    struct ebitmap *sattr = flex_array_get(db->type_attr_map_array, type->value - 1);\n#else\n    struct ebitmap *sattr = &db->type_attr_map_array[type->value - 1];\n#endif'
         )
         c = c.replace('#include <linux/version.h>', '#include <linux/version.h>\n#define KSU_TYPE_ATTR_MAP_FLEX 1', 1)
 
-    # 1e. add_type : stub sur 4.19 (flex_array de taille fixe, types déjà dans le policy stock)
-    if 'KSU_ADD_TYPE_4_19_GUARD' not in c:
-        pattern = r'(static bool add_type\(struct policydb \*db, const char \*type_name, bool attr\)\s*\{)'
-        match = re.search(pattern, c)
-        if match:
-            start_pos = match.start()
-            open_pos = match.end() - 1
-            depth = 0
-            end_pos = -1
-            for i in range(open_pos, len(c)):
-                if c[i] == '{': depth += 1
-                elif c[i] == '}':
-                    depth -= 1
-                    if depth == 0:
-                        end_pos = i
-                        break
-            if end_pos > 0:
-                wrapper = '#define KSU_ADD_TYPE_4_19_GUARD 1\n#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0) || defined(KSU_TYPE_VAL_TO_STRUCT_ARRAY)\n'
-                stub = '''
-#else
-static bool add_type(struct policydb *db, const char *type_name, bool attr) {
-    struct type_datum *existing = symtab_search(&db->p_types, type_name);
-    if (existing) return true;
-    pr_warn("add_type: cannot add new type '%s' on kernel 4.19 (flex_array is fixed-size)\\n", type_name);
-    return false;
-}
-#endif'''
-                c = c[:start_pos] + wrapper + c[start_pos:end_pos+1] + stub + c[end_pos+1:]
+    # 1d. add_filename_trans : guard with proper brace counting
+    if 'KSU_FILENAME_TRANS_GUARD' not in c:
+        c, ok = wrap_function(c,
+            r'(static\s+bool\s+add_filename_trans\s*\([^)]*\)\s*\{)',
+            'LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0)',
+            stub_else='static bool add_filename_trans(struct policydb *db, const char *s, const char *t,\n'
+                     '                                const char *cls, const char *d, const char *o) { return true; }')
+        if ok:
+            c = c.replace('#include <linux/version.h>', '#include <linux/version.h>\n#define KSU_FILENAME_TRANS_GUARD 1', 1)
+
+    # 1e. ksu_destroy_sepolicy : guard (uses struct selinux_policy)
+    if 'KSU_DUP_SEPOLICY_GUARD' not in c:
+        c, ok = wrap_function(c,
+            r'(void\s+ksu_destroy_sepolicy\s*\([^)]*\)\s*\{)',
+            'LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)')
+        if ok:
+            c = c.replace('#include <linux/version.h>', '#include <linux/version.h>\n#define KSU_DUP_SEPOLICY_GUARD 1', 1)
+
+    # 1f. ksu_dup_sepolicy : guard
+    c, ok = wrap_function(c,
+        r'(struct\s+selinux_policy\s*\*\s*ksu_dup_sepolicy\s*\([^)]*\)\s*\{)',
+        'LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)')
 
     write(p, c, o)
 
 # ============================================================
-# 2. file_wrapper.c — erreurs ciblées
+# 2. sepolicy.h — declarations of ksu_dup_sepolicy/ksu_destroy_sepolicy
+# ============================================================
+p = os.path.join(root, "selinux/sepolicy.h")
+if os.path.isfile(p):
+    c, o = read(p), None
+    o = c
+    c = ensure_inc(c, '<linux/version.h>')
+    if 'KSU_SEPOLICY_HDR_GUARD' not in c:
+        # Find and guard declarations
+        for pat, name in [
+            (r'^(\s*void\s+ksu_destroy_sepolicy\s*\([^;]*\);)', 'ksu_destroy_sepolicy'),
+            (r'^(\s*struct\s+selinux_policy\s*\*\s*ksu_dup_sepolicy\s*\([^;]*\);)', 'ksu_dup_sepolicy'),
+        ]:
+            m = re.search(pat, c, re.M)
+            if m:
+                c = c[:m.start()] + '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n#define KSU_SEPOLICY_HDR_GUARD 1\n' + c[m.start():m.end()] + '\n#endif' + c[m.end():]
+        write(p, c, o)
+
+# ============================================================
+# 3. file_wrapper.c — guard function definitions
 # ============================================================
 p = os.path.join(root, "infra/file_wrapper.c")
 if os.path.isfile(p):
@@ -624,70 +515,90 @@ if os.path.isfile(p):
     o = c
     c = ensure_inc(c, '<linux/version.h>')
 
-    # 2a. ksu_wrapper_iopoll : #else → #elif >= 5.1.0
-    c = re.sub(
-        r'(#if LINUX_VERSION_CODE >= KERNEL_VERSION\(6, 1, 0\)\nstatic int ksu_wrapper_iopoll\([^)]*\)\s*\n\{.*?\n\})\n#else\n',
-        r'\1\n#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n',
-        c, flags=re.DOTALL, count=1
-    )
+    # 3a. ksu_wrapper_iopoll (function, exists in 5.1+)
+    if 'KSU_IOPOLL_FUNC' not in c:
+        c, ok = wrap_function(c,
+            r'(static\s+int\s+ksu_wrapper_iopoll\s*\([^)]*\)\s*\{)',
+            'LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)')
+        if ok:
+            c = c.replace('#include <linux/version.h>', '#include <linux/version.h>\n#define KSU_IOPOLL_FUNC 1', 1)
 
-    # 2b. p->ops.iopoll : guard (si pas déjà guardé)
-    if 'p->ops.iopoll = fp->f_op->iopoll' in c:
-        if 'KSU_IOPOLL_ASSIGN' not in c:
-            c = c.replace(
-                '    p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;',
-                '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n    p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;\n#endif\n#define KSU_IOPOLL_ASSIGN 1'
-            )
+    # 3b. ksu_wrapper_remap_file_range (function, exists in 4.20+)
+    if 'KSU_REMAP_FUNC' not in c:
+        c, ok = wrap_function(c,
+            r'(static\s+loff_t\s+ksu_wrapper_remap_file_range\s*\([^)]*\)\s*\{)',
+            'LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)')
+        if ok:
+            c = c.replace('#include <linux/version.h>', '#include <linux/version.h>\n#define KSU_REMAP_FUNC 1', 1)
 
-    # 2c. ksu_wrapper_remap_file_range : wrapper la fonction entière
-    if 'KSU_REMAP_WRAPPED' not in c:
-        c = c.replace(
-            'static loff_t ksu_wrapper_remap_file_range(struct file *file_in, loff_t pos_in, struct file *file_out, loff_t pos_out,\n                                           loff_t len, unsigned int remap_flags)',
-            '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n#define KSU_REMAP_WRAPPED 1\nstatic loff_t ksu_wrapper_remap_file_range(struct file *file_in, loff_t pos_in, struct file *file_out, loff_t pos_out,\n                                           loff_t len, unsigned int remap_flags)'
-        )
-        # trouver la fermeture de la fonction et ajouter #endif
-        start = c.find('static loff_t ksu_wrapper_remap_file_range')
-        if start >= 0:
-            # Chercher la première occurrence de "\n}" après start
-            end = c.find('\n}\n', start)
-            if end >= 0:
-                c = c[:end+2] + '\n#endif /* KSU_REMAP_WRAPPED */' + c[end+2:]
+    # 3c. ksu_wrapper_splice_eof (function, exists in 6.6+)
+    if 'KSU_SPLICE_EOF_FUNC' not in c:
+        c, ok = wrap_function(c,
+            r'(void\s+ksu_wrapper_splice_eof\s*\([^)]*\)\s*\{)',
+            'LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)')
+        if ok:
+            c = c.replace('#include <linux/version.h>', '#include <linux/version.h>\n#define KSU_SPLICE_EOF_FUNC 1', 1)
 
-    # 2d. p->ops.remap_file_range : guard
-    if 'p->ops.remap_file_range = fp->f_op->remap_file_range' in c:
-        if 'KSU_REMAP_ASSIGN' not in c:
-            c = c.replace(
-                '    p->ops.remap_file_range = fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;',
-                '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n    p->ops.remap_file_range = fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;\n#endif\n#define KSU_REMAP_ASSIGN 1'
-            )
+    # 3d. Guard .iopoll, .remap_file_range, .splice_eof in p->ops assignments
+    lines = c.split('\n')
+    out = []
+    for line in lines:
+        s = line.strip()
+        if re.match(r'p->ops\.iopoll\s*=', s) and 'KSU_IOPOLL_ASSIGN' not in c:
+            out.append('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)')
+            out.append(line)
+            out.append('#endif')
+        elif re.match(r'p->ops\.remap_file_range\s*=', s) and 'KSU_REMAP_ASSIGN' not in c:
+            out.append('#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)')
+            out.append(line)
+            out.append('#endif')
+        elif re.match(r'p->ops\.splice_eof\s*=', s) and 'KSU_SPLICE_EOF_ASSIGN' not in c:
+            out.append('#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)')
+            out.append(line)
+            out.append('#endif')
+        else:
+            out.append(line)
+    c = '\n'.join(out)
+    if 'KSU_IOPOLL_ASSIGN' not in c:
+        c = c.replace('#include <linux/version.h>', '#include <linux/version.h>\n#define KSU_IOPOLL_ASSIGN 1\n#define KSU_REMAP_ASSIGN 1\n#define KSU_SPLICE_EOF_ASSIGN 1', 1)
 
     write(p, c, o)
 
 # ============================================================
-# 3. pkg_observer.c — handle_inode_event
+# 4. selinux_hide.c — stub on 4.19
 # ============================================================
-p = os.path.join(root, 'manager/pkg_observer.c')
+p = os.path.join(root, 'feature/selinux_hide.c')
 if os.path.isfile(p):
     c, o = read(p), None
     o = c
-    c = ensure_inc(c, '<linux/version.h>')
-    if 'handle_inode_event' in c and 'KSU_FSNOTIFY_COMPAT' not in c:
-        lines, out = c.split('\n'), []
-        for line in lines:
-            if re.search(r'\.handle_inode_event\s*=', line) and not line.strip().startswith('#'):
-                out.append('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)')
-                out.append(line)
-                out.append('#endif')
-            else:
-                out.append(line)
-        c = '\n'.join(out).replace('#include <linux/version.h>', '#include <linux/version.h>\n#define KSU_FSNOTIFY_COMPAT 1', 1)
+    if 'KSU_SELINUX_HIDE_4_19_STUB' not in c:
+        stub_prefix = '''#include <linux/version.h>
+#include <linux/types.h>
+#include <linux/errno.h>
+#define KSU_SELINUX_HIDE_4_19_STUB 1
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+bool ksu_selinux_hide_enabled = false;
+bool ksu_selinux_hide_running = false;
+int ksu_selinux_hide_enable(void) { return -EOPNOTSUPP; }
+int ksu_selinux_hide_disable(void) { return 0; }
+void ksu_selinux_hide_unhook(void) { }
+void initialize_fake_status(void) { }
+void ksu_selinux_hide_handle_post_fs_data(void) { }
+void ksu_selinux_hide_handle_second_stage(void) { }
+void ksu_selinux_hide_drop_backup_if_unused(void) { }
+void ksu_selinux_hide_handle_umount(void) { }
+#else
+'''
+        c = re.sub(r'#include\s*[<"]linux/version\.h[>"]\s*\n', '', c, count=1)
+        c = stub_prefix + c + '\n#endif /* KSU_SELINUX_HIDE_4_19_STUB */\n'
         write(p, c, o)
 
 # ============================================================
-# 4. allowlist.c — put_task_struct
+# 5. dynamic_manager.c + allowlist.c — put_task_struct
 # ============================================================
-p = os.path.join(root, 'policy/allowlist.c')
-if os.path.isfile(p):
+for rel in ['manager/dynamic_manager.c', 'policy/allowlist.c']:
+    p = os.path.join(root, rel)
+    if not os.path.isfile(p): continue
     c, o = read(p), None
     o = c
     if 'put_task_struct' in c:
@@ -696,7 +607,7 @@ if os.path.isfile(p):
         write(p, c, o)
 
 # ============================================================
-# 5. TWA_RESUME (reste des fichiers)
+# 6. TWA_RESUME
 # ============================================================
 TWA = '\n#ifndef TWA_RESUME\n#define TWA_RESUME 0\n#endif\n'
 for rel in ['manager/pkg_observer.c','manager/dynamic_manager.c','policy/allowlist.c','supercall/supercall.c']:
@@ -712,7 +623,27 @@ for rel in ['manager/pkg_observer.c','manager/dynamic_manager.c','policy/allowli
         write(p, c, o)
 
 # ============================================================
-# 6. SECCOMP
+# 7. pkg_observer.c — handle_inode_event
+# ============================================================
+p = os.path.join(root, 'manager/pkg_observer.c')
+if os.path.isfile(p):
+    c, o = read(p), None
+    o = c
+    c = ensure_inc(c, '<linux/version.h>')
+    if 'KSU_FSNOTIFY_COMPAT' not in c:
+        lines, out = c.split('\n'), []
+        for line in lines:
+            if re.search(r'\.handle_inode_event\s*=', line) and not line.strip().startswith('#'):
+                out.append('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)')
+                out.append(line)
+                out.append('#endif')
+            else:
+                out.append(line)
+        c = '\n'.join(out).replace('#include <linux/version.h>', '#include <linux/version.h>\n#define KSU_FSNOTIFY_COMPAT 1', 1)
+        write(p, c, o)
+
+# ============================================================
+# 8. SECCOMP + filter_count + tasklist_lock + minmax.h + mount.h
 # ============================================================
 p = os.path.join(root, 'infra/seccomp_cache.c')
 if os.path.isfile(p):
@@ -726,9 +657,6 @@ if os.path.isfile(p):
         c = c[:last] + stub + c[last:]
         write(p, c, o)
 
-# ============================================================
-# 7. filter_count
-# ============================================================
 p = os.path.join(root, 'policy/app_profile.c')
 if os.path.isfile(p):
     c, o = read(p), None
@@ -745,9 +673,6 @@ if os.path.isfile(p):
         c = '\n'.join(out).replace('#include <linux/version.h>', '#include <linux/version.h>\n#define KSU_FILTER_COUNT_COMPAT 1', 1)
         write(p, c, o)
 
-# ============================================================
-# 8. tasklist_lock / init_task
-# ============================================================
 p = os.path.join(root, 'supercall/dispatch.c')
 if os.path.isfile(p):
     c, o = read(p), None
@@ -762,29 +687,26 @@ if os.path.isfile(p):
         c = c[:last] + '\n#ifndef KSU_TASKLIST_COMPAT\n#define KSU_TASKLIST_COMPAT 1\nextern rwlock_t tasklist_lock;\nextern struct task_struct init_task;\n#endif\n' + c[last:]
         write(p, c, o)
 
-# ============================================================
-# 9. minmax.h / mount.h
-# ============================================================
 p = os.path.join(root, 'sulog/event.c')
 if os.path.isfile(p):
     c, o = read(p), None
     o = c
-    if 'linux/minmax.h' in c:
+    if 'linux/minmax.h' in c and 'KSU_MINMAX_COMPAT' not in c:
         c = c.replace('#include <linux/minmax.h>',
-            '#include <linux/version.h>\n#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n#include <linux/minmax.h>\n#else\n#include <linux/kernel.h>\n#endif')
+            '#include <linux/version.h>\n#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n#include <linux/minmax.h>\n#else\n#include <linux/kernel.h>\n#endif\n#define KSU_MINMAX_COMPAT 1')
         write(p, c, o)
 
 p = os.path.join(root, 'infra/su_mount_ns.c')
 if os.path.isfile(p):
     c, o = read(p), None
     o = c
-    if 'uapi/linux/mount.h' in c:
+    if 'uapi/linux/mount.h' in c and 'KSU_MOUNT_HDR_COMPAT' not in c:
         c = c.replace('#include <uapi/linux/mount.h>',
-            '#include <linux/version.h>\n#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0)\n#include <uapi/linux/mount.h>\n#else\n#include <linux/mount.h>\n#endif')
+            '#include <linux/version.h>\n#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0)\n#include <uapi/linux/mount.h>\n#else\n#include <linux/mount.h>\n#endif\n#define KSU_MOUNT_HDR_COMPAT 1')
         write(p, c, o)
 
 # ============================================================
-# 10. MODULE_IMPORT_NS
+# 9. MODULE_IMPORT_NS
 # ============================================================
 for dp, dn, fn in os.walk(root):
     for f in fn:
@@ -796,11 +718,10 @@ for dp, dn, fn in os.walk(root):
         c2 = re.sub(r'^([ \t]*MODULE_IMPORT_NS\([^\n]*\);[ \t]*)$', r'#ifdef MODULE_IMPORT_NS\n\1\n#endif', c, flags=re.M)
         if c2 != o: write(p, c2, o)
 
-print(f"  ✅ portage ciblé : {total} fichier(s)")
+print(f"  ✅ portage : {total} fichier(s)")
 PORTEOF
 
 # ==================== 5. CONFIG ====================
-echo "=== Configuration ==="
 export ARCH=arm64 SUBARCH=arm64
 export CROSS_COMPILE=aarch64-linux-gnu-
 export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
@@ -819,26 +740,26 @@ fi
 
 mkdir -p out
 make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 vendor/lito-perf_defconfig
-{
-  echo "CONFIG_KSU=y"
-  echo "CONFIG_KSU_HOOK_TRACEPOINT=y"
-  echo "# CONFIG_KSU_HOOK_SUSFS_INLINE is not set"
-  echo "# CONFIG_KSU_SUSFS is not set"
-  echo "CONFIG_KPROBES=y"
-  echo "CONFIG_HAVE_KPROBES=y"
-  echo "CONFIG_KRETPROBES=y"
-  echo "CONFIG_KALLSYMS=y"
-  echo "CONFIG_KALLSYMS_ALL=y"
-  echo "CONFIG_EXT4_FS=y"
-  echo "CONFIG_HEADERS_INSTALL=y"
-  echo "CONFIG_THREAD_INFO_IN_TASK=y"
-  echo "CONFIG_FTRACE=y"
-  echo "CONFIG_FTRACE_SYSCALLS=y"
-  echo "CONFIG_SECCOMP=y"
-  echo "CONFIG_SECCOMP_FILTER=y"
-  echo "CONFIG_COMPAT=y"
-  echo "CONFIG_COMPAT_32BIT_TIME=y"
-} >> out/.config
+cat >> out/.config <<'EOF'
+CONFIG_KSU=y
+CONFIG_KSU_HOOK_TRACEPOINT=y
+# CONFIG_KSU_HOOK_SUSFS_INLINE is not set
+# CONFIG_KSU_SUSFS is not set
+CONFIG_KPROBES=y
+CONFIG_HAVE_KPROBES=y
+CONFIG_KRETPROBES=y
+CONFIG_KALLSYMS=y
+CONFIG_KALLSYMS_ALL=y
+CONFIG_EXT4_FS=y
+CONFIG_HEADERS_INSTALL=y
+CONFIG_THREAD_INFO_IN_TASK=y
+CONFIG_FTRACE=y
+CONFIG_FTRACE_SYSCALLS=y
+CONFIG_SECCOMP=y
+CONFIG_SECCOMP_FILTER=y
+CONFIG_COMPAT=y
+CONFIG_COMPAT_32BIT_TIME=y
+EOF
 make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig 2>&1 | tail -3
 grep -q "^CONFIG_KSU=y" out/.config || { echo "❌ CONFIG_KSU off"; exit 1; }
 
