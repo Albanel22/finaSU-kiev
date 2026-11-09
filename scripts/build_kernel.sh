@@ -5,13 +5,7 @@ set -euo pipefail
 # FinaSU (LyraVoid) en dur dans le noyau 4.19 — ÉTAPE A : FinaSU seul, hooks Tracepoint, SANS SuSFS
 # Motorola One 5G Ace (kiev) — LineageOS 23.2
 #
-# Objectif : voir si le driver FinaSU compile et démarre sur ce noyau 4.19 (compatibilité NON démontrée).
-# Réutilise : source du noyau épinglée, garde-fou clang, make -k + build-errors.txt, audits, ksud, repack.
-#
-# SIGNATURE DU MANAGER : le noyau vérifie l'APK du manager (taille + SHA-256 du certificat compilés).
-#   1) Place l'APK du manager FinaSU dans patches/manager.apk -> le script calcule les valeurs, OU
-#   2) FINASU_EXPECTED_SIZE=0x... FINASU_EXPECTED_HASH=<sha256> en variables d'environnement.
-#   Sans l'un ni l'autre, le noyau garde les valeurs « placeholder » : le manager ne sera pas reconnu.
+# Objectif : voir si le driver FinaSU compile et démarre sur ce noyau 4.19.
 # =============================================================================
 
 FINASU_URL="${FINASU_URL:-https://github.com/LyraVoid/FinaSU.git}"
@@ -33,7 +27,7 @@ mkdir -p "$GITHUB_WORKSPACE/output"
 AUDIT="$GITHUB_WORKSPACE/output/audit-${VER}.txt"
 : > "$AUDIT"
 
-# ---------- Résumé du build : écrit même si le script s'arrête n'importe où ----------
+# ---------- Résumé du build ----------
 summarize() {
     local rc=$?
     set +e
@@ -112,7 +106,7 @@ sudo apt-get install -y bc bison build-essential ccache flex glibc-source libelf
 pip3 install --quiet gdown
 cd "$GITHUB_WORKSPACE"
 
-# ==================== 1. CLONAGE DU NOYAU (source épinglée) ====================
+# ==================== 1. CLONAGE DU NOYAU ====================
 KERNEL_URL="https://github.com/LineageOS/android_kernel_motorola_sm8250.git"
 git clone --filter=blob:none --no-checkout -b lineage-23.2 "$KERNEL_URL" kernel_sources
 cd kernel_sources
@@ -124,7 +118,7 @@ fi
 echo "Source figée sur : $KERNEL_PIN" | tee -a "$AUDIT"
 echo "SHA complet de la source : $(git rev-parse HEAD)" | tee -a "$AUDIT"
 
-# ==================== 2. INTÉGRATION FinaSU (setup officiel, checkout existant) ====================
+# ==================== 2. INTÉGRATION FinaSU ====================
 echo ""
 echo "=== Intégration FinaSU ($FINASU_REF) ==="
 rm -rf drivers/kernelsu FinaSU 2>/dev/null || true
@@ -158,7 +152,7 @@ echo "✅ FinaSU intégré ($KSU_DIR -> $(readlink drivers/kernelsu || echo '?')
     true
 } 2>&1 | tee -a "$AUDIT"
 
-# ==================== 3. SIGNATURE DU MANAGER (taille + SHA-256 du certificat) ====================
+# ==================== 3. SIGNATURE DU MANAGER ====================
 MGR_APK="$GITHUB_WORKSPACE/patches/manager.apk"
 if [ -z "$FINASU_EXPECTED_SIZE" ] && [ -f "$MGR_APK" ]; then
     SIG_OUT=$(python3 - "$MGR_APK" <<'PYEOF' || true
@@ -199,7 +193,7 @@ PYEOF
         FINASU_EXPECTED_SIZE=$(echo "$SIG_OUT" | sed -n '1p')
         FINASU_EXPECTED_HASH=$(echo "$SIG_OUT" | sed -n '2p')
     else
-        echo "⚠️ signature de patches/manager.apk illisible (schéma v2/v3 absent ?)" | tee -a "$AUDIT"
+        echo "⚠️ signature de patches/manager.apk illisible" | tee -a "$AUDIT"
     fi
 fi
 SIG_ARGS=""
@@ -207,7 +201,7 @@ if [ -n "$FINASU_EXPECTED_SIZE" ] && [ -n "$FINASU_EXPECTED_HASH" ]; then
     SIG_ARGS="KSU_EXPECTED_SIZE=$FINASU_EXPECTED_SIZE KSU_EXPECTED_HASH=$FINASU_EXPECTED_HASH"
     echo "Signature du manager : taille $FINASU_EXPECTED_SIZE, sha256 $FINASU_EXPECTED_HASH" | tee -a "$AUDIT"
 else
-    echo "⚠️ AUCUNE signature de manager fournie : valeurs par défaut du noyau (manager non reconnu)" | tee -a "$AUDIT"
+    echo "⚠️ AUCUNE signature de manager fournie" | tee -a "$AUDIT"
 fi
 
 # ==================== 3g. STATIC EXPORTS SELINUX ====================
@@ -230,8 +224,7 @@ echo "=== Static exports SELinux ==="
 
 # ==================== 3h. FIX O_CLOEXEC ====================
 echo ""
-echo "=== Fix O_CLOEXEC dans TOUS les fichiers (détection Manager) ==="
-
+echo "=== Fix O_CLOEXEC ==="
 FILES_GET_UNUSED=$(grep -rl "get_unused_fd_flags(O_CLOEXEC)" "$KSU_DIR/" 2>/dev/null || true)
 if [ -n "$FILES_GET_UNUSED" ]; then
     for f in $FILES_GET_UNUSED; do
@@ -239,7 +232,6 @@ if [ -n "$FILES_GET_UNUSED" ]; then
         echo "  ✅ get_unused_fd_flags fixé dans $f"
     done
 fi
-
 FILES_ANON_INODE=$(grep -rl "anon_inode_getfile" "$KSU_DIR/" 2>/dev/null || true)
 if [ -n "$FILES_ANON_INODE" ]; then
     for f in $FILES_ANON_INODE; do
@@ -250,9 +242,9 @@ if [ -n "$FILES_ANON_INODE" ]; then
     done
 fi
 
-# ==================== 4b. PORTAGE 4.19 DU DRIVER FinaSU (SELinux lourd + file_wrapper) ====================
+# ==================== 4b. PORTAGE 4.19 (SELinux lourd + file_wrapper) — VERSION CORRIGÉE ====================
 echo ""
-echo "=== Portage 4.19 (SELinux lourd + file_wrapper) ==="
+echo "=== Portage 4.19 (SELinux lourd + file_wrapper) — version corrigée ==="
 
 python3 - "$KSU_DIR" <<'PORTEOF' 2>&1 | tee -a "$AUDIT"
 import os, re, sys
@@ -270,21 +262,22 @@ def write_if_changed(path, new_content, old_content):
         return True
     return False
 
-# ---------------------------------------------------------------------
-# 1. rules.c — chemin ancien noyau (< 5.10)
-# ---------------------------------------------------------------------
+# =====================================================================
+# 1. rules.c
+# =====================================================================
 rules_path = os.path.join(root, "selinux", "rules.c")
 if os.path.isfile(rules_path):
     with open(rules_path, encoding='utf-8', errors='replace') as f:
         c = f.read()
     o = c
 
-    # Stub backup_sepolicy sur vieux noyaux
+    if '#include <linux/version.h>' not in c and '#include "linux/version.h"' not in c:
+        c = '#include <linux/version.h>\n' + c
+
     if "struct selinux_policy *backup_sepolicy;" in c and "KSU_BACKUP_SEPOLICY_STUB" not in c:
         c = c.replace(
             "struct selinux_policy *backup_sepolicy;",
             '''#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
-/* stub */
 struct selinux_policy *backup_sepolicy = NULL;
 #define KSU_BACKUP_SEPOLICY_STUB 1
 #else
@@ -292,8 +285,7 @@ struct selinux_policy *backup_sepolicy;
 #endif'''
         )
 
-    old_apply = r'void apply_kernelsu_rules\(\)\s*\{'
-    new_apply = r'''
+    old_kernel_path = r'''
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 /* ========== Chemin noyau ancien (4.14 / 4.19) ========== */
 static struct policydb *ksu_get_policydb(void)
@@ -311,7 +303,7 @@ void apply_kernelsu_rules(void)
     struct policydb *db = ksu_get_policydb();
 
     if (!getenforce()) {
-        pr_info("SELinux permissive or disabled, apply rules! (old kernel path)\\n");
+        pr_info("SELinux permissive or disabled, apply rules! (old kernel path)\n");
     }
 
     ksu_type(db, KERNEL_SU_DOMAIN, "domain");
@@ -374,25 +366,31 @@ void apply_kernelsu_rules(void)
     selnl_notify_policyload(0);
 #endif
 
-    pr_info("KernelSU rules applied (4.19 compatibility path)\\n");
+    pr_info("KernelSU rules applied (4.19 compatibility path)\n");
 }
-#else
-/* ========== Chemin moderne (>= 5.10) ========== */
-void apply_kernelsu_rules()
-{'''
 
-    if re.search(old_apply, c):
-        c = re.sub(old_apply, new_apply, c, count=1)
-        c = c.replace(
-            "out_unlock:\n    mutex_unlock(&selinux_state.policy_mutex);\n}",
-            "out_unlock:\n    mutex_unlock(&selinux_state.policy_mutex);\n}\n#endif /* end of dual-path apply_kernelsu_rules */"
+#else /* >= 5.10 — code original FinaSU */
+'''
+
+    if re.search(r'void\s+apply_kernelsu_rules\s*\(\s*\)\s*\{', c) and "Chemin noyau ancien" not in c:
+        c = re.sub(
+            r'void\s+apply_kernelsu_rules\s*\(\s*\)\s*\{',
+            old_kernel_path + r'\nvoid apply_kernelsu_rules()\n{',
+            c,
+            count=1
+        )
+        c = re.sub(
+            r'(mutex_unlock\s*\(\s*&selinux_state\.policy_mutex\s*\)\s*;\s*\n\s*\})',
+            r'\1\n#endif /* end dual-path apply_kernelsu_rules */',
+            c,
+            count=1
         )
 
     write_if_changed(rules_path, c, o)
 
-# ---------------------------------------------------------------------
-# 2. selinux_hide.c — désactivation agressive sur < 5.10
-# ---------------------------------------------------------------------
+# =====================================================================
+# 2. selinux_hide.c
+# =====================================================================
 hide_path = os.path.join(root, "feature", "selinux_hide.c")
 if os.path.isfile(hide_path):
     with open(hide_path, encoding='utf-8', errors='replace') as f:
@@ -401,10 +399,12 @@ if os.path.isfile(hide_path):
 
     if "KSU_SELINUX_HIDE_DISABLED_ON_OLD_KERNEL" not in c:
         header = '''/* Auto-portage 4.19 : selinux_hide désactivé sur noyaux < 5.10 */
+#include <linux/version.h>
 #define KSU_SELINUX_HIDE_DISABLED_ON_OLD_KERNEL 1
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 
+#include <linux/errno.h>
 bool ksu_selinux_hide_enabled = false;
 bool ksu_selinux_hide_running = false;
 
@@ -415,12 +415,13 @@ void initialize_fake_status(void) {}
 #else /* >= 5.10 */
 
 '''
-        c = header + c + "\n#endif /* LINUX_VERSION_CODE < 5.10.0 */\n"
+        c = re.sub(r'#include\s*[<"]linux/version\.h[>"]\s*\n', '', c)
+        c = header + c + "\n#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0) */\n"
         write_if_changed(hide_path, c, o)
 
-# ---------------------------------------------------------------------
-# 3. sepolicy.c — protections filename_trans
-# ---------------------------------------------------------------------
+# =====================================================================
+# 3. sepolicy.c
+# =====================================================================
 sepolicy_path = os.path.join(root, "selinux", "sepolicy.c")
 if os.path.isfile(sepolicy_path):
     with open(sepolicy_path, encoding='utf-8', errors='replace') as f:
@@ -428,32 +429,35 @@ if os.path.isfile(sepolicy_path):
     o = c
 
     if "KSU_FILENAME_TRANS_STUB" not in c:
+        if '#include <linux/version.h>' not in c:
+            c = '#include <linux/version.h>\n' + c
+
         stub = '''
 /* ========== Compat 4.19 : filename_trans trop différent ========== */
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
 #define KSU_FILENAME_TRANS_STUB 1
 
 static bool add_filename_trans(struct policydb *db, const char *s, const char *t,
-                               const char *c, const char *d, const char *o)
+                               const char *cls, const char *d, const char *o)
 {
     pr_info("add_filename_trans ignored on kernel < 5.8\\n");
     return true;
 }
-#endif
+#endif /* < 5.8 */
 '''
-        c = re.sub(
-            r'(#include "ss/symtab.h".*?\n)',
-            r'\1\n' + stub + '\n',
-            c,
-            count=1,
-            flags=re.DOTALL
-        )
+        last_include = 0
+        for m in re.finditer(r'#include\s+[<"].*?[>"]\s*\n', c):
+            last_include = m.end()
+        if last_include > 0:
+            c = c[:last_include] + "\n" + stub + "\n" + c[last_include:]
+        else:
+            c = stub + "\n" + c
 
-    write_if_changed(sepolicy_path, c, o)
+        write_if_changed(sepolicy_path, c, o)
 
-# ---------------------------------------------------------------------
-# 4. file_wrapper.c (iopoll / remap_file_range) — déjà présent, on le garde
-# ---------------------------------------------------------------------
+# =====================================================================
+# 4. file_wrapper.c
+# =====================================================================
 def find_matching(c, i, open_ch, close_ch):
     depth = 0
     for k in range(i, len(c)):
@@ -496,7 +500,10 @@ for dp, dn, fn in os.walk(root):
     for f in fn:
         if not f.endswith(('.c', '.h')): continue
         p = os.path.join(dp, f)
-        c = open(p, encoding='utf-8', errors='replace').read()
+        try:
+            c = open(p, encoding='utf-8', errors='replace').read()
+        except:
+            continue
         o = c
         c = re.sub(r'^([ \t]*MODULE_IMPORT_NS\([^\n]*\);[ \t]*)$', r'#ifdef MODULE_IMPORT_NS\n\1\n#endif', c, flags=re.M)
         if f == 'file_wrapper.c':
@@ -542,7 +549,7 @@ exec clang -Wno-unknown-warning-option "${args[@]}" -Wno-unknown-warning-option
 WRAPEOF
     chmod +x "$GITHUB_WORKSPACE/clang-wrap"
     CC_ARGS="CC=$GITHUB_WORKSPACE/clang-wrap"
-    echo "⚠️ clang < 16 : wrapper actif (flags inconnus ignorés)" | tee -a "$AUDIT"
+    echo "⚠️ clang < 16 : wrapper actif" | tee -a "$AUDIT"
 fi
 
 mkdir -p out
@@ -580,7 +587,7 @@ echo "=== État final .config ==="
 } 2>&1 | tee -a "$AUDIT"
 
 if ! grep -q "^CONFIG_KSU=y" out/.config; then
-    echo "❌ CONFIG_KSU non activé (dépendances du Kconfig non satisfaites ?), abandon" | tee -a "$AUDIT"
+    echo "❌ CONFIG_KSU non activé" | tee -a "$AUDIT"
     grep -n "KSU" out/.config | head -20 || true
     exit 1
 fi
@@ -591,7 +598,7 @@ sed -i 's/if (!check_version(/if (0 \&\& !check_version(/g' kernel/module.c
 printf "\n/* --- Début Patch Tactile --- */\n#include <linux/notifier.h>\n#include <linux/module.h>\nstatic BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);\nint panel_register_notifier(struct notifier_block *nb) {\n    return blocking_notifier_chain_register(&motorola_panel_notifier_list, nb);\n}\nEXPORT_SYMBOL(panel_register_notifier);\nint panel_unregister_notifier(struct notifier_block *nb) {\n    return blocking_notifier_chain_unregister(&motorola_panel_notifier_list, nb);\n}\nEXPORT_SYMBOL(panel_unregister_notifier);\nvoid touch_set_state(int state) { return; }\nEXPORT_SYMBOL(touch_set_state);\n/* --- Fin Patch Tactile --- */\n" >> techpack/display/msm/msm_drv.c
 echo "✅ Patchs Motorola appliqués"
 
-# ==================== 7. COMPILATION KERNEL (make -k) ====================
+# ==================== 7. COMPILATION KERNEL ====================
 echo "=== Compilation du kernel ==="
 set +eo pipefail
 make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 \
@@ -607,7 +614,7 @@ if [ "$MAKE_RC" -ne 0 ] || [ ! -f out/arch/arm64/boot/Image ]; then
         echo "=== ERREURS (rc=$MAKE_RC) ==="
         grep -nE "error:|undefined symbol|undefined reference|fatal error:|\*\*\*" build.log | head -150 || true
         echo ""
-        echo "=== SYMBOLES NON DÉFINIS (édition de liens) ==="
+        echo "=== SYMBOLES NON DÉFINIS ==="
         grep -oE "undefined (symbol|reference to)[: ]+[^ ]+" build.log | sort | uniq -c | sort -rn | head -60 || true
         echo ""
         echo "=== 150 DERNIÈRES LIGNES ==="
@@ -637,10 +644,9 @@ KSUD_ROOT=""
 if [ -n "$KSU_REPO_ROOT" ] && [ -f "$KSU_REPO_ROOT/userspace/ksud/Cargo.toml" ]; then
     KSUD_DIR="$KSU_REPO_ROOT/userspace/ksud"
     KSUD_ROOT="$KSU_REPO_ROOT"
-    echo "✅ ksud pris dans le MÊME checkout que le driver ($KSU_REF) : $KSUD_DIR"
+    echo "✅ ksud pris dans le MÊME checkout que le driver ($KSU_REF)"
 else
-    echo "⚠️  userspace/ksud absent du checkout $KSU_REF"
-    echo "⚠️  Fallback : ksud depuis la branche '$KSUD_FALLBACK_REF'"
+    echo "⚠️ Fallback ksud depuis $KSUD_FALLBACK_REF"
     rm -rf "$GITHUB_WORKSPACE/ksud-src" 2>/dev/null || true
     git clone --depth=1 --branch "$KSUD_FALLBACK_REF" https://github.com/KernelSU-Next/KernelSU-Next.git "$GITHUB_WORKSPACE/ksud-src"
     KSUD_DIR="$GITHUB_WORKSPACE/ksud-src/userspace/ksud"
@@ -648,7 +654,7 @@ else
 fi
 
 if [ ! -f "$KSUD_DIR/Cargo.toml" ]; then
-    echo "❌ Cargo.toml de ksud introuvable dans $KSUD_DIR"; exit 1
+    echo "❌ Cargo.toml de ksud introuvable"; exit 1
 fi
 
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -678,13 +684,12 @@ cargo +nightly build --release --target aarch64-linux-android
 KSUD_BINARY=$(find "$KSUD_ROOT" -type f -path "*aarch64-linux-android/release/ksud" 2>/dev/null | head -1 || true)
 if [ -z "$KSUD_BINARY" ]; then echo "❌ ksud introuvable"; exit 1; fi
 cp "$KSUD_BINARY" "$GITHUB_WORKSPACE/ksud"; chmod 755 "$GITHUB_WORKSPACE/ksud"
-echo "✅ ksud compilé ($KSUD_BINARY)"
+echo "✅ ksud compilé"
 cd "$GITHUB_WORKSPACE"
 
 # ==================== 9. REPACK ====================
 echo ""
-echo "=== Repack (méthode backslashxx : magiskboot cpio add) ==="
-
+echo "=== Repack ==="
 rm -f ./boot-stock.img 2>/dev/null || true
 if gdown "https://drive.google.com/uc?id=${BOOT_GDRIVE_ID}" -O boot-stock.img 2>&1; then
     echo "  ✅ boot.img : $(du -h boot-stock.img | cut -f1)"
@@ -739,7 +744,6 @@ if [ -f "kernel" ]; then
     HASH_COMPILED=$(cat /tmp/kernel_compiled_hash.txt)
     [ "$HASH_EXTRACTED" = "$HASH_COMPILED" ] && echo "✅ Noyau IDENTIQUE"
 fi
-
 if [ -f "ramdisk.cpio" ]; then
     if ../repack/magiskboot cpio ramdisk.cpio "exists data/adb/ksud/ksud" 2>/dev/null; then
         echo "  ✅ ksud présent dans /data/adb/ksud/"
