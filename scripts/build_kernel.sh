@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # =============================================================================
-# FinaSU (LyraVoid) en dur dans le noyau 4.19 — ÉTAPE A
-# rules.c dual-path + portage non-SELinux complet (cible : ne laisser que sepolicy.c)
+# FinaSU (LyraVoid) — noyau 4.19 — ÉTAPE A (Tracepoint, sans SuSFS)
+# Script global unifié : rules dual-path + portages + file_wrapper propre
 # =============================================================================
 
 FINASU_URL="${FINASU_URL:-https://github.com/LyraVoid/FinaSU.git}"
@@ -15,7 +15,7 @@ VER="finasu-A"
 KSU_REF="$FINASU_REF"
 KSUD_FALLBACK_REF="${KSUD_FALLBACK_REF:-v3.4.2}"
 
-echo "=== Build FinaSU ($FINASU_REF) — étape A (Tracepoint, sans SuSFS) ==="
+echo "=== Build FinaSU ($FINASU_REF) — étape A ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -163,7 +163,7 @@ else
     echo "⚠️ AUCUNE signature de manager fournie" | tee -a "$AUDIT"
 fi
 
-# ==================== 3g/3h. EXPORTS + O_CLOEXEC ====================
+# ==================== 3g/3h EXPORTS + O_CLOEXEC ====================
 [ -f "security/selinux/selinuxfs.c" ] && {
     sed -i 's/^static ssize_t (\*write_op\[\])/ssize_t (*write_op[])/' security/selinux/selinuxfs.c
     sed -i 's/^static const struct file_operations sel_handle_status_ops/const struct file_operations sel_handle_status_ops/' security/selinux/selinuxfs.c
@@ -183,10 +183,10 @@ grep -rl "anon_inode_getfile" "$KSU_DIR/" 2>/dev/null | while read -r f; do
     sed -i 's/O_RDWR | O_CLOEXEC/O_RDWR/g; s/O_RDWR|O_CLOEXEC/O_RDWR/g; s/, O_CLOEXEC)/)/g' "$f"
 done || true
 
-# ==================== 4b. PORTAGE 4.19 ====================
-echo "=== Portage 4.19 ==="
+# ==================== 4b. PORTAGE 4.19 (UNIFIÉ) ====================
+echo "=== Portage 4.19 unifié ==="
 
-# 4b.1 rules.c dual-path
+# --- 4b.1 rules.c dual-path (fichier complet) ---
 cat > "$KSU_DIR/selinux/rules.c" << 'RULESEOF'
 #include "linux/rcupdate.h"
 #include "security.h"
@@ -312,7 +312,7 @@ void apply_kernelsu_rules(void)
 	mutex_lock(&selinux_state.policy_mutex);
 	old_pol = rcu_dereference_protected(selinux_state.policy, lockdep_is_held(&selinux_state.policy_mutex));
 	backup_sepolicy = ksu_dup_sepolicy(old_pol);
-	if (IS_ERR(backup_sepolicy)) { backup_sepolicy = NULL; }
+	if (IS_ERR(backup_sepolicy)) backup_sepolicy = NULL;
 	else {
 		backup_sepolicy->sidtab = kzalloc(sizeof(*backup_sepolicy->sidtab), GFP_KERNEL);
 		if (!backup_sepolicy->sidtab) { ksu_destroy_sepolicy(backup_sepolicy); backup_sepolicy = NULL; }
@@ -514,153 +514,200 @@ out_free: kvfree(payload); return ret;
 RULESEOF
 echo "  ✅ rules.c dual-path"
 
-# 4b.2 Python portage
+# --- 4b.2 Portages Python (dont file_wrapper PROPRE) ---
 python3 - "$KSU_DIR" <<'PORTEOF' 2>&1 | tee -a "$AUDIT"
 import os, re, sys
+
 root = sys.argv[1]
 total = 0
 
 def read(p):
-    with open(p, encoding='utf-8', errors='replace') as f: return f.read()
+    with open(p, encoding='utf-8', errors='replace') as f:
+        return f.read()
+
 def write(p, c, o):
     global total
     if c != o:
         open(p, 'w', encoding='utf-8').write(c)
         total += 1
         print(f"  ✅ {os.path.relpath(p, root)}")
+
 def ensure_inc(c, inc):
-    if inc in c: return c
+    if inc in c:
+        return c
     last = 0
-    for m in re.finditer(r'#include\s+[<"].*?[>"]\s*\n', c): last = m.end()
+    for m in re.finditer(r'#include\s+[<"].*?[>"]\s*\n', c):
+        last = m.end()
     return (c[:last] + f'#include {inc}\n' + c[last:]) if last else f'#include {inc}\n' + c
+
 def ensure_ver(c):
     return c if 'linux/version.h' in c else ensure_inc(c, '<linux/version.h>')
 
-# selinux_hide
+# ----- selinux_hide -----
 p = os.path.join(root, "feature/selinux_hide.c")
 if os.path.isfile(p):
-    c, o = read(p), None
+    c = read(p)
     o = c
     if "KSU_SELINUX_HIDE_DISABLED_ON_OLD_KERNEL" not in c:
-        h = ("#include <linux/version.h>\n#include <linux/types.h>\n#include <linux/errno.h>\n"
-             "#define KSU_SELINUX_HIDE_DISABLED_ON_OLD_KERNEL 1\n"
-             "#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n"
-             "bool ksu_selinux_hide_enabled = false;\nbool ksu_selinux_hide_running = false;\n"
-             "int ksu_selinux_hide_enable(void) { return -EOPNOTSUPP; }\n"
-             "void ksu_selinux_hide_unhook(void) {}\nvoid initialize_fake_status(void) {}\n#else\n")
+        h = (
+            "#include <linux/version.h>\n#include <linux/types.h>\n#include <linux/errno.h>\n"
+            "#define KSU_SELINUX_HIDE_DISABLED_ON_OLD_KERNEL 1\n"
+            "#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n"
+            "bool ksu_selinux_hide_enabled = false;\nbool ksu_selinux_hide_running = false;\n"
+            "int ksu_selinux_hide_enable(void) { return -EOPNOTSUPP; }\n"
+            "void ksu_selinux_hide_unhook(void) {}\nvoid initialize_fake_status(void) {}\n#else\n"
+        )
         c = re.sub(r'#include\s*[<"]linux/version\.h[>"]\s*\n', '', c)
         c = h + c + "\n#endif\n"
         write(p, c, o)
 
-# sepolicy filename_trans
+# ----- sepolicy : garde add_filename_trans uniquement -----
 p = os.path.join(root, "selinux/sepolicy.c")
 if os.path.isfile(p):
-    c, o = read(p), None
+    c = read(p)
     o = c
     if "KSU_FILENAME_TRANS_GUARD" not in c:
         c = ensure_ver(c)
         pat = r'(static\s+bool\s+add_filename_trans\s*\([^)]*\)\s*\{)'
         if re.search(pat, c):
-            c = re.sub(pat, r'#define KSU_FILENAME_TRANS_GUARD 1\n#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)\n\1', c, count=1)
+            c = re.sub(
+                pat,
+                r'#define KSU_FILENAME_TRANS_GUARD 1\n#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)\n\1',
+                c, count=1,
+            )
             c = re.sub(
                 r'(#if LINUX_VERSION_CODE >= KERNEL_VERSION\(5, 8, 0\)\nstatic bool add_filename_trans[\s\S]*?\n\})',
                 r'\1\n#else\nstatic bool add_filename_trans(struct policydb *db, const char *s, const char *t,\n'
-                r' const char *cls, const char *d, const char *o) { return true; }\n#endif', c, count=1)
+                r' const char *cls, const char *d, const char *o) { return true; }\n#endif',
+                c, count=1,
+            )
         write(p, c, o)
 
-# file_wrapper — iopoll renforcé (fix restant)
+# ----- file_wrapper PROPRE (pas de wrap de fonction) -----
 p = os.path.join(root, "infra/file_wrapper.c")
 if os.path.isfile(p):
-    c, o = read(p), None
+    c = read(p)
     o = c
+
+    # Enlever d'anciens gardes mal posés (évite macros non terminées)
+    c = re.sub(
+        r'#if\s+LINUX_VERSION_CODE\s*>=\s*KERNEL_VERSION\(\s*5\s*,\s*1\s*,\s*0\s*\)\s*\n(.*?\n)#endif\s*\n',
+        r'\1', c,
+    )
+    c = re.sub(
+        r'#if\s+LINUX_VERSION_CODE\s*>=\s*KERNEL_VERSION\(\s*4\s*,\s*20\s*,\s*0\s*\)\s*\n(.*?\n)#endif\s*\n',
+        r'\1', c,
+    )
+
     c = ensure_ver(c)
-    # Protéger TOUTE occurrence de .iopoll
-    lines, out, i = c.split('\n'), [], 0
-    while i < len(lines):
-        line = lines[i]
-        if re.search(r'\.iopoll\b', line) and not line.strip().startswith('#'):
-            # Vérifier si déjà dans un #if
+
+    # REMAP_FILE_DEDUP
+    if 'REMAP_FILE_DEDUP' in c and 'KSU_REMAP_FILE_DEDUP_COMPAT' not in c:
+        last = 0
+        for m in re.finditer(r'#include\s+[<"].*?[>"]\s*\n', c):
+            last = m.end()
+        c = c[:last] + (
+            '\n#ifndef KSU_REMAP_FILE_DEDUP_COMPAT\n'
+            '#define KSU_REMAP_FILE_DEDUP_COMPAT 1\n'
+            '#ifndef REMAP_FILE_DEDUP\n#define REMAP_FILE_DEDUP 0\n#endif\n'
+            '#endif\n'
+        ) + c[last:]
+
+    def guard_member(text, member, cond):
+        out = []
+        for line in text.split('\n'):
             prev = out[-1] if out else ''
-            if '#if' not in prev and '#endif' not in prev:
-                out.append('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)')
-                out.append(line)
-                out.append('#endif')
+            if re.search(r'\.' + re.escape(member) + r'\s*=', line) and not line.lstrip().startswith('#'):
+                if '#if' not in prev:
+                    out.append(f'#if {cond}')
+                    out.append(line)
+                    out.append('#endif')
+                else:
+                    out.append(line)
             else:
                 out.append(line)
-        else:
-            out.append(line)
-        i += 1
-    c = '\n'.join(out)
-    # Aussi wrapper la fonction ksu_wrapper_iopoll si présente
-    if 'ksu_wrapper_iopoll' in c and '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n' not in c.split('ksu_wrapper_iopoll')[0][-80:]:
-        c = re.sub(
-            r'((?:static\s+)?(?:inline\s+)?[^(]+ksu_wrapper_iopoll\s*\([^)]*\)\s*\{)',
-            r'#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n\1',
-            c, count=1)
-        # fermeture approximative : après la fonction
-        if c.count('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)') > c.count('#endif'):
-            pass  # on laisse, le wrap lignes suffit souvent
+        return '\n'.join(out)
+
+    c = guard_member(c, 'iopoll', 'LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)')
+    c = guard_member(c, 'remap_file_range', 'LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)')
     write(p, c, o)
 
-# TWA_RESUME
+# ----- TWA_RESUME -----
 TWA = '\n#ifndef TWA_RESUME\n#define TWA_RESUME 0\n#endif\n'
-for rel in ['manager/pkg_observer.c','manager/dynamic_manager.c','policy/allowlist.c','supercall/supercall.c']:
+for rel in ['manager/pkg_observer.c', 'manager/dynamic_manager.c', 'policy/allowlist.c', 'supercall/supercall.c']:
     p = os.path.join(root, rel)
-    if not os.path.isfile(p): continue
-    c, o = read(p), None
+    if not os.path.isfile(p):
+        continue
+    c = read(p)
     o = c
     if 'TWA_RESUME' in c and 'TWA_RESUME 0' not in c:
         c = ensure_ver(c)
         last = 0
-        for m in re.finditer(r'#include\s+[<"].*?[>"]\s*\n', c): last = m.end()
+        for m in re.finditer(r'#include\s+[<"].*?[>"]\s*\n', c):
+            last = m.end()
         c = c[:last] + TWA + c[last:]
         write(p, c, o)
 
-# SECCOMP
+# ----- SECCOMP -----
 p = os.path.join(root, 'infra/seccomp_cache.c')
 if os.path.isfile(p):
-    c, o = read(p), None
+    c = read(p)
     o = c
     if 'SECCOMP_ARCH_NATIVE_NR' in c and 'KSU_SECCOMP_COMPAT' not in c:
         c = ensure_ver(c)
-        stub = '\n#ifndef KSU_SECCOMP_COMPAT\n#define KSU_SECCOMP_COMPAT 1\n#ifndef SECCOMP_ARCH_NATIVE_NR\n#ifdef CONFIG_COMPAT\n#define SECCOMP_ARCH_NATIVE_NR 2\n#else\n#define SECCOMP_ARCH_NATIVE_NR 1\n#endif\n#endif\n#endif\n'
         last = 0
-        for m in re.finditer(r'#include\s+[<"].*?[>"]\s*\n', c): last = m.end()
-        c = c[:last] + stub + c[last:]
+        for m in re.finditer(r'#include\s+[<"].*?[>"]\s*\n', c):
+            last = m.end()
+        c = c[:last] + (
+            '\n#ifndef KSU_SECCOMP_COMPAT\n#define KSU_SECCOMP_COMPAT 1\n'
+            '#ifndef SECCOMP_ARCH_NATIVE_NR\n#ifdef CONFIG_COMPAT\n'
+            '#define SECCOMP_ARCH_NATIVE_NR 2\n#else\n#define SECCOMP_ARCH_NATIVE_NR 1\n'
+            '#endif\n#endif\n#endif\n'
+        ) + c[last:]
         write(p, c, o)
 
-# filter_count
+# ----- filter_count -----
 p = os.path.join(root, 'policy/app_profile.c')
 if os.path.isfile(p):
-    c, o = read(p), None
+    c = read(p)
     o = c
     if 'filter_count' in c and 'KSU_FILTER_COUNT_COMPAT' not in c:
         c = ensure_ver(c)
-        lines, out = c.split('\n'), []
-        for line in lines:
+        out = []
+        for line in c.split('\n'):
             if 'filter_count' in line and not line.strip().startswith(('/', '#')):
-                out += ['#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)', line, '#else',
-                        '\treturn 0;' if 'return' in line else '\t/* no filter_count */', '#endif']
+                out += [
+                    '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)',
+                    line,
+                    '#else',
+                    '\treturn 0;' if 'return' in line else '\t/* no filter_count */',
+                    '#endif',
+                ]
             else:
                 out.append(line)
-        c = '\n'.join(out).replace('#include <linux/version.h>', '#include <linux/version.h>\n#define KSU_FILTER_COUNT_COMPAT 1', 1)
+        c = '\n'.join(out).replace(
+            '#include <linux/version.h>',
+            '#include <linux/version.h>\n#define KSU_FILTER_COUNT_COMPAT 1',
+            1,
+        )
         write(p, c, o)
 
-# put_task_struct — dynamic_manager + allowlist
+# ----- put_task_struct -----
 for rel in ['manager/dynamic_manager.c', 'policy/allowlist.c']:
     p = os.path.join(root, rel)
-    if not os.path.isfile(p): continue
-    c, o = read(p), None
+    if not os.path.isfile(p):
+        continue
+    c = read(p)
     o = c
     if 'put_task_struct' in c:
         c = ensure_inc(c, '<linux/sched.h>')
         c = ensure_inc(c, '<linux/sched/task.h>')
         write(p, c, o)
 
-# tasklist_lock / init_task
+# ----- tasklist_lock / init_task -----
 p = os.path.join(root, 'supercall/dispatch.c')
 if os.path.isfile(p):
-    c, o = read(p), None
+    c = read(p)
     o = c
     c = ensure_ver(c)
     c = ensure_inc(c, '<linux/sched.h>')
@@ -668,63 +715,87 @@ if os.path.isfile(p):
     c = ensure_inc(c, '<linux/sched/task.h>')
     if 'tasklist_lock' in c and 'KSU_TASKLIST_COMPAT' not in c:
         last = 0
-        for m in re.finditer(r'#include\s+[<"].*?[>"]\s*\n', c): last = m.end()
-        c = c[:last] + '\n#ifndef KSU_TASKLIST_COMPAT\n#define KSU_TASKLIST_COMPAT 1\nextern rwlock_t tasklist_lock;\nextern struct task_struct init_task;\n#endif\n' + c[last:]
+        for m in re.finditer(r'#include\s+[<"].*?[>"]\s*\n', c):
+            last = m.end()
+        c = c[:last] + (
+            '\n#ifndef KSU_TASKLIST_COMPAT\n#define KSU_TASKLIST_COMPAT 1\n'
+            'extern rwlock_t tasklist_lock;\nextern struct task_struct init_task;\n#endif\n'
+        ) + c[last:]
         write(p, c, o)
 
-# minmax.h
+# ----- minmax.h -----
 p = os.path.join(root, 'sulog/event.c')
 if os.path.isfile(p):
-    c, o = read(p), None
+    c = read(p)
     o = c
     if 'linux/minmax.h' in c:
-        c = c.replace('#include <linux/minmax.h>',
-            '#include <linux/version.h>\n#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n#include <linux/minmax.h>\n#else\n#include <linux/kernel.h>\n#endif')
+        c = c.replace(
+            '#include <linux/minmax.h>',
+            '#include <linux/version.h>\n#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n'
+            '#include <linux/minmax.h>\n#else\n#include <linux/kernel.h>\n#endif',
+        )
         write(p, c, o)
 
-# mount.h
+# ----- mount.h -----
 p = os.path.join(root, 'infra/su_mount_ns.c')
 if os.path.isfile(p):
-    c, o = read(p), None
+    c = read(p)
     o = c
     if 'uapi/linux/mount.h' in c:
-        c = c.replace('#include <uapi/linux/mount.h>',
-            '#include <linux/version.h>\n#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0)\n#include <uapi/linux/mount.h>\n#else\n#include <linux/mount.h>\n#endif')
+        c = c.replace(
+            '#include <uapi/linux/mount.h>',
+            '#include <linux/version.h>\n#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0)\n'
+            '#include <uapi/linux/mount.h>\n#else\n#include <linux/mount.h>\n#endif',
+        )
         write(p, c, o)
 
-# fsnotify — pkg_observer : éviter le mismatch de signature
-# Sur 4.19 handle_event a une signature différente → on neutralise le champ sur < 5.2
+# ----- fsnotify (pkg_observer) : neutraliser le champ sur < 5.2 -----
 p = os.path.join(root, 'manager/pkg_observer.c')
 if os.path.isfile(p):
-    c, o = read(p), None
+    c = read(p)
     o = c
     c = ensure_ver(c)
     if 'handle_inode_event' in c or 'handle_event' in c:
-        lines, out = c.split('\n'), []
-        for line in lines:
+        out = []
+        for line in c.split('\n'):
             if re.search(r'\.(handle_inode_event|handle_event)\s*=', line) and not line.strip().startswith('#'):
-                out.append('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0)')
-                out.append(line)
-                out.append('#endif')
+                out += [
+                    '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0)',
+                    line,
+                    '#endif',
+                ]
             else:
                 out.append(line)
         c = '\n'.join(out)
         if 'KSU_FSNOTIFY_COMPAT' not in c:
-            c = c.replace('#include <linux/version.h>', '#include <linux/version.h>\n#define KSU_FSNOTIFY_COMPAT 1', 1)
+            c = c.replace(
+                '#include <linux/version.h>',
+                '#include <linux/version.h>\n#define KSU_FSNOTIFY_COMPAT 1',
+                1,
+            )
         write(p, c, o)
 
-# MODULE_IMPORT_NS
+# ----- MODULE_IMPORT_NS -----
 for dp, dn, fn in os.walk(root):
     for f in fn:
-        if not f.endswith(('.c','.h')): continue
+        if not f.endswith(('.c', '.h')):
+            continue
         p = os.path.join(dp, f)
-        try: c = read(p)
-        except: continue
+        try:
+            c = read(p)
+        except Exception:
+            continue
         o = c
-        c2 = re.sub(r'^([ \t]*MODULE_IMPORT_NS\([^\n]*\);[ \t]*)$', r'#ifdef MODULE_IMPORT_NS\n\1\n#endif', c, flags=re.M)
-        if c2 != o: write(p, c2, o)
+        c2 = re.sub(
+            r'^([ \t]*MODULE_IMPORT_NS\([^\n]*\);[ \t]*)$',
+            r'#ifdef MODULE_IMPORT_NS\n\1\n#endif',
+            c,
+            flags=re.M,
+        )
+        if c2 != o:
+            write(p, c2, o)
 
-print(f"  ✅ portage : {total} fichier(s)")
+print(f"  ✅ portage unifié : {total} fichier(s)")
 PORTEOF
 
 # ==================== 5. CONFIG ====================
@@ -851,7 +922,7 @@ rm -f ./local_su
 mv new-boot.img ../final_boot.img
 cd ..
 
-# ==================== 10-11. DIAG + SORTIE ====================
+# ==================== 10-11 DIAG + SORTIE ====================
 mkdir -p verify; cd verify
 cp ../final_boot.img verify_boot.img
 ../repack/magiskboot unpack verify_boot.img 2>/dev/null || true
