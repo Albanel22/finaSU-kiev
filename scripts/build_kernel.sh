@@ -60,7 +60,7 @@ for l in txt:
         first_loc.setdefault(key, f"{f}:{ln}")
         first_msg.setdefault(f, f"{ln}: {key}")
         continue
-    u = re.search(r'undefined (?:symbol|reference to)[: ]+[`\']?([^\s\'`]+)', l)
+    u = re.search(r'undefined (?:symbol|reference to)[: ]+[`]?([^\s\'`]+)', l)
     if u:
         undefined[u.group(1)] += 1
     t = re.search(r'\*\*\* \[[^\]]*?:(\d+): ([^\]]+)\] Error', l)
@@ -177,14 +177,14 @@ cert = None
 while pos < end and cert is None:
     pair_len = struct.unpack_from('<Q', data, pos)[0]
     pid = struct.unpack_from('<I', data, pos + 8)[0]
-    if pid in (0x7109871a, 0xf05368c0):          # schéma de signature v2 ou v3
+    if pid in (0x7109871a, 0xf05368c0):
         p = pos + 12
-        p += 4                                   # longueur de la séquence des signataires
-        p += 4                                   # longueur du premier signataire
-        p += 4                                   # longueur des données signées
+        p += 4
+        p += 4
+        p += 4
         dg_len = struct.unpack_from('<I', data, p)[0]
-        p += 4 + dg_len                          # on saute les digests
-        p += 4                                   # longueur de la séquence de certificats
+        p += 4 + dg_len
+        p += 4
         c_len = struct.unpack_from('<I', data, p)[0]
         p += 4
         cert = data[p:p + c_len]
@@ -210,7 +210,6 @@ else
     echo "⚠️ AUCUNE signature de manager fournie : valeurs par défaut du noyau (manager non reconnu)" | tee -a "$AUDIT"
 fi
 
-# ==================== 4. COMPATIBILITÉ NOYAU (comme pour KernelSU-Next) ====================
 # ==================== 3g. STATIC EXPORTS SELINUX ====================
 echo "=== Static exports SELinux ==="
 [ -f "security/selinux/selinuxfs.c" ] && {
@@ -251,12 +250,210 @@ if [ -n "$FILES_ANON_INODE" ]; then
     done
 fi
 
+# ==================== 4b. PORTAGE 4.19 DU DRIVER FinaSU (SELinux lourd + file_wrapper) ====================
+echo ""
+echo "=== Portage 4.19 (SELinux lourd + file_wrapper) ==="
 
-# ==================== 4b. PORTAGE 4.19 DU DRIVER FinaSU (erreurs observées) ====================
 python3 - "$KSU_DIR" <<'PORTEOF' 2>&1 | tee -a "$AUDIT"
 import os, re, sys
-root = sys.argv[1]
 
+root = sys.argv[1]
+total = 0
+
+def write_if_changed(path, new_content, old_content):
+    global total
+    if new_content != old_content:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(new_content)
+        total += 1
+        print(f"  ✅ modifié : {os.path.relpath(path, root)}")
+        return True
+    return False
+
+# ---------------------------------------------------------------------
+# 1. rules.c — chemin ancien noyau (< 5.10)
+# ---------------------------------------------------------------------
+rules_path = os.path.join(root, "selinux", "rules.c")
+if os.path.isfile(rules_path):
+    with open(rules_path, encoding='utf-8', errors='replace') as f:
+        c = f.read()
+    o = c
+
+    # Stub backup_sepolicy sur vieux noyaux
+    if "struct selinux_policy *backup_sepolicy;" in c and "KSU_BACKUP_SEPOLICY_STUB" not in c:
+        c = c.replace(
+            "struct selinux_policy *backup_sepolicy;",
+            '''#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+/* stub */
+struct selinux_policy *backup_sepolicy = NULL;
+#define KSU_BACKUP_SEPOLICY_STUB 1
+#else
+struct selinux_policy *backup_sepolicy;
+#endif'''
+        )
+
+    old_apply = r'void apply_kernelsu_rules\(\)\s*\{'
+    new_apply = r'''
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+/* ========== Chemin noyau ancien (4.14 / 4.19) ========== */
+static struct policydb *ksu_get_policydb(void)
+{
+#if defined(KSU_COMPAT_USE_SELINUX_STATE)
+    return &selinux_state.ss->policydb;
+#else
+    extern struct policydb policydb;
+    return &policydb;
+#endif
+}
+
+void apply_kernelsu_rules(void)
+{
+    struct policydb *db = ksu_get_policydb();
+
+    if (!getenforce()) {
+        pr_info("SELinux permissive or disabled, apply rules! (old kernel path)\\n");
+    }
+
+    ksu_type(db, KERNEL_SU_DOMAIN, "domain");
+    ksu_permissive(db, KERNEL_SU_DOMAIN);
+    ksu_typeattribute(db, KERNEL_SU_DOMAIN, "mlstrustedsubject");
+    ksu_typeattribute(db, KERNEL_SU_DOMAIN, "netdomain");
+    ksu_typeattribute(db, KERNEL_SU_DOMAIN, "bluetoothdomain");
+
+    ksu_type(db, KERNEL_SU_FILE, "file_type");
+    ksu_typeattribute(db, KERNEL_SU_FILE, "mlstrustedobject");
+    ksu_allow(db, "domain", KERNEL_SU_FILE, ALL, ALL);
+
+    ksu_allow(db, KERNEL_SU_DOMAIN, ALL, ALL, ALL);
+
+    if (db->policyvers >= POLICYDB_VERSION_XPERMS_IOCTL) {
+        ksu_allowxperm(db, KERNEL_SU_DOMAIN, ALL, "blk_file", ALL);
+        ksu_allowxperm(db, KERNEL_SU_DOMAIN, ALL, "fifo_file", ALL);
+        ksu_allowxperm(db, KERNEL_SU_DOMAIN, ALL, "chr_file", ALL);
+        ksu_allowxperm(db, KERNEL_SU_DOMAIN, ALL, "file", ALL);
+    }
+
+    ksu_allow(db, "init", KERNEL_SU_DOMAIN, ALL, ALL);
+
+    ksu_allow(db, "servicemanager", KERNEL_SU_DOMAIN, "dir", "search");
+    ksu_allow(db, "servicemanager", KERNEL_SU_DOMAIN, "dir", "read");
+    ksu_allow(db, "servicemanager", KERNEL_SU_DOMAIN, "file", "open");
+    ksu_allow(db, "servicemanager", KERNEL_SU_DOMAIN, "file", "read");
+    ksu_allow(db, "servicemanager", KERNEL_SU_DOMAIN, "process", "getattr");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "process", "sigchld");
+
+    ksu_allow(db, "logd", KERNEL_SU_DOMAIN, "dir", "search");
+    ksu_allow(db, "logd", KERNEL_SU_DOMAIN, "file", "read");
+    ksu_allow(db, "logd", KERNEL_SU_DOMAIN, "file", "open");
+    ksu_allow(db, "logd", KERNEL_SU_DOMAIN, "file", "getattr");
+
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "fd", "use");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "fifo_file", "write");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "fifo_file", "read");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "fifo_file", "open");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "fifo_file", "getattr");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "read");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "write");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "connectto");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "getopt");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "getattr");
+
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "binder", ALL);
+    ksu_allow(db, "system_server", KERNEL_SU_DOMAIN, "process", "getpgid");
+    ksu_allow(db, "system_server", KERNEL_SU_DOMAIN, "process", "sigkill");
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
+    {
+        struct selinux_avc *avc = selinux_state.avc;
+        if (avc)
+            avc_ss_reset(avc, 0);
+        selnl_notify_policyload(0);
+    }
+#else
+    avc_ss_reset(0);
+    selnl_notify_policyload(0);
+#endif
+
+    pr_info("KernelSU rules applied (4.19 compatibility path)\\n");
+}
+#else
+/* ========== Chemin moderne (>= 5.10) ========== */
+void apply_kernelsu_rules()
+{'''
+
+    if re.search(old_apply, c):
+        c = re.sub(old_apply, new_apply, c, count=1)
+        c = c.replace(
+            "out_unlock:\n    mutex_unlock(&selinux_state.policy_mutex);\n}",
+            "out_unlock:\n    mutex_unlock(&selinux_state.policy_mutex);\n}\n#endif /* end of dual-path apply_kernelsu_rules */"
+        )
+
+    write_if_changed(rules_path, c, o)
+
+# ---------------------------------------------------------------------
+# 2. selinux_hide.c — désactivation agressive sur < 5.10
+# ---------------------------------------------------------------------
+hide_path = os.path.join(root, "feature", "selinux_hide.c")
+if os.path.isfile(hide_path):
+    with open(hide_path, encoding='utf-8', errors='replace') as f:
+        c = f.read()
+    o = c
+
+    if "KSU_SELINUX_HIDE_DISABLED_ON_OLD_KERNEL" not in c:
+        header = '''/* Auto-portage 4.19 : selinux_hide désactivé sur noyaux < 5.10 */
+#define KSU_SELINUX_HIDE_DISABLED_ON_OLD_KERNEL 1
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+
+bool ksu_selinux_hide_enabled = false;
+bool ksu_selinux_hide_running = false;
+
+int ksu_selinux_hide_enable(void) { return -EOPNOTSUPP; }
+void ksu_selinux_hide_unhook(void) {}
+void initialize_fake_status(void) {}
+
+#else /* >= 5.10 */
+
+'''
+        c = header + c + "\n#endif /* LINUX_VERSION_CODE < 5.10.0 */\n"
+        write_if_changed(hide_path, c, o)
+
+# ---------------------------------------------------------------------
+# 3. sepolicy.c — protections filename_trans
+# ---------------------------------------------------------------------
+sepolicy_path = os.path.join(root, "selinux", "sepolicy.c")
+if os.path.isfile(sepolicy_path):
+    with open(sepolicy_path, encoding='utf-8', errors='replace') as f:
+        c = f.read()
+    o = c
+
+    if "KSU_FILENAME_TRANS_STUB" not in c:
+        stub = '''
+/* ========== Compat 4.19 : filename_trans trop différent ========== */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
+#define KSU_FILENAME_TRANS_STUB 1
+
+static bool add_filename_trans(struct policydb *db, const char *s, const char *t,
+                               const char *c, const char *d, const char *o)
+{
+    pr_info("add_filename_trans ignored on kernel < 5.8\\n");
+    return true;
+}
+#endif
+'''
+        c = re.sub(
+            r'(#include "ss/symtab.h".*?\n)',
+            r'\1\n' + stub + '\n',
+            c,
+            count=1,
+            flags=re.DOTALL
+        )
+
+    write_if_changed(sepolicy_path, c, o)
+
+# ---------------------------------------------------------------------
+# 4. file_wrapper.c (iopoll / remap_file_range) — déjà présent, on le garde
+# ---------------------------------------------------------------------
 def find_matching(c, i, open_ch, close_ch):
     depth = 0
     for k in range(i, len(c)):
@@ -267,18 +464,17 @@ def find_matching(c, i, open_ch, close_ch):
     return -1
 
 def wrap_function(c, name, cond):
-    """Entoure la DÉFINITION de la fonction `name` d'un #if."""
     for m in re.finditer(r'\b' + re.escape(name) + r'\s*\(', c):
         po = m.end() - 1
         pc = find_matching(c, po, '(', ')')
         if pc < 0: continue
         j = pc + 1
         while j < len(c) and c[j] in ' \t\r\n': j += 1
-        if j >= len(c) or c[j] != '{': continue          # appel ou prototype, pas une définition
+        if j >= len(c) or c[j] != '{': continue
         end = find_matching(c, j, '{', '}')
         if end < 0: continue
-        start = c.rfind('\n', 0, m.start()) + 1           # début de la ligne du nom
-        while start > 0:                                   # remonter jusqu'au début de la déclaration
+        start = c.rfind('\n', 0, m.start()) + 1
+        while start > 0:
             prev = c.rfind('\n', 0, start - 1) + 1
             line = c[prev:start - 1].strip()
             if line == '' or line.endswith(';') or line.endswith('}') or line.startswith('#'):
@@ -296,14 +492,12 @@ def wrap_lines(c, pattern, cond):
             out.append(line)
     return '\n'.join(out), n
 
-total = 0
 for dp, dn, fn in os.walk(root):
     for f in fn:
         if not f.endswith(('.c', '.h')): continue
         p = os.path.join(dp, f)
         c = open(p, encoding='utf-8', errors='replace').read()
         o = c
-        # MODULE_IMPORT_NS n'existe pas avant le 5.4
         c = re.sub(r'^([ \t]*MODULE_IMPORT_NS\([^\n]*\);[ \t]*)$', r'#ifdef MODULE_IMPORT_NS\n\1\n#endif', c, flags=re.M)
         if f == 'file_wrapper.c':
             V51 = 'LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)'
@@ -316,8 +510,10 @@ for dp, dn, fn in os.walk(root):
                 c = '#include <linux/version.h>\n' + c
             print(f"  file_wrapper.c : iopoll/remap_file_range protégés (fonctions {int(a)}+{int(b)}, affectations {l1}+{l2})")
         if c != o:
-            open(p, 'w', encoding='utf-8').write(c); total += 1
-print(f"  ✅ portage 4.19 : {total} fichier(s) modifié(s)")
+            open(p, 'w', encoding='utf-8').write(c)
+            total += 1
+
+print(f"  ✅ portage 4.19 (SELinux + file_wrapper) : {total} fichier(s) modifié(s)")
 PORTEOF
 
 # ==================== 5. CONFIGURATION ====================
@@ -327,7 +523,6 @@ export ARCH=arm64; export SUBARCH=arm64
 export CROSS_COMPILE=aarch64-linux-gnu-
 export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 
-# --- Compatibilité clang : le noyau peut passer des -Wno-... inconnus d'un clang ancien
 CLANG_MAJOR=$(clang --version | sed -n 's/.*clang version \([0-9]*\).*/\1/p' | head -1)
 echo "clang : $(command -v clang) -> $(readlink -f "$(command -v clang)")" | tee -a "$AUDIT"
 clang --version | head -2 | tee -a "$AUDIT"
@@ -349,7 +544,6 @@ WRAPEOF
     CC_ARGS="CC=$GITHUB_WORKSPACE/clang-wrap"
     echo "⚠️ clang < 16 : wrapper actif (flags inconnus ignorés)" | tee -a "$AUDIT"
 fi
-
 
 mkdir -p out
 make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 vendor/lito-perf_defconfig
@@ -397,7 +591,7 @@ sed -i 's/if (!check_version(/if (0 \&\& !check_version(/g' kernel/module.c
 printf "\n/* --- Début Patch Tactile --- */\n#include <linux/notifier.h>\n#include <linux/module.h>\nstatic BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);\nint panel_register_notifier(struct notifier_block *nb) {\n    return blocking_notifier_chain_register(&motorola_panel_notifier_list, nb);\n}\nEXPORT_SYMBOL(panel_register_notifier);\nint panel_unregister_notifier(struct notifier_block *nb) {\n    return blocking_notifier_chain_unregister(&motorola_panel_notifier_list, nb);\n}\nEXPORT_SYMBOL(panel_unregister_notifier);\nvoid touch_set_state(int state) { return; }\nEXPORT_SYMBOL(touch_set_state);\n/* --- Fin Patch Tactile --- */\n" >> techpack/display/msm/msm_drv.c
 echo "✅ Patchs Motorola appliqués"
 
-# ==================== 7. COMPILATION KERNEL (make -k : toutes les erreurs d'un coup) ====================
+# ==================== 7. COMPILATION KERNEL (make -k) ====================
 echo "=== Compilation du kernel ==="
 set +eo pipefail
 make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 \
@@ -433,12 +627,11 @@ cp out/System.map "$GITHUB_WORKSPACE/output/System.map-${VER}"
     true
 } 2>&1 | tee -a "$AUDIT"
 
-# ==================== 8. COMPILATION KSUD (même checkout que le driver) ====================
+# ==================== 8. COMPILATION KSUD ====================
 echo ""
 echo "=== Compilation ksud ==="
 cd "$GITHUB_WORKSPACE"
 
-# Source de ksud : on privilégie le checkout déjà utilisé pour le driver
 KSUD_DIR=""
 KSUD_ROOT=""
 if [ -n "$KSU_REPO_ROOT" ] && [ -f "$KSU_REPO_ROOT/userspace/ksud/Cargo.toml" ]; then
@@ -447,14 +640,11 @@ if [ -n "$KSU_REPO_ROOT" ] && [ -f "$KSU_REPO_ROOT/userspace/ksud/Cargo.toml" ];
     echo "✅ ksud pris dans le MÊME checkout que le driver ($KSU_REF) : $KSUD_DIR"
 else
     echo "⚠️  userspace/ksud absent du checkout $KSU_REF"
-    echo "⚠️  Fallback : ksud depuis la branche '$KSUD_FALLBACK_REF' (risque de protocole différent du driver)"
+    echo "⚠️  Fallback : ksud depuis la branche '$KSUD_FALLBACK_REF'"
     rm -rf "$GITHUB_WORKSPACE/ksud-src" 2>/dev/null || true
     git clone --depth=1 --branch "$KSUD_FALLBACK_REF" https://github.com/KernelSU-Next/KernelSU-Next.git "$GITHUB_WORKSPACE/ksud-src"
     KSUD_DIR="$GITHUB_WORKSPACE/ksud-src/userspace/ksud"
     KSUD_ROOT="$GITHUB_WORKSPACE/ksud-src"
-    echo -n "  ksud fallback commit : "; git -C "$GITHUB_WORKSPACE/ksud-src" rev-parse HEAD
-    echo -n "  ksud fallback describe : "; git -C "$GITHUB_WORKSPACE/ksud-src" describe --tags --always 2>/dev/null || echo "?"
-    echo "  UAPI vue par ksud :"; grep -rn "KERNEL_SU_UAPI_VERSION" "$GITHUB_WORKSPACE/ksud-src" --include=*.h --include=*.rs 2>/dev/null | head -5 || true
 fi
 
 if [ ! -f "$KSUD_DIR/Cargo.toml" ]; then
@@ -491,7 +681,7 @@ cp "$KSUD_BINARY" "$GITHUB_WORKSPACE/ksud"; chmod 755 "$GITHUB_WORKSPACE/ksud"
 echo "✅ ksud compilé ($KSUD_BINARY)"
 cd "$GITHUB_WORKSPACE"
 
-# ==================== 9. REPACK (MÉTHODE BACKSLASHXX) ====================
+# ==================== 9. REPACK ====================
 echo ""
 echo "=== Repack (méthode backslashxx : magiskboot cpio add) ==="
 
