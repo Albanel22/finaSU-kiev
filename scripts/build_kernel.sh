@@ -179,7 +179,7 @@ for f in $(grep -rl "get_unused_fd_flags(O_CLOEXEC)" "$KSU_DIR/" 2>/dev/null || 
     sed -i 's/get_unused_fd_flags(O_CLOEXEC)/get_unused_fd_flags(0)/g' "$f"
 done
 
-# ==================== 4b. PORTAGE STRUCTUREL 4.19 (FinaSU & SELinux) ====================
+# ==================== 4b. PORTAGE STRUCTUREL 4.19 CORRIGÉ (FinaSU & SELinux) ====================
 python3 - "$KSU_DIR" <<'PORTEOF' 2>&1 | tee -a "$AUDIT"
 import os, re, sys
 root = sys.argv[1]
@@ -191,24 +191,30 @@ for dp, dn, fn in os.walk(root):
         c = open(p, encoding='utf-8', errors='replace').read()
         o = c
         
-        # 1. Remplacement des en-têtes spécifiques
+        # 1. S'assurer que <linux/version.h> est inclus tout en haut pour que KERNEL_VERSION/LINUX_VERSION_CODE soient définis
+        if "#include <linux/version.h>" not in c:
+            c = "#include <linux/version.h>\n" + c
+
+        # 2. Remplacement des en-têtes spécifiques
         c = c.replace("include <linux/minmax.h>", "include <linux/kernel.h>")
         c = c.replace("include <uapi/linux/mount.h>", "include <linux/mount.h>")
         
         if "AUDIT_ARCH_AARCH64" in c and "#include <linux/audit.h>" not in c:
             c = "#include <linux/audit.h>\n" + c
 
-        # 2. Remplacement propre de TWA_RESUME pour 4.19
+        # 3. Remplacement propre de TWA_RESUME pour 4.19
         if "TWA_RESUME" in c:
             twa_compat = """
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 1, 0)
+#ifndef TWA_RESUME
 #define TWA_RESUME 0
 #endif
+#endif
 """
-            if twa_compat.strip() not in c:
+            if "TWA_RESUME 0" not in c:
                 c = twa_compat + c
 
-        # 3. Adaptation des structures file_operations pour 4.19
+        # 4. Adaptation des structures file_operations pour 4.19
         if f == 'file_wrapper.c':
             c = re.sub(
                 r'(\.iopoll\s*=.*?,)', 
@@ -221,29 +227,21 @@ for dp, dn, fn in os.walk(root):
                 c
             )
 
-        # 4. Compatibilité SELinux 4.19 dans rules.c et sepolicy.c
-        if f == 'rules.c':
-            selinux_rules_compat = """
+        # 5. Compatibilité SELinux 4.19 dans rules.c et sepolicy.c
+        if f in ['rules.c', 'sepolicy.c']:
+            selinux_compat = """
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 1, 0)
-// Compatibilité structures SELinux noyau 4.19
+#ifndef KSU_SEPOLICY_V419
 #define KSU_SEPOLICY_V419 1
+#endif
 #endif
 """
             if "KSU_SEPOLICY_V419" not in c:
-                c = selinux_rules_compat + c
-
-        if f == 'sepolicy.c':
-            sepolicy_compat = """
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 1, 0)
-#define KSU_SEPOLICY_V419 1
-#endif
-"""
-            if "KSU_SEPOLICY_V419" not in c:
-                c = sepolicy_compat + c
+                c = selinux_compat + c
 
         if c != o:
             open(p, 'w', encoding='utf-8').write(c)
-            print(f"  ✅ Portage structurel 4.19 appliqué : {f}")
+            print(f"  ✅ Portage structurel 4.19 corrigé : {f}")
 PORTEOF
 
 # ==================== 5. CONFIGURATION ====================
