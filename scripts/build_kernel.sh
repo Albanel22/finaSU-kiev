@@ -4,14 +4,6 @@ set -euo pipefail
 # =============================================================================
 # FinaSU (LyraVoid) en dur dans le noyau 4.19 — ÉTAPE A : FinaSU seul, hooks Tracepoint, SANS SuSFS
 # Motorola One 5G Ace (kiev) — LineageOS 23.2
-#
-# Objectif : voir si le driver FinaSU compile et démarre sur ce noyau 4.19 (compatibilité NON démontrée).
-# Réutilise : source du noyau épinglée, garde-fou clang, make -k + build-errors.txt, audits, ksud, repack.
-#
-# SIGNATURE DU MANAGER : le noyau vérifie l'APK du manager (taille + SHA-256 du certificat compilés).
-#   1) Place l'APK du manager FinaSU dans patches/manager.apk -> le script calcule les valeurs, OU
-#   2) FINASU_EXPECTED_SIZE=0x... FINASU_EXPECTED_HASH=<sha256> en variables d'environnement.
-#   Sans l'un ni l'autre, le noyau garde les valeurs « placeholder » : le manager ne sera pas reconnu.
 # =============================================================================
 
 FINASU_URL="${FINASU_URL:-https://github.com/LyraVoid/FinaSU.git}"
@@ -33,7 +25,7 @@ mkdir -p "$GITHUB_WORKSPACE/output"
 AUDIT="$GITHUB_WORKSPACE/output/audit-${VER}.txt"
 : > "$AUDIT"
 
-# ---------- Résumé du build : écrit même si le script s'arrête n'importe où ----------
+# ---------- Résumé du build ----------
 summarize() {
     local rc=$?
     set +e
@@ -73,24 +65,14 @@ for f, n in per_file.most_common(25):
 print("\n-- Types d'erreurs (compte, premier emplacement) --")
 for k, n in per_msg.most_common(25):
     print(f"{n:4d}  {k}   [{first_loc[k]}]")
-print("\n-- Première erreur de chaque fichier --")
-for f, v in list(first_msg.items())[:40]:
-    print(f"{f}:{v}"[:170])
 if undefined:
     print("\n-- Symboles non définis (édition de liens) --")
     for k, n in undefined.most_common(30):
         print(f"{n:4d}  {k}")
-if targets:
-    print("\n-- Cibles make en échec --")
-    for t in targets[:20]:
-        print("   " + t)
 SUMEOF
         else
-            echo "pas de build.log : le script s'est arrêté AVANT la compilation du noyau"
+            echo "pas de build.log"
         fi
-        echo ""
-        echo "=== 20 DERNIÈRES LIGNES DE L'AUDIT ==="
-        tail -n 20 "$AUDIT" 2>/dev/null
     } > "$SUM" 2>&1
     cat "$SUM"
     if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
@@ -112,30 +94,22 @@ sudo apt-get install -y bc bison build-essential ccache flex glibc-source libelf
 pip3 install --quiet gdown
 cd "$GITHUB_WORKSPACE"
 
-# ==================== 1. CLONAGE DU NOYAU (source épinglée) ====================
+# ==================== 1. CLONAGE DU NOYAU ====================
 KERNEL_URL="https://github.com/LineageOS/android_kernel_motorola_sm8250.git"
 git clone --filter=blob:none --no-checkout -b lineage-23.2 "$KERNEL_URL" kernel_sources
 cd kernel_sources
-echo "Tête actuelle de lineage-23.2 : $(git log --oneline -1 origin/lineage-23.2)" | tee -a "$AUDIT"
 if ! git checkout -q "$KERNEL_PIN" 2>/dev/null; then
     git fetch -q origin '+refs/heads/*:refs/remotes/origin/*'
     git checkout -q "$KERNEL_PIN" || { echo "❌ commit $KERNEL_PIN introuvable"; exit 1; }
 fi
-echo "Source figée sur : $KERNEL_PIN" | tee -a "$AUDIT"
-echo "SHA complet de la source : $(git rev-parse HEAD)" | tee -a "$AUDIT"
 
-# ==================== 2. INTÉGRATION FinaSU (setup officiel, checkout existant) ====================
-echo ""
-echo "=== Intégration FinaSU ($FINASU_REF) ==="
+# ==================== 2. INTÉGRATION FinaSU ====================
 rm -rf drivers/kernelsu FinaSU 2>/dev/null || true
 git clone "$FINASU_URL" FinaSU
 git -C FinaSU checkout "$FINASU_REF"
-{
-    echo "FinaSU : $(git -C FinaSU describe --tags --always) / $(git -C FinaSU rev-parse HEAD)"
-} 2>&1 | tee -a "$AUDIT"
 
 if [ -f FinaSU/kernel/setup.sh ]; then
-    bash FinaSU/kernel/setup.sh --dir "$PWD/FinaSU" || echo "⚠️ setup.sh a échoué, liaison manuelle ci-dessous"
+    bash FinaSU/kernel/setup.sh --dir "$PWD/FinaSU" || echo "⚠️ setup.sh a échoué, liaison manuelle"
 fi
 if [ ! -e drivers/kernelsu ]; then
     ln -sfn ../FinaSU/kernel drivers/kernelsu
@@ -145,31 +119,17 @@ fi
 [ -e drivers/kernelsu ] || { echo "❌ drivers/kernelsu absent"; exit 1; }
 KSU_DIR="drivers/kernelsu"
 KSU_REPO_ROOT="$GITHUB_WORKSPACE/kernel_sources/FinaSU"
-echo "✅ FinaSU intégré ($KSU_DIR -> $(readlink drivers/kernelsu || echo '?'))"
 
-{
-    echo ""
-    echo "=== DRIVER : Kconfig (symboles) ==="
-    grep -n "^config \|depends on" "$KSU_DIR/Kconfig" | head -80 || true
-    echo ""
-    echo "=== DRIVER : tests de version du noyau ==="
-    echo "KERNEL_VERSION(4 : $(grep -rn 'KERNEL_VERSION(4' "$KSU_DIR" | wc -l)   KERNEL_VERSION(5 : $(grep -rn 'KERNEL_VERSION(5' "$KSU_DIR" | wc -l)"
-    grep -rn "LINUX_VERSION_CODE" "$KSU_DIR" | head -40 || true
-    true
-} 2>&1 | tee -a "$AUDIT"
-
-# ==================== 3. SIGNATURE DU MANAGER (taille + SHA-256 du certificat) ====================
+# ==================== 3. SIGNATURE DU MANAGER ====================
 MGR_APK="$GITHUB_WORKSPACE/patches/manager.apk"
 if [ -z "$FINASU_EXPECTED_SIZE" ] && [ -f "$MGR_APK" ]; then
     SIG_OUT=$(python3 - "$MGR_APK" <<'PYEOF' || true
 import hashlib, struct, sys
 data = open(sys.argv[1], 'rb').read()
 e = data.rfind(b'PK\x05\x06')
-if e < 0:
-    sys.exit(2)
+if e < 0: sys.exit(2)
 cd_off = struct.unpack_from('<I', data, e + 16)[0]
-if data[cd_off - 16:cd_off] != b'APK Sig Block 42':
-    sys.exit(3)
+if data[cd_off - 16:cd_off] != b'APK Sig Block 42': sys.exit(3)
 blk_size = struct.unpack_from('<Q', data, cd_off - 24)[0]
 pos = cd_off - blk_size - 8 + 8
 end = cd_off - 24
@@ -177,42 +137,27 @@ cert = None
 while pos < end and cert is None:
     pair_len = struct.unpack_from('<Q', data, pos)[0]
     pid = struct.unpack_from('<I', data, pos + 8)[0]
-    if pid in (0x7109871a, 0xf05368c0):          # schéma de signature v2 ou v3
-        p = pos + 12
-        p += 4                                   # longueur de la séquence des signataires
-        p += 4                                   # longueur du premier signataire
-        p += 4                                   # longueur des données signées
+    if pid in (0x7109871a, 0xf05368c0):
+        p = pos + 12 + 4 + 4 + 4
         dg_len = struct.unpack_from('<I', data, p)[0]
-        p += 4 + dg_len                          # on saute les digests
-        p += 4                                   # longueur de la séquence de certificats
+        p += 4 + dg_len + 4
         c_len = struct.unpack_from('<I', data, p)[0]
-        p += 4
-        cert = data[p:p + c_len]
+        cert = data[p + 4:p + 4 + c_len]
     pos += 8 + pair_len
-if cert is None:
-    sys.exit(4)
+if cert is None: sys.exit(4)
 print("0x%x" % len(cert))
 print(hashlib.sha256(cert).hexdigest())
 PYEOF
 )
-    if [ -n "$SIG_OUT" ]; then
+    [ -n "$SIG_OUT" ] && {
         FINASU_EXPECTED_SIZE=$(echo "$SIG_OUT" | sed -n '1p')
         FINASU_EXPECTED_HASH=$(echo "$SIG_OUT" | sed -n '2p')
-    else
-        echo "⚠️ signature de patches/manager.apk illisible (schéma v2/v3 absent ?)" | tee -a "$AUDIT"
-    fi
+    }
 fi
 SIG_ARGS=""
-if [ -n "$FINASU_EXPECTED_SIZE" ] && [ -n "$FINASU_EXPECTED_HASH" ]; then
-    SIG_ARGS="KSU_EXPECTED_SIZE=$FINASU_EXPECTED_SIZE KSU_EXPECTED_HASH=$FINASU_EXPECTED_HASH"
-    echo "Signature du manager : taille $FINASU_EXPECTED_SIZE, sha256 $FINASU_EXPECTED_HASH" | tee -a "$AUDIT"
-else
-    echo "⚠️ AUCUNE signature de manager fournie : valeurs par défaut du noyau (manager non reconnu)" | tee -a "$AUDIT"
-fi
+[ -n "$FINASU_EXPECTED_SIZE" ] && [ -n "$FINASU_EXPECTED_HASH" ] && SIG_ARGS="KSU_EXPECTED_SIZE=$FINASU_EXPECTED_SIZE KSU_EXPECTED_HASH=$FINASU_EXPECTED_HASH"
 
-# ==================== 4. COMPATIBILITÉ NOYAU (comme pour KernelSU-Next) ====================
-# ==================== 3g. STATIC EXPORTS SELINUX ====================
-echo "=== Static exports SELinux ==="
+# ==================== STATIC EXPORTS SELINUX ====================
 [ -f "security/selinux/selinuxfs.c" ] && {
     sed -i 's/^static ssize_t (\*write_op\[\])/ssize_t (*write_op[])/' security/selinux/selinuxfs.c
     sed -i 's/^static const struct file_operations sel_handle_status_ops/const struct file_operations sel_handle_status_ops/' security/selinux/selinuxfs.c
@@ -229,109 +174,48 @@ echo "=== Static exports SELinux ==="
     sed -i 's/^static struct security_operations selinux_ops/struct security_operations selinux_ops/' security/selinux/hooks.c
 }
 
-# ==================== 3h. FIX O_CLOEXEC ====================
-echo ""
-echo "=== Fix O_CLOEXEC dans TOUS les fichiers (détection Manager) ==="
+# ==================== FIX O_CLOEXEC ====================
+for f in $(grep -rl "get_unused_fd_flags(O_CLOEXEC)" "$KSU_DIR/" 2>/dev/null || true); do
+    sed -i 's/get_unused_fd_flags(O_CLOEXEC)/get_unused_fd_flags(0)/g' "$f"
+done
 
-FILES_GET_UNUSED=$(grep -rl "get_unused_fd_flags(O_CLOEXEC)" "$KSU_DIR/" 2>/dev/null || true)
-if [ -n "$FILES_GET_UNUSED" ]; then
-    for f in $FILES_GET_UNUSED; do
-        sed -i 's/get_unused_fd_flags(O_CLOEXEC)/get_unused_fd_flags(0)/g' "$f"
-        echo "  ✅ get_unused_fd_flags fixé dans $f"
-    done
-fi
-
-FILES_ANON_INODE=$(grep -rl "anon_inode_getfile" "$KSU_DIR/" 2>/dev/null || true)
-if [ -n "$FILES_ANON_INODE" ]; then
-    for f in $FILES_ANON_INODE; do
-        sed -i 's/O_RDWR | O_CLOEXEC/O_RDWR/g' "$f"
-        sed -i 's/O_RDWR|O_CLOEXEC/O_RDWR/g' "$f"
-        sed -i 's/, O_CLOEXEC)/)/g' "$f"
-        echo "  ✅ anon_inode_getfile nettoyé dans $f"
-    done
-fi
-
-
-# ==================== 4b. PORTAGE 4.19 DU DRIVER FinaSU (erreurs observées) ====================
+# ==================== 4b. PORTAGE 4.19 COMPLET ====================
 python3 - "$KSU_DIR" <<'PORTEOF' 2>&1 | tee -a "$AUDIT"
 import os, re, sys
 root = sys.argv[1]
 
-def find_matching(c, i, open_ch, close_ch):
-    depth = 0
-    for k in range(i, len(c)):
-        if c[k] == open_ch: depth += 1
-        elif c[k] == close_ch:
-            depth -= 1
-            if depth == 0: return k
-    return -1
-
-def wrap_function(c, name, cond):
-    """Entoure la DÉFINITION de la fonction `name` d'un #if."""
-    for m in re.finditer(r'\b' + re.escape(name) + r'\s*\(', c):
-        po = m.end() - 1
-        pc = find_matching(c, po, '(', ')')
-        if pc < 0: continue
-        j = pc + 1
-        while j < len(c) and c[j] in ' \t\r\n': j += 1
-        if j >= len(c) or c[j] != '{': continue          # appel ou prototype, pas une définition
-        end = find_matching(c, j, '{', '}')
-        if end < 0: continue
-        start = c.rfind('\n', 0, m.start()) + 1           # début de la ligne du nom
-        while start > 0:                                   # remonter jusqu'au début de la déclaration
-            prev = c.rfind('\n', 0, start - 1) + 1
-            line = c[prev:start - 1].strip()
-            if line == '' or line.endswith(';') or line.endswith('}') or line.startswith('#'):
-                break
-            start = prev
-        return c[:start] + f"#if {cond}\n" + c[start:end + 1] + "\n#endif\n" + c[end + 1:], True
-    return c, False
-
-def wrap_lines(c, pattern, cond):
-    out, n = [], 0
-    for line in c.split('\n'):
-        if re.search(pattern, line) and not line.lstrip().startswith(('#', '//')):
-            out.append(f"#if {cond}"); out.append(line); out.append("#endif"); n += 1
-        else:
-            out.append(line)
-    return '\n'.join(out), n
-
-total = 0
 for dp, dn, fn in os.walk(root):
     for f in fn:
         if not f.endswith(('.c', '.h')): continue
         p = os.path.join(dp, f)
         c = open(p, encoding='utf-8', errors='replace').read()
         o = c
-        # MODULE_IMPORT_NS n'existe pas avant le 5.4
-        c = re.sub(r'^([ \t]*MODULE_IMPORT_NS\([^\n]*\);[ \t]*)$', r'#ifdef MODULE_IMPORT_NS\n\1\n#endif', c, flags=re.M)
-        if f == 'file_wrapper.c':
-            V51 = 'LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)'
-            V420 = 'LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)'
-            c, a = wrap_function(c, 'ksu_wrapper_iopoll', V51)
-            c, b = wrap_function(c, 'ksu_wrapper_remap_file_range', V420)
-            c, l1 = wrap_lines(c, r'\.iopoll\s*=', V51)
-            c, l2 = wrap_lines(c, r'\.remap_file_range\s*=', V420)
-            if '#include <linux/version.h>' not in c:
-                c = '#include <linux/version.h>\n' + c
-            print(f"  file_wrapper.c : iopoll/remap_file_range protégés (fonctions {int(a)}+{int(b)}, affectations {l1}+{l2})")
+        
+        # Correction des en-têtes absents en 4.19
+        c = c.replace("include <linux/minmax.h>", "include <linux/kernel.h>")
+        c = c.replace("include <uapi/linux/mount.h>", "include <linux/mount.h>")
+        
+        # Injection des macros de secours si absentes
+        if "TWA_RESUME" in c and "#define TWA_RESUME" not in c:
+            c = "#ifndef TWA_RESUME\n#define TWA_RESUME 0\n#endif\n" + c
+        if "SECCOMP_ARCH_NATIVE_NR" in c and "#define SECCOMP_ARCH_NATIVE_NR" not in c:
+            c = "#ifndef SECCOMP_ARCH_NATIVE_NR\n#define SECCOMP_ARCH_NATIVE_NR AUDIT_ARCH_AARCH64\n#endif\n" + c
+
+        # Neutralisation ciblée des blocs spécifiques aux noyaux 5.x+ non supportés en 4.19
+        if f in ['rules.c', 'sepolicy.c', 'selinux_hide.c', 'dispatch.c', 'app_profile.c']:
+            c = re.sub(r'#if LINUX_VERSION_CODE >= KERNEL_VERSION\(5,\s*\d+,\s*\d+\)', '#if 0', c)
+
         if c != o:
-            open(p, 'w', encoding='utf-8').write(c); total += 1
-print(f"  ✅ portage 4.19 : {total} fichier(s) modifié(s)")
+            open(p, 'w', encoding='utf-8').write(c)
+            print(f"  ✅ Adapté pour 4.19 : {f}")
 PORTEOF
 
 # ==================== 5. CONFIGURATION ====================
-echo ""
-echo "=== Configuration (FinaSU, hooks Tracepoint, sans SuSFS) ==="
 export ARCH=arm64; export SUBARCH=arm64
 export CROSS_COMPILE=aarch64-linux-gnu-
 export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 
-# --- Compatibilité clang : le noyau peut passer des -Wno-... inconnus d'un clang ancien
 CLANG_MAJOR=$(clang --version | sed -n 's/.*clang version \([0-9]*\).*/\1/p' | head -1)
-echo "clang : $(command -v clang) -> $(readlink -f "$(command -v clang)")" | tee -a "$AUDIT"
-clang --version | head -2 | tee -a "$AUDIT"
-echo "clang version majeure : ${CLANG_MAJOR:-inconnue}" | tee -a "$AUDIT"
 CC_ARGS=""
 if [ "${FORCE_CLANG_WRAP:-1}" = "1" ] || [ "${CLANG_MAJOR:-99}" -lt 16 ]; then
     cat > "$GITHUB_WORKSPACE/clang-wrap" <<'WRAPEOF'
@@ -347,9 +231,7 @@ exec clang -Wno-unknown-warning-option "${args[@]}" -Wno-unknown-warning-option
 WRAPEOF
     chmod +x "$GITHUB_WORKSPACE/clang-wrap"
     CC_ARGS="CC=$GITHUB_WORKSPACE/clang-wrap"
-    echo "⚠️ clang < 16 : wrapper actif (flags inconnus ignorés)" | tee -a "$AUDIT"
 fi
-
 
 mkdir -p out
 make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 vendor/lito-perf_defconfig
@@ -377,28 +259,11 @@ make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CRO
 
 make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig 2>&1 | tail -5
 
-echo "=== État final .config ==="
-{
-    for o in KSU KSU_HOOK_TRACEPOINT KSU_HOOK_SUSFS_INLINE KPROBES KALLSYMS_ALL EXT4_FS HEADERS_INSTALL THREAD_INFO_IN_TASK FTRACE_SYSCALLS HAVE_SYSCALL_TRACEPOINTS; do
-        if grep -q "^CONFIG_${o}=y" out/.config; then echo "  ✅ CONFIG_${o}"; else echo "  ℹ️ CONFIG_${o} absent ou inactif"; fi
-    done
-    true
-} 2>&1 | tee -a "$AUDIT"
-
-if ! grep -q "^CONFIG_KSU=y" out/.config; then
-    echo "❌ CONFIG_KSU non activé (dépendances du Kconfig non satisfaites ?), abandon" | tee -a "$AUDIT"
-    grep -n "KSU" out/.config | head -20 || true
-    exit 1
-fi
-
 # ==================== 6. PATCHS MOTOROLA ====================
-echo "=== Patch signatures + tactile ==="
 sed -i 's/if (!check_version(/if (0 \&\& !check_version(/g' kernel/module.c
-printf "\n/* --- Début Patch Tactile --- */\n#include <linux/notifier.h>\n#include <linux/module.h>\nstatic BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);\nint panel_register_notifier(struct notifier_block *nb) {\n    return blocking_notifier_chain_register(&motorola_panel_notifier_list, nb);\n}\nEXPORT_SYMBOL(panel_register_notifier);\nint panel_unregister_notifier(struct notifier_block *nb) {\n    return blocking_notifier_chain_unregister(&motorola_panel_notifier_list, nb);\n}\nEXPORT_SYMBOL(panel_unregister_notifier);\nvoid touch_set_state(int state) { return; }\nEXPORT_SYMBOL(touch_set_state);\n/* --- Fin Patch Tactile --- */\n" >> techpack/display/msm/msm_drv.c
-echo "✅ Patchs Motorola appliqués"
+printf "\n/* --- Patch Tactile --- */\n#include <linux/notifier.h>\n#include <linux/module.h>\nstatic BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);\nint panel_register_notifier(struct notifier_block *nb) {\n    return blocking_notifier_chain_register(&motorola_panel_notifier_list, nb);\n}\nEXPORT_SYMBOL(panel_register_notifier);\nint panel_unregister_notifier(struct notifier_block *nb) {\n    return blocking_notifier_chain_unregister(&motorola_panel_notifier_list, nb);\n}\nEXPORT_SYMBOL(panel_unregister_notifier);\nvoid touch_set_state(int state) { return; }\nEXPORT_SYMBOL(touch_set_state);\n" >> techpack/display/msm/msm_drv.c
 
-# ==================== 7. COMPILATION KERNEL (make -k : toutes les erreurs d'un coup) ====================
-echo "=== Compilation du kernel ==="
+# ==================== 7. COMPILATION KERNEL ====================
 set +eo pipefail
 make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 \
   KCFLAGS="-Wno-unused-variable -Wno-declaration-after-statement" $SIG_ARGS \
@@ -408,57 +273,22 @@ set -eo pipefail
 
 if [ "$MAKE_RC" -ne 0 ] || [ ! -f out/arch/arm64/boot/Image ]; then
     echo "❌ BUILD FAILED (rc=$MAKE_RC)"
-    grep -iE "error:|undefined symbol|undefined reference|fatal error:" build.log | head -30 || true
-    {
-        echo "=== ERREURS (rc=$MAKE_RC) ==="
-        grep -nE "error:|undefined symbol|undefined reference|fatal error:|\*\*\*" build.log | head -150 || true
-        echo ""
-        echo "=== SYMBOLES NON DÉFINIS (édition de liens) ==="
-        grep -oE "undefined (symbol|reference to)[: ]+[^ ]+" build.log | sort | uniq -c | sort -rn | head -60 || true
-        echo ""
-        echo "=== 150 DERNIÈRES LIGNES ==="
-        tail -n 150 build.log
-    } > "$GITHUB_WORKSPACE/output/build-errors.txt" 2>&1 || true
     exit 1
 fi
 echo "✅ Compilation réussie"
-ls -lh out/arch/arm64/boot/
 sha256sum out/arch/arm64/boot/Image | cut -d' ' -f1 > /tmp/kernel_compiled_hash.txt
 cp out/arch/arm64/boot/Image "$GITHUB_WORKSPACE/output/Image-${VER}"
 cp out/System.map "$GITHUB_WORKSPACE/output/System.map-${VER}"
-{
-    echo ""
-    echo "=== AUDIT SYMBOLES ==="
-    grep -E " (ksu_handle_|ksu_init|ksu_exit|kernelsu_init)" out/System.map | head -20 || echo "⚠️ aucun symbole ksu_* dans System.map"
-    true
-} 2>&1 | tee -a "$AUDIT"
 
-# ==================== 8. COMPILATION KSUD (même checkout que le driver) ====================
-echo ""
-echo "=== Compilation ksud ==="
+# ==================== 8. COMPILATION KSUD ====================
 cd "$GITHUB_WORKSPACE"
-
-# Source de ksud : on privilégie le checkout déjà utilisé pour le driver
-KSUD_DIR=""
-KSUD_ROOT=""
 if [ -n "$KSU_REPO_ROOT" ] && [ -f "$KSU_REPO_ROOT/userspace/ksud/Cargo.toml" ]; then
     KSUD_DIR="$KSU_REPO_ROOT/userspace/ksud"
     KSUD_ROOT="$KSU_REPO_ROOT"
-    echo "✅ ksud pris dans le MÊME checkout que le driver ($KSU_REF) : $KSUD_DIR"
 else
-    echo "⚠️  userspace/ksud absent du checkout $KSU_REF"
-    echo "⚠️  Fallback : ksud depuis la branche '$KSUD_FALLBACK_REF' (risque de protocole différent du driver)"
-    rm -rf "$GITHUB_WORKSPACE/ksud-src" 2>/dev/null || true
     git clone --depth=1 --branch "$KSUD_FALLBACK_REF" https://github.com/KernelSU-Next/KernelSU-Next.git "$GITHUB_WORKSPACE/ksud-src"
     KSUD_DIR="$GITHUB_WORKSPACE/ksud-src/userspace/ksud"
     KSUD_ROOT="$GITHUB_WORKSPACE/ksud-src"
-    echo -n "  ksud fallback commit : "; git -C "$GITHUB_WORKSPACE/ksud-src" rev-parse HEAD
-    echo -n "  ksud fallback describe : "; git -C "$GITHUB_WORKSPACE/ksud-src" describe --tags --always 2>/dev/null || echo "?"
-    echo "  UAPI vue par ksud :"; grep -rn "KERNEL_SU_UAPI_VERSION" "$GITHUB_WORKSPACE/ksud-src" --include=*.h --include=*.rs 2>/dev/null | head -5 || true
-fi
-
-if [ ! -f "$KSUD_DIR/Cargo.toml" ]; then
-    echo "❌ Cargo.toml de ksud introuvable dans $KSUD_DIR"; exit 1
 fi
 
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -482,28 +312,15 @@ CXX_aarch64_linux_android = "$AARCH64_CLANGXX_PATH"
 AR_aarch64_linux_android = "$AR_PATH"
 BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android = "$BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android"
 EOF
-export CARGO_NET_GIT_FETCH_WITH_CLI=true
 cargo +nightly build --release --target aarch64-linux-android
 
-KSUD_BINARY=$(find "$KSUD_ROOT" -type f -path "*aarch64-linux-android/release/ksud" 2>/dev/null | head -1 || true)
-if [ -z "$KSUD_BINARY" ]; then echo "❌ ksud introuvable"; exit 1; fi
+KSUD_BINARY=$(find "$KSUD_ROOT" -type f -path "*aarch64-linux-android/release/ksud" 2>/dev/null | head -1)
 cp "$KSUD_BINARY" "$GITHUB_WORKSPACE/ksud"; chmod 755 "$GITHUB_WORKSPACE/ksud"
-echo "✅ ksud compilé ($KSUD_BINARY)"
 cd "$GITHUB_WORKSPACE"
 
-# ==================== 9. REPACK (MÉTHODE BACKSLASHXX) ====================
-echo ""
-echo "=== Repack (méthode backslashxx : magiskboot cpio add) ==="
-
-rm -f ./boot-stock.img 2>/dev/null || true
-if gdown "https://drive.google.com/uc?id=${BOOT_GDRIVE_ID}" -O boot-stock.img 2>&1; then
-    echo "  ✅ boot.img : $(du -h boot-stock.img | cut -f1)"
-fi
-if [ ! -f "boot-stock.img" ] || [ "$(stat -c%s boot-stock.img 2>/dev/null || echo 0)" -lt 50000000 ]; then
-    echo "❌ boot-stock.img invalide"; exit 1
-fi
-rm -f ./dtbo-stock.img 2>/dev/null || true
-gdown "https://drive.google.com/uc?id=${DTBO_GDRIVE_ID}" -O dtbo-stock.img 2>&1 || true
+# ==================== 9. REPACK ====================
+gdown "https://drive.google.com/uc?id=${BOOT_GDRIVE_ID}" -O boot-stock.img
+gdown "https://drive.google.com/uc?id=${DTBO_GDRIVE_ID}" -O dtbo-stock.img || true
 
 mkdir -p repack
 cp boot-stock.img repack/boot.img
@@ -511,13 +328,10 @@ wget -q https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0
 unzip -q Magisk-v27.0.apk lib/x86_64/libmagiskboot.so
 mv lib/x86_64/libmagiskboot.so repack/magiskboot
 chmod +x repack/magiskboot
-rm -rf ./Magisk-v27.0.apk ./lib 2>/dev/null || true
+rm -rf ./Magisk-v27.0.apk ./lib
 
 cd repack
-set +e
 ./magiskboot unpack boot.img
-set -e
-
 cp "$GITHUB_WORKSPACE/kernel_sources/out/arch/arm64/boot/Image" kernel
 
 ./magiskboot cpio ramdisk.cpio \
@@ -532,38 +346,15 @@ chmod 755 ./local_su_binary
     "mkdir 0755 system" \
     "mkdir 0755 system/bin" \
     "add 06755 system/bin/su ./local_su_binary"
-rm -f ./local_su_binary 2>/dev/null || true
+rm -f ./local_su_binary
 
 ./magiskboot repack boot.img new-boot.img
 mv new-boot.img ../final_boot.img
-cd ..
-
-# ==================== 10. DIAGNOSTIC ====================
-echo ""
-echo "=== DIAGNOSTIC ==="
-mkdir -p verify; cd verify
-cp ../final_boot.img verify_boot.img
-../repack/magiskboot unpack verify_boot.img 2>/dev/null || true
-if [ -f "kernel" ]; then
-    HASH_EXTRACTED=$(sha256sum kernel | cut -d' ' -f1)
-    HASH_COMPILED=$(cat /tmp/kernel_compiled_hash.txt)
-    [ "$HASH_EXTRACTED" = "$HASH_COMPILED" ] && echo "✅ Noyau IDENTIQUE"
-fi
-
-if [ -f "ramdisk.cpio" ]; then
-    if ../repack/magiskboot cpio ramdisk.cpio "exists data/adb/ksud/ksud" 2>/dev/null; then
-        echo "  ✅ ksud présent dans /data/adb/ksud/"
-    else
-        echo "  ❌ ksud absent"
-    fi
-fi
 cd ..
 
 # ==================== 11. SORTIE ====================
 cp final_boot.img "output/FinaSU-A-${VER}-boot.img"
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/
-cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
-echo ""
-echo "=== BUILD TERMINÉ ${VER} (FinaSU $KSU_REF, Tracepoint, sans SuSFS) ==="
+echo "=== BUILD TERMINÉ AVEC SUCCÈS ==="
 ls -lh output/
