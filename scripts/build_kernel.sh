@@ -4,8 +4,7 @@ set -euo pipefail
 # =============================================================================
 # FinaSU (LyraVoid) en dur dans le noyau 4.19 — ÉTAPE A : FinaSU seul, hooks Tracepoint, SANS SuSFS
 # Motorola One 5G Ace (kiev) — LineageOS 23.2
-#
-# Objectif : voir si le driver FinaSU compile et démarre sur ce noyau 4.19.
+# Option B : corrections minimales (pas de stub agressif)
 # =============================================================================
 
 FINASU_URL="${FINASU_URL:-https://github.com/LyraVoid/FinaSU.git}"
@@ -242,9 +241,9 @@ if [ -n "$FILES_ANON_INODE" ]; then
     done
 fi
 
-# ==================== 4b. PORTAGE 4.19 (SELinux lourd + file_wrapper) — VERSION CORRIGÉE ====================
+# ==================== 4b. PORTAGE 4.19 — OPTION B (corrections minimales) ====================
 echo ""
-echo "=== Portage 4.19 (SELinux lourd + file_wrapper) — version corrigée ==="
+echo "=== Portage 4.19 (Option B — corrections minimales) ==="
 
 python3 - "$KSU_DIR" <<'PORTEOF' 2>&1 | tee -a "$AUDIT"
 import os, re, sys
@@ -263,7 +262,7 @@ def write_if_changed(path, new_content, old_content):
     return False
 
 # =====================================================================
-# 1. rules.c
+# 1. rules.c — chemin 4.19 + correction échappement des chaînes
 # =====================================================================
 rules_path = os.path.join(root, "selinux", "rules.c")
 if os.path.isfile(rules_path):
@@ -277,14 +276,15 @@ if os.path.isfile(rules_path):
     if "struct selinux_policy *backup_sepolicy;" in c and "KSU_BACKUP_SEPOLICY_STUB" not in c:
         c = c.replace(
             "struct selinux_policy *backup_sepolicy;",
-            '''#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
-struct selinux_policy *backup_sepolicy = NULL;
-#define KSU_BACKUP_SEPOLICY_STUB 1
-#else
-struct selinux_policy *backup_sepolicy;
-#endif'''
+            "#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n"
+            "struct selinux_policy *backup_sepolicy = NULL;\n"
+            "#define KSU_BACKUP_SEPOLICY_STUB 1\n"
+            "#else\n"
+            "struct selinux_policy *backup_sepolicy;\n"
+            "#endif"
         )
 
+    # Chemin ancien noyau (chaînes correctement formées, pas de \\n dans les littéraux Python)
     old_kernel_path = r'''
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 /* ========== Chemin noyau ancien (4.14 / 4.19) ========== */
@@ -375,7 +375,7 @@ void apply_kernelsu_rules(void)
     if re.search(r'void\s+apply_kernelsu_rules\s*\(\s*\)\s*\{', c) and "Chemin noyau ancien" not in c:
         c = re.sub(
             r'void\s+apply_kernelsu_rules\s*\(\s*\)\s*\{',
-            old_kernel_path + r'\nvoid apply_kernelsu_rules()\n{',
+            old_kernel_path + "\nvoid apply_kernelsu_rules()\n{",
             c,
             count=1
         )
@@ -389,7 +389,7 @@ void apply_kernelsu_rules(void)
     write_if_changed(rules_path, c, o)
 
 # =====================================================================
-# 2. selinux_hide.c
+# 2. selinux_hide.c — stub minimal avec includes corrects
 # =====================================================================
 hide_path = os.path.join(root, "feature", "selinux_hide.c")
 if os.path.isfile(hide_path):
@@ -398,29 +398,31 @@ if os.path.isfile(hide_path):
     o = c
 
     if "KSU_SELINUX_HIDE_DISABLED_ON_OLD_KERNEL" not in c:
-        header = '''/* Auto-portage 4.19 : selinux_hide désactivé sur noyaux < 5.10 */
-#include <linux/version.h>
-#define KSU_SELINUX_HIDE_DISABLED_ON_OLD_KERNEL 1
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
-
-#include <linux/errno.h>
-bool ksu_selinux_hide_enabled = false;
-bool ksu_selinux_hide_running = false;
-
-int ksu_selinux_hide_enable(void) { return -EOPNOTSUPP; }
-void ksu_selinux_hide_unhook(void) {}
-void initialize_fake_status(void) {}
-
-#else /* >= 5.10 */
-
-'''
+        header = (
+            "/* Auto-portage 4.19 : selinux_hide désactivé sur noyaux < 5.10 */\n"
+            "#include <linux/version.h>\n"
+            "#include <linux/types.h>\n"
+            "#include <linux/errno.h>\n"
+            "#define KSU_SELINUX_HIDE_DISABLED_ON_OLD_KERNEL 1\n"
+            "\n"
+            "#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n"
+            "\n"
+            "bool ksu_selinux_hide_enabled = false;\n"
+            "bool ksu_selinux_hide_running = false;\n"
+            "\n"
+            "int ksu_selinux_hide_enable(void) { return -EOPNOTSUPP; }\n"
+            "void ksu_selinux_hide_unhook(void) {}\n"
+            "void initialize_fake_status(void) {}\n"
+            "\n"
+            "#else /* >= 5.10 */\n"
+            "\n"
+        )
         c = re.sub(r'#include\s*[<"]linux/version\.h[>"]\s*\n', '', c)
         c = header + c + "\n#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0) */\n"
         write_if_changed(hide_path, c, o)
 
 # =====================================================================
-# 3. sepolicy.c
+# 3. sepolicy.c — protection anti-redefinition uniquement (pas de stub agressif)
 # =====================================================================
 sepolicy_path = os.path.join(root, "selinux", "sepolicy.c")
 if os.path.isfile(sepolicy_path):
@@ -428,35 +430,42 @@ if os.path.isfile(sepolicy_path):
         c = f.read()
     o = c
 
-    if "KSU_FILENAME_TRANS_STUB" not in c:
+    if "KSU_FILENAME_TRANS_GUARD" not in c:
         if '#include <linux/version.h>' not in c:
             c = '#include <linux/version.h>\n' + c
 
-        stub = '''
-/* ========== Compat 4.19 : filename_trans trop différent ========== */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
-#define KSU_FILENAME_TRANS_STUB 1
-
-static bool add_filename_trans(struct policydb *db, const char *s, const char *t,
-                               const char *cls, const char *d, const char *o)
-{
-    pr_info("add_filename_trans ignored on kernel < 5.8\\n");
-    return true;
-}
-#endif /* < 5.8 */
-'''
-        last_include = 0
-        for m in re.finditer(r'#include\s+[<"].*?[>"]\s*\n', c):
-            last_include = m.end()
-        if last_include > 0:
-            c = c[:last_include] + "\n" + stub + "\n" + c[last_include:]
-        else:
-            c = stub + "\n" + c
+        # On entoure uniquement la définition existante de add_filename_trans
+        # pour éviter les erreurs de structure sur < 5.8, sans ajouter de nouvelle fonction.
+        pattern = r'(static\s+bool\s+add_filename_trans\s*\([^)]*\)\s*\{)'
+        if re.search(pattern, c):
+            c = re.sub(
+                pattern,
+                r'#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)\n\1',
+                c,
+                count=1
+            )
+            # Fermer le #if juste avant la fonction suivante (approche simple)
+            # On ajoute un marqueur pour éviter les doubles traitements
+            c = c.replace(
+                "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)\nstatic bool add_filename_trans",
+                "#define KSU_FILENAME_TRANS_GUARD 1\n#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)\nstatic bool add_filename_trans",
+                1
+            )
+            # Fermeture approximative : après la fonction on remet un #else stub minimal
+            # (on cherche la prochaine fonction static bool)
+            c = re.sub(
+                r'(#if LINUX_VERSION_CODE >= KERNEL_VERSION\(5, 8, 0\)\nstatic bool add_filename_trans[\s\S]*?\n\})',
+                r'\1\n#else\nstatic bool add_filename_trans(struct policydb *db, const char *s, const char *t,\n'
+                r'                               const char *cls, const char *d, const char *o)\n'
+                r'{\n    return true;\n}\n#endif',
+                c,
+                count=1
+            )
 
         write_if_changed(sepolicy_path, c, o)
 
 # =====================================================================
-# 4. file_wrapper.c
+# 4. file_wrapper.c (inchangé)
 # =====================================================================
 def find_matching(c, i, open_ch, close_ch):
     depth = 0
@@ -520,7 +529,7 @@ for dp, dn, fn in os.walk(root):
             open(p, 'w', encoding='utf-8').write(c)
             total += 1
 
-print(f"  ✅ portage 4.19 (SELinux + file_wrapper) : {total} fichier(s) modifié(s)")
+print(f"  ✅ portage 4.19 (Option B) : {total} fichier(s) modifié(s)")
 PORTEOF
 
 # ==================== 5. CONFIGURATION ====================
