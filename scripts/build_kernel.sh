@@ -20,6 +20,7 @@ df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
 DTBO_GDRIVE_ID="11451aa0CCzyVtNTYOK2n6oH6E0PT-2NX"
+MGR_GDRIVE_ID="${MGR_GDRIVE_ID:-1Qr07fjThXjmIz_DAmW2GZepoWrNIikXR}"
 
 mkdir -p "$GITHUB_WORKSPACE/output"
 AUDIT="$GITHUB_WORKSPACE/output/audit-${VER}.txt"
@@ -583,13 +584,13 @@ if os.path.isfile(p):
             )
         write(p, c, o)
 
-# ----- file_wrapper PROPRE (pas de wrap de fonction) -----
+# ----- file_wrapper PROPRE + gardes élargis -----
 p = os.path.join(root, "infra/file_wrapper.c")
 if os.path.isfile(p):
     c = read(p)
     o = c
 
-    # Enlever d'anciens gardes mal posés (évite macros non terminées)
+    # Retirer d'anciens gardes 5.1 / 4.20 (une ligne de corps)
     c = re.sub(
         r'#if\s+LINUX_VERSION_CODE\s*>=\s*KERNEL_VERSION\(\s*5\s*,\s*1\s*,\s*0\s*\)\s*\n(.*?\n)#endif\s*\n',
         r'\1', c,
@@ -601,23 +602,21 @@ if os.path.isfile(p):
 
     c = ensure_ver(c)
 
-    # REMAP_FILE_DEDUP
     if 'REMAP_FILE_DEDUP' in c and 'KSU_REMAP_FILE_DEDUP_COMPAT' not in c:
         last = 0
         for m in re.finditer(r'#include\s+[<"].*?[>"]\s*\n', c):
             last = m.end()
         c = c[:last] + (
-            '\n#ifndef KSU_REMAP_FILE_DEDUP_COMPAT\n'
-            '#define KSU_REMAP_FILE_DEDUP_COMPAT 1\n'
-            '#ifndef REMAP_FILE_DEDUP\n#define REMAP_FILE_DEDUP 0\n#endif\n'
-            '#endif\n'
+            '\n#ifndef KSU_REMAP_FILE_DEDUP_COMPAT\n#define KSU_REMAP_FILE_DEDUP_COMPAT 1\n'
+            '#ifndef REMAP_FILE_DEDUP\n#define REMAP_FILE_DEDUP 0\n#endif\n#endif\n'
         ) + c[last:]
 
-    def guard_member(text, member, cond):
+    def guard_lines_containing(text, pattern, cond):
+        """Toute ligne non-# qui matche pattern → entourée de #if cond."""
         out = []
         for line in text.split('\n'):
             prev = out[-1] if out else ''
-            if re.search(r'\.' + re.escape(member) + r'\s*=', line) and not line.lstrip().startswith('#'):
+            if re.search(pattern, line) and not line.lstrip().startswith(('#', '//')):
                 if '#if' not in prev:
                     out.append(f'#if {cond}')
                     out.append(line)
@@ -628,8 +627,15 @@ if os.path.isfile(p):
                 out.append(line)
         return '\n'.join(out)
 
-    c = guard_member(c, 'iopoll', 'LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)')
-    c = guard_member(c, 'remap_file_range', 'LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)')
+    # Plus large que "\.iopoll\s*=" : couvre .iopoll, ->iopoll, etc.
+    c = guard_lines_containing(
+        c, r'(\.iopoll\b|->iopoll\b)',
+        'LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)',
+    )
+    c = guard_lines_containing(
+        c, r'(\.remap_file_range\b|->remap_file_range\b)',
+        'LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)',
+    )
     write(p, c, o)
 
 # ----- TWA_RESUME -----
