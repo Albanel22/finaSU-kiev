@@ -22,7 +22,7 @@ BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
 DTBO_GDRIVE_ID="11451aa0CCzyVtNTYOK2n6oH6E0PT-2NX"
 
 mkdir -p "$GITHUB_WORKSPACE/output"
-AUDIT="\( GITHUB_WORKSPACE/output/audit- \){VER}.txt"
+AUDIT="$GITHUB_WORKSPACE/output/audit-${VER}.txt"
 : > "$AUDIT"
 
 summarize() {
