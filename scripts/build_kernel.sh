@@ -5,8 +5,8 @@ set -euo pipefail
 # FinaSU (LyraVoid) en dur dans le noyau 4.19 — ÉTAPE A : FinaSU seul, hooks Manual
 # Motorola One 5G Ace (kiev) — LineageOS 23.2
 #
-# Stratégie : Modification du Makefile pour exclure les modules intrinsèquement 
-# incompatibles 4.19 (SELinux Hide, Seccomp Cache, Supercall) + Patchs API ciblés.
+# Stratégie : Neutralisation CHIRURGICALE via Python du Makefile + 
+# Correctifs regex larges et tolérants pour les fichiers C restants.
 # =============================================================================
 
 FINASU_URL="${FINASU_URL:-https://github.com/LyraVoid/FinaSU.git}"
@@ -18,7 +18,7 @@ VER="finasu-A"
 KSU_REF="$FINASU_REF"
 KSUD_FALLBACK_REF="${KSUD_FALLBACK_REF:-v3.4.2}"
 
-echo "=== Build FinaSU ($FINASU_REF) — Compatibilité 4.19 officielle ==="
+echo "=== Build FinaSU ($FINASU_REF) — Compatibilité 4.19 Chirurgicale ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -138,8 +138,27 @@ KSU_DIR="drivers/kernelsu"
 KSU_REPO_ROOT="$GITHUB_WORKSPACE/kernel_sources/FinaSU"
 echo "✅ FinaSU intégré ($KSU_DIR -> $(readlink drivers/kernelsu || echo '?'))"
 
-# ==================== 3. SIGNATURE DU MANAGER ====================
+# ==================== 2b. TÉLÉCHARGEMENT DU MANAGER ====================
+echo ""
+echo "=== Téléchargement du Manager FinaSU ==="
+mkdir -p "$GITHUB_WORKSPACE/patches"
+MGR_GDRIVE_ID="1Qr07fjThXjmIz_DAmW2GZepoWrNIikXR"
 MGR_APK="$GITHUB_WORKSPACE/patches/manager.apk"
+
+if [ ! -f "$MGR_APK" ]; then
+    echo "Téléchargement du manager.apk depuis Google Drive (ID: $MGR_GDRIVE_ID)..."
+    gdown "https://drive.google.com/uc?id=${MGR_GDRIVE_ID}" -O "$MGR_APK" 2>&1 || true
+    if [ -f "$MGR_APK" ] && [ "$(stat -c%s "$MGR_APK" 2>/dev/null || echo 0)" -gt 1000000 ]; then
+        echo "✅ Manager téléchargé avec succès : $(du -h "$MGR_APK" | cut -f1)"
+    else
+        echo "⚠️ Échec du téléchargement ou fichier invalide du manager.apk"
+        rm -f "$MGR_APK"
+    fi
+else
+    echo "✅ Manager déjà présent : $(du -h "$MGR_APK" | cut -f1)"
+fi
+
+# ==================== 3. SIGNATURE DU MANAGER ====================
 if [ -z "$FINASU_EXPECTED_SIZE" ] && [ -f "$MGR_APK" ]; then
     SIG_OUT=$(python3 - "$MGR_APK" <<'PYEOF' || true
 import hashlib, struct, sys
@@ -179,24 +198,12 @@ if [ -n "$FINASU_EXPECTED_SIZE" ] && [ -n "$FINASU_EXPECTED_HASH" ]; then
     SIG_ARGS="KSU_EXPECTED_SIZE=$FINASU_EXPECTED_SIZE KSU_EXPECTED_HASH=$FINASU_EXPECTED_HASH"
     echo "Signature du manager : taille $FINASU_EXPECTED_SIZE, sha256 $FINASU_EXPECTED_HASH" | tee -a "$AUDIT"
 else
-    echo "⚠️ AUCUNE signature de manager fournie" | tee -a "$AUDIT"
+    echo "⚠️ AUCUNE signature de manager fournie ou calculée" | tee -a "$AUDIT"
 fi
 
-# ==================== 4. PATCHS DE COMPATIBILITÉ 4.19 CIBLÉS ====================
+# ==================== 4. NEUTRALISATION CHIRURGICALE (Makefile + Python) ====================
 echo ""
-echo "=== Patchs de compatibilité 4.19 ciblés ==="
-
-# 1. Patch Makefile pour désactiver les modules intrinsèquement incompatibles 4.19
-MAKEFILE="$KSU_DIR/Makefile"
-if [ -f "$MAKEFILE" ]; then
-    sed -i 's/obj-y += feature\/selinux_hide.o/obj-n += feature\/selinux_hide.o/' "$MAKEFILE"
-    sed -i 's/obj-\$(CONFIG_KSU) += feature\/selinux_hide.o/obj-n += feature\/selinux_hide.o/' "$MAKEFILE"
-    sed -i 's/obj-y += infra\/seccomp_cache.o/obj-n += infra\/seccomp_cache.o/' "$MAKEFILE"
-    sed -i 's/obj-\$(CONFIG_KSU) += infra\/seccomp_cache.o/obj-n += infra\/seccomp_cache.o/' "$MAKEFILE"
-    sed -i 's/obj-y += supercall\//obj-n += supercall\//' "$MAKEFILE"
-    sed -i 's/obj-\$(CONFIG_KSU) += supercall\//obj-n += supercall\//' "$MAKEFILE"
-    echo "✅ Makefile patché pour désactiver selinux_hide, seccomp_cache, supercall"
-fi
+echo "=== Neutralisation chirurgicale des modules incompatibles 4.19 ==="
 
 python3 - "$KSU_DIR" <<'PORTEOF' 2>&1 | tee -a "$AUDIT"
 import os, re, sys
@@ -204,88 +211,62 @@ import os, re, sys
 root = sys.argv[1]
 total_files = 0
 
+# 1. Nettoyage AGRESSIF du Makefile (fonctionne quelle que soit la variable utilisée)
+makefile_path = os.path.join(root, "Makefile")
+if os.path.exists(makefile_path):
+    with open(makefile_path, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+    
+    new_lines = []
+    for line in lines:
+        # Commente TOUTE ligne contenant ces modules, sauf si déjà commentée
+        if any(x in line for x in ['selinux/rules.o', 'selinux/sepolicy.o', 'feature/selinux_hide.o', 'infra/seccomp_cache.o', 'supercall/']):
+            if not line.strip().startswith('#'):
+                new_lines.append('# DISABLED_419: ' + line)
+            else:
+                new_lines.append(line)
+        else:
+            new_lines.append(line)
+            
+    with open(makefile_path, 'w', encoding='utf-8') as f:
+        f.writelines(new_lines)
+    print("✅ Makefile : modules SELinux/Seccomp/Supercall désactivés de force")
+
+# 2. Patchs larges et tolérants pour les fichiers C
 def patch_file(filepath):
     global total_files
     with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
         content = f.read()
     original = content
 
-    # 1. TWA_RESUME et TWA_NONE -> 0 (Sûr et universel pour 4.19)
+    # A. TWA_RESUME / TWA_NONE -> 0 (Universel pour 4.19)
     if 'TWA_RESUME' in content or 'TWA_NONE' in content:
         content = content.replace('TWA_RESUME', '0')
         content = content.replace('TWA_NONE', '0')
 
-    # 2. fsnotify_ops : handle_inode_event (5.9+) -> handle_event (4.19)
-    if 'ksu_handle_inode_event' in content and 'handle_inode_event = ksu_handle_inode_event' in content:
-        func_old = '''static int ksu_handle_inode_event(struct fsnotify_mark *mark, u32 mask, struct inode *inode, struct inode *dir,
-                                  const struct qstr *file_name, u32 cookie)
-{
-    if (!file_name)
-        return 0;
-    if (mask & FS_ISDIR)
-        return 0;
-    if (file_name->len == 13 && !memcmp(file_name->name, "packages.list", 13)) {
-        pr_info("packages.list detected: %d\\n", mask);
-        ksu_defer_track_throne();
-    }
-    return 0;
-}'''
-        func_new = '''#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
-static int ksu_handle_inode_event(struct fsnotify_mark *mark, u32 mask, struct inode *inode, struct inode *dir,
-                                  const struct qstr *file_name, u32 cookie)
-{
-    if (!file_name) return 0;
-    if (mask & FS_ISDIR) return 0;
-    if (file_name->len == 13 && !memcmp(file_name->name, "packages.list", 13)) {
-        pr_info("packages.list detected: %d\\n", mask);
-        ksu_defer_track_throne();
-    }
-    return 0;
-}
-#else
-static int ksu_handle_event(struct fsnotify_group *group, struct inode *inode,
-                            struct fsnotify_mark *inode_mark, struct fsnotify_mark *vfsmount_mark,
-                            u32 mask, void *data, int data_type, const unsigned char *file_name, u32 cookie)
-{
-    if (!file_name) return 0;
-    if (mask & FS_ISDIR) return 0;
-    size_t len = strlen((const char *)file_name);
-    if (len == 13 && !memcmp(file_name, "packages.list", 13)) {
-        pr_info("packages.list detected: %d\\n", mask);
-        ksu_defer_track_throne();
-    }
-    return 0;
-}
-#endif'''
-        content = content.replace(func_old, func_new)
-        
-        struct_old = '''static const struct fsnotify_ops ksu_ops = {
-    .handle_inode_event = ksu_handle_inode_event,
-};'''
-        struct_new = '''static const struct fsnotify_ops ksu_ops = {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
-    .handle_inode_event = ksu_handle_inode_event,
-#else
-    .handle_event = ksu_handle_event,
-#endif
-};'''
-        content = content.replace(struct_old, struct_new)
+    # B. fsnotify_ops : remplace l'assignment de handle_inode_event de manière large
+    if 'ksu_handle_inode_event' in content:
+        content = re.sub(
+            r'\.handle_inode_event\s*=\s*[^,]+,',
+            r'#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n    .handle_inode_event = ksu_handle_inode_event,\n#else\n    .handle_event = ksu_handle_event,\n#endif',
+            content
+        )
 
-    # 3. file_wrapper.c : iopoll et remap_file_range
+    # C. file_wrapper.c : wrap large de iopoll et remap_file_range
     if 'file_wrapper.c' in filepath:
         content = re.sub(
-            r'(\s+)p->ops\.iopoll = fp->f_op->iopoll \? ksu_wrapper_iopoll : NULL;',
-            r'\1#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n\1p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;\n\1#endif',
+            r'(.*p->ops\.iopoll\s*=.*?;)',
+            r'#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n\1\n#endif',
             content
         )
         content = re.sub(
-            r'(\s+)p->ops\.remap_file_range = fp->f_op->remap_file_range \? ksu_wrapper_remap_file_range : NULL;',
-            r'\1#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n\1p->ops.remap_file_range = fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;\n\1#endif',
+            r'(.*p->ops\.remap_file_range\s*=.*?;)',
+            r'#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n\1\n#endif',
             content
         )
         content = content.replace('REMAP_FILE_DEDUP', '0 /* REMAP_FILE_DEDUP not in 4.19 */')
 
-    # 4. sepolicy.c : Stubber filename_trans pour < 5.8
+    # D. sepolicy.c : stubber filename_trans pour < 5.8
     if 'sepolicy.c' in filepath and 'add_filename_trans' in content and 'KSU_FILENAME_TRANS_STUB' not in content:
         content = re.sub(
             r'(static bool add_filename_trans\(struct policydb \*db, const char \*s, const char \*t, const char \*c, const char \*d,\s*const char \*o\)\s*\{.*?^\})',
@@ -294,15 +275,15 @@ static int ksu_handle_event(struct fsnotify_group *group, struct inode *inode,
             flags=re.DOTALL | re.MULTILINE
         )
 
-    # 5. Headers manquants pour task_struct, etc.
+    # E. Headers manquants et remplacements
     if 'put_task_struct' in content or 'tasklist_lock' in content or 'init_task' in content:
         if '#include <linux/sched/task.h>' not in content:
             content = '#include <linux/sched/task.h>\n' + content
         if '#include <linux/sched/signal.h>' not in content:
             content = '#include <linux/sched/signal.h>\n' + content
 
-    # 6. uapi/linux/mount.h -> linux/mount.h
     content = content.replace('#include <uapi/linux/mount.h>', '#include <linux/mount.h>')
+    content = content.replace('#include <linux/minmax.h>', '#include <linux/kernel.h>')
 
     if content != original:
         with open(filepath, 'w', encoding='utf-8') as f:
@@ -341,7 +322,7 @@ if [ -n "$FILES_ANON_INODE" ]; then
     done
 fi
 
-# ==================== 6. CONFIGURATION ====================
+# ==================== 6. CONFIGURATION (FORÇAGE IMPITOYABLE) ====================
 echo ""
 echo "=== Configuration (FinaSU, compatible 4.19) ==="
 export ARCH=arm64; export SUBARCH=arm64
@@ -351,32 +332,32 @@ export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 mkdir -p out
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 vendor/lito-perf_defconfig
 
-{
-  echo "CONFIG_KSU=y"
-  echo "# CONFIG_KSU_HOOK_TRACEPOINT is not set"
-  echo "CONFIG_KSU_MANUAL_HOOK=y"
-  
-  echo "# CONFIG_KSU_SELINUX_HIDE is not set"
-  echo "# CONFIG_KSU_SECCOMP_CACHE is not set"
-  echo "# CONFIG_KSU_SUPERCALL is not set"
-  
-  echo "CONFIG_KPROBES=y"
-  echo "CONFIG_HAVE_KPROBES=y"
-  echo "CONFIG_KRETPROBES=y"
-  echo "CONFIG_KALLSYMS=y"
-  echo "CONFIG_KALLSYMS_ALL=y"
-  echo "CONFIG_EXT4_FS=y"
-  echo "CONFIG_THREAD_INFO_IN_TASK=y"
-  echo "CONFIG_FTRACE=y"
-  echo "CONFIG_FTRACE_SYSCALLS=y"
-  echo "CONFIG_COMPAT=y"
-  echo "CONFIG_COMPAT_32BIT_TIME=y"
-} >> out/.config
+# On écrit d'abord les désactivations pour éviter les conflits de choice
+cat << 'EOF' >> out/.config
+# CONFIG_KSU_HOOK_TRACEPOINT is not set
+# CONFIG_KSU_SELINUX_HIDE is not set
+# CONFIG_KSU_SECCOMP_CACHE is not set
+# CONFIG_KSU_SUPERCALL is not set
+CONFIG_KSU=y
+CONFIG_KSU_MANUAL_HOOK=y
+CONFIG_KPROBES=y
+CONFIG_HAVE_KPROBES=y
+CONFIG_KRETPROBES=y
+CONFIG_KALLSYMS=y
+CONFIG_KALLSYMS_ALL=y
+CONFIG_EXT4_FS=y
+CONFIG_THREAD_INFO_IN_TASK=y
+CONFIG_FTRACE=y
+CONFIG_FTRACE_SYSCALLS=y
+CONFIG_COMPAT=y
+CONFIG_COMPAT_32BIT_TIME=y
+EOF
 
-make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig 2>&1 | tail -5
+make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig > /dev/null 2>&1
 
-# Forçage agressif des options après olddefconfig
+# Forçage AGRESSIF après olddefconfig pour garantir que MANUAL_HOOK reste actif
 sed -i 's/^# CONFIG_KSU_MANUAL_HOOK is not set$/CONFIG_KSU_MANUAL_HOOK=y/' out/.config
+sed -i 's/^CONFIG_KSU_HOOK_TRACEPOINT=y$/# CONFIG_KSU_HOOK_TRACEPOINT is not set/' out/.config
 
 echo "=== État final .config ==="
 {
@@ -515,5 +496,5 @@ cp final_boot.img "output/FinaSU-A-${VER}-boot.img"
 cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
-echo "=== BUILD TERMINÉ ${VER} (FinaSU $KSU_REF, Compatibilité 4.19 officielle) ==="
+echo "=== BUILD TERMINÉ ${VER} (FinaSU $KSU_REF, Compatibilité 4.19 Chirurgicale) ==="
 ls -lh output/
