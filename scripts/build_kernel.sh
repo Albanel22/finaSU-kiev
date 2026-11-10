@@ -3,8 +3,10 @@ set -euo pipefail
 
 # =============================================================================
 # FinaSU (LyraVoid) — noyau 4.19 — ÉTAPE A (Tracepoint, sans SuSFS)
-# Script global : rules dual-path + portages + file_wrapper renforcé + manager GDrive
+# Script global corrigé ($ variables intacts)
 # =============================================================================
+
+export GITHUB_WORKSPACE="${GITHUB_WORKSPACE:-$PWD}"
 
 FINASU_URL="${FINASU_URL:-https://github.com/LyraVoid/FinaSU.git}"
 FINASU_REF="${FINASU_REF:-v1.5.0}"
@@ -124,7 +126,7 @@ KSU_DIR="drivers/kernelsu"
 KSU_REPO_ROOT="$GITHUB_WORKSPACE/kernel_sources/FinaSU"
 echo "✅ FinaSU intégré"
 
-# ==================== 3. MANAGER APK (GDrive) + SIGNATURE ====================
+# ==================== 3. MANAGER APK + SIGNATURE ====================
 mkdir -p "$GITHUB_WORKSPACE/patches"
 if [ ! -f "$GITHUB_WORKSPACE/patches/manager.apk" ] && [ -n "$MGR_GDRIVE_ID" ]; then
     echo "=== Téléchargement manager.apk (GDrive) ==="
@@ -194,7 +196,6 @@ done || true
 # ==================== 4b. PORTAGE 4.19 ====================
 echo "=== Portage 4.19 ==="
 
-# rules.c dual-path (abrégé moderne OK — chemin 4.19 complet)
 cat > "$KSU_DIR/selinux/rules.c" << 'RULESEOF'
 #include "linux/rcupdate.h"
 #include "security.h"
@@ -549,7 +550,6 @@ def ensure_inc(c, inc):
 def ensure_ver(c):
     return c if 'linux/version.h' in c else ensure_inc(c, '<linux/version.h>')
 
-# selinux_hide
 p = os.path.join(root, "feature/selinux_hide.c")
 if os.path.isfile(p):
     c, o = read(p), None
@@ -567,7 +567,6 @@ if os.path.isfile(p):
         c = h + c + "\n#endif\n"
         write(p, c, o)
 
-# sepolicy add_filename_trans
 p = os.path.join(root, "selinux/sepolicy.c")
 if os.path.isfile(p):
     c, o = read(p), None
@@ -585,7 +584,6 @@ if os.path.isfile(p):
             )
         write(p, c, o)
 
-# file_wrapper RENFORCÉ
 p = os.path.join(root, "infra/file_wrapper.c")
 if os.path.isfile(p):
     c, o = read(p), None
@@ -627,7 +625,6 @@ if os.path.isfile(p):
     c = guard_lines_containing(c, r'(\.remap_file_range\b|->remap_file_range\b)', 'LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)')
     write(p, c, o)
 
-# TWA_RESUME
 TWA = '\n#ifndef TWA_RESUME\n#define TWA_RESUME 0\n#endif\n'
 for rel in ['manager/pkg_observer.c', 'manager/dynamic_manager.c', 'policy/allowlist.c', 'supercall/supercall.c']:
     p = os.path.join(root, rel)
@@ -643,7 +640,6 @@ for rel in ['manager/pkg_observer.c', 'manager/dynamic_manager.c', 'policy/allow
         c = c[:last] + TWA + c[last:]
         write(p, c, o)
 
-# SECCOMP
 p = os.path.join(root, 'infra/seccomp_cache.c')
 if os.path.isfile(p):
     c, o = read(p), None
@@ -660,7 +656,6 @@ if os.path.isfile(p):
         ) + c[last:]
         write(p, c, o)
 
-# filter_count
 p = os.path.join(root, 'policy/app_profile.c')
 if os.path.isfile(p):
     c, o = read(p), None
@@ -677,7 +672,6 @@ if os.path.isfile(p):
         c = '\n'.join(out).replace('#include <linux/version.h>', '#include <linux/version.h>\n#define KSU_FILTER_COUNT_COMPAT 1', 1)
         write(p, c, o)
 
-# put_task_struct
 for rel in ['manager/dynamic_manager.c', 'policy/allowlist.c']:
     p = os.path.join(root, rel)
     if not os.path.isfile(p):
@@ -689,7 +683,6 @@ for rel in ['manager/dynamic_manager.c', 'policy/allowlist.c']:
         c = ensure_inc(c, '<linux/sched/task.h>')
         write(p, c, o)
 
-# tasklist_lock
 p = os.path.join(root, 'supercall/dispatch.c')
 if os.path.isfile(p):
     c, o = read(p), None
@@ -708,7 +701,6 @@ if os.path.isfile(p):
         ) + c[last:]
         write(p, c, o)
 
-# minmax.h / mount.h
 p = os.path.join(root, 'sulog/event.c')
 if os.path.isfile(p):
     c, o = read(p), None
@@ -729,7 +721,6 @@ if os.path.isfile(p):
             '#include <uapi/linux/mount.h>\n#else\n#include <linux/mount.h>\n#endif')
         write(p, c, o)
 
-# fsnotify
 p = os.path.join(root, 'manager/pkg_observer.c')
 if os.path.isfile(p):
     c, o = read(p), None
