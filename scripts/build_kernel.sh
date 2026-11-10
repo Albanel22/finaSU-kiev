@@ -5,8 +5,8 @@ set -euo pipefail
 # FinaSU (LyraVoid) en dur dans le noyau 4.19 — ÉTAPE A : FinaSU seul, hooks Manual
 # Motorola One 5G Ace (kiev) — LineageOS 23.2
 #
-# Stratégie : Désactivation propre des features incompatibles 4.19 (SELinux Hide, 
-# Seccomp Cache, Supercall) + Patchs API ciblés (fsnotify, TWA, iopoll, O_CLOEXEC).
+# Stratégie : Modification du Makefile pour exclure les modules intrinsèquement 
+# incompatibles 4.19 (SELinux Hide, Seccomp Cache, Supercall) + Patchs API ciblés.
 # =============================================================================
 
 FINASU_URL="${FINASU_URL:-https://github.com/LyraVoid/FinaSU.git}"
@@ -186,6 +186,18 @@ fi
 echo ""
 echo "=== Patchs de compatibilité 4.19 ciblés ==="
 
+# 1. Patch Makefile pour désactiver les modules intrinsèquement incompatibles 4.19
+MAKEFILE="$KSU_DIR/Makefile"
+if [ -f "$MAKEFILE" ]; then
+    sed -i 's/obj-y += feature\/selinux_hide.o/obj-n += feature\/selinux_hide.o/' "$MAKEFILE"
+    sed -i 's/obj-\$(CONFIG_KSU) += feature\/selinux_hide.o/obj-n += feature\/selinux_hide.o/' "$MAKEFILE"
+    sed -i 's/obj-y += infra\/seccomp_cache.o/obj-n += infra\/seccomp_cache.o/' "$MAKEFILE"
+    sed -i 's/obj-\$(CONFIG_KSU) += infra\/seccomp_cache.o/obj-n += infra\/seccomp_cache.o/' "$MAKEFILE"
+    sed -i 's/obj-y += supercall\//obj-n += supercall\//' "$MAKEFILE"
+    sed -i 's/obj-\$(CONFIG_KSU) += supercall\//obj-n += supercall\//' "$MAKEFILE"
+    echo "✅ Makefile patché pour désactiver selinux_hide, seccomp_cache, supercall"
+fi
+
 python3 - "$KSU_DIR" <<'PORTEOF' 2>&1 | tee -a "$AUDIT"
 import os, re, sys
 
@@ -198,9 +210,10 @@ def patch_file(filepath):
         content = f.read()
     original = content
 
-    # 1. TWA_RESUME -> TWA_NONE (Disponible en 4.19, comportement sûr)
-    if 'TWA_RESUME' in content:
-        content = content.replace('TWA_RESUME', 'TWA_NONE')
+    # 1. TWA_RESUME et TWA_NONE -> 0 (Sûr et universel pour 4.19)
+    if 'TWA_RESUME' in content or 'TWA_NONE' in content:
+        content = content.replace('TWA_RESUME', '0')
+        content = content.replace('TWA_NONE', '0')
 
     # 2. fsnotify_ops : handle_inode_event (5.9+) -> handle_event (4.19)
     if 'ksu_handle_inode_event' in content and 'handle_inode_event = ksu_handle_inode_event' in content:
@@ -258,23 +271,38 @@ static int ksu_handle_event(struct fsnotify_group *group, struct inode *inode,
 };'''
         content = content.replace(struct_old, struct_new)
 
-    # 3. file_wrapper.c : iopoll n'existe pas dans file_operations en 4.19
-    if 'file_wrapper.c' in filepath and 'p->ops.iopoll = fp->f_op->iopoll' in content:
+    # 3. file_wrapper.c : iopoll et remap_file_range
+    if 'file_wrapper.c' in filepath:
         content = re.sub(
             r'(\s+)p->ops\.iopoll = fp->f_op->iopoll \? ksu_wrapper_iopoll : NULL;',
             r'\1#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n\1p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;\n\1#endif',
             content
         )
+        content = re.sub(
+            r'(\s+)p->ops\.remap_file_range = fp->f_op->remap_file_range \? ksu_wrapper_remap_file_range : NULL;',
+            r'\1#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n\1p->ops.remap_file_range = fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;\n\1#endif',
+            content
+        )
+        content = content.replace('REMAP_FILE_DEDUP', '0 /* REMAP_FILE_DEDUP not in 4.19 */')
 
-    # 4. sepolicy.c : Stubber filename_trans pour < 5.8 car la structure a changé
+    # 4. sepolicy.c : Stubber filename_trans pour < 5.8
     if 'sepolicy.c' in filepath and 'add_filename_trans' in content and 'KSU_FILENAME_TRANS_STUB' not in content:
-        # On entoure la fonction complète d'un #if >= 5.8.0
         content = re.sub(
             r'(static bool add_filename_trans\(struct policydb \*db, const char \*s, const char \*t, const char \*c, const char \*d,\s*const char \*o\)\s*\{.*?^\})',
             r'#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)\n\1\n#else\nstatic bool add_filename_trans(struct policydb *db, const char *s, const char *t, const char *c, const char *d, const char *o) {\n    pr_info("add_filename_trans ignored on kernel < 5.8\\n");\n    return true;\n}\n#endif',
             content,
             flags=re.DOTALL | re.MULTILINE
         )
+
+    # 5. Headers manquants pour task_struct, etc.
+    if 'put_task_struct' in content or 'tasklist_lock' in content or 'init_task' in content:
+        if '#include <linux/sched/task.h>' not in content:
+            content = '#include <linux/sched/task.h>\n' + content
+        if '#include <linux/sched/signal.h>' not in content:
+            content = '#include <linux/sched/signal.h>\n' + content
+
+    # 6. uapi/linux/mount.h -> linux/mount.h
+    content = content.replace('#include <uapi/linux/mount.h>', '#include <linux/mount.h>')
 
     if content != original:
         with open(filepath, 'w', encoding='utf-8') as f:
@@ -313,7 +341,7 @@ if [ -n "$FILES_ANON_INODE" ]; then
     done
 fi
 
-# ==================== 6. CONFIGURATION (DÉSACTIVATION PROPRE DES FEATURES INCOMPATIBLES) ====================
+# ==================== 6. CONFIGURATION ====================
 echo ""
 echo "=== Configuration (FinaSU, compatible 4.19) ==="
 export ARCH=arm64; export SUBARCH=arm64
@@ -325,12 +353,9 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
 
 {
   echo "CONFIG_KSU=y"
-  # Sur 4.19, MANUAL_HOOK est beaucoup plus stable que TRACEPOINT
   echo "# CONFIG_KSU_HOOK_TRACEPOINT is not set"
   echo "CONFIG_KSU_MANUAL_HOOK=y"
   
-  # DÉSACTIVATION OFFICIELLE DES FEATURES INCOMPATIBLES 4.19
-  # (Comme documenté dans kernel/Kbuild de KernelSU : "exclu, suppose l'architecture SELinux introduite bien après 4.19")
   echo "# CONFIG_KSU_SELINUX_HIDE is not set"
   echo "# CONFIG_KSU_SECCOMP_CACHE is not set"
   echo "# CONFIG_KSU_SUPERCALL is not set"
@@ -350,9 +375,12 @@ make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPIL
 
 make O=out LLVM=1 CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig 2>&1 | tail -5
 
+# Forçage agressif des options après olddefconfig
+sed -i 's/^# CONFIG_KSU_MANUAL_HOOK is not set$/CONFIG_KSU_MANUAL_HOOK=y/' out/.config
+
 echo "=== État final .config ==="
 {
-    for o in KSU KSU_MANUAL_HOOK KSU_SELINUX_HIDE KPROBES KALLSYMS_ALL EXT4_FS THREAD_INFO_IN_TASK FTRACE_SYSCALLS; do
+    for o in KSU KSU_MANUAL_HOOK KPROBES KALLSYMS_ALL EXT4_FS THREAD_INFO_IN_TASK FTRACE_SYSCALLS; do
         if grep -q "^CONFIG_${o}=y" out/.config; then echo "  ✅ CONFIG_${o}"; else echo "  ℹ️ CONFIG_${o} absent ou inactif"; fi
     done
     true
