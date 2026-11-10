@@ -199,15 +199,18 @@ static void reset_avc_cache(u32 seqno)
 }
 static struct policydb *ksu_get_policydb(void)
 {
-#if defined(KSU_COMPAT_USE_SELINUX_STATE)
-	return &selinux_state.ss->policydb;
-#else
-	return selinux_state.ss->policydb;
-#endif
+	struct selinux_ss *ss = selinux_state.ss;
+	if (!ss)
+		return NULL;
+	return &ss->policydb;
 }
 void apply_kernelsu_rules(void)
 {
 	struct policydb *db = ksu_get_policydb();
+	if (!db) {
+		pr_err("KernelSU: policydb unavailable (selinux_state.ss is NULL)\n");
+		return;
+	}
 	if (!getenforce())
 		pr_info("SELinux permissive or disabled, apply rules! (old kernel path)\n");
 	ksu_type(db, KERNEL_SU_DOMAIN, "domain");
@@ -361,7 +364,7 @@ echo "  ✅ rules.c dual-path"
 
 # ==================== 4b.2 Correctifs 4.19 ====================
 python3 - "$KSU_DIR" <<'PORTEOF' 2>&1 | tee -a "$AUDIT"
-import os, sys
+import os, re, sys
 
 root = sys.argv[1]
 total = 0
@@ -571,7 +574,7 @@ if os.path.isfile(p):
         ebitmap_set_bit(&db->role_val_to_struct[i]->types, value - 1, 1);
     }
     return true;
-#else /* 4.19 flex_array path */
+#else
     u32 value = ++db->p_types.nprim;
     int k;
     void *zero = NULL;
@@ -585,7 +588,6 @@ if os.path.isfile(p):
     if (!key) { pr_err("add_type: alloc key failed.\\n"); return false; }
     if (symtab_insert(&db->p_types, key, type)) { pr_err("add_type: insert symtab failed.\\n"); return false; }
 
-    /* type_attr_map_array: flex_array of struct ebitmap */
     struct flex_array *new_tama = flex_array_alloc(sizeof(struct ebitmap), value, GFP_KERNEL);
     if (!new_tama) { pr_err("add_type: flex_array_alloc type_attr_map_array failed\\n"); return false; }
     {
@@ -610,7 +612,6 @@ if os.path.isfile(p):
         }
     }
 
-    /* type_val_to_struct_array: flex_array of void* */
     struct flex_array *new_tvts = flex_array_alloc(sizeof(void *), value, GFP_KERNEL);
     if (!new_tvts) { pr_err("add_type: flex_array_alloc type_val_to_struct_array failed\\n"); return false; }
     for (k = 0; k < value; k++)
@@ -624,7 +625,6 @@ if os.path.isfile(p):
     db->type_val_to_struct_array = new_tvts;
     flex_array_put_ptr(new_tvts, value - 1, type, GFP_KERNEL);
 
-    /* sym_val_to_name[SYM_TYPES]: flex_array of char* */
     struct flex_array *new_names = flex_array_alloc(sizeof(char *), value, GFP_KERNEL);
     if (!new_names) { pr_err("add_type: flex_array_alloc sym_val_to_name failed\\n"); return false; }
     for (k = 0; k < value; k++)
@@ -671,14 +671,14 @@ if os.path.isfile(p):
     c = rep(c,
         'free_trans:\n    kfree(trans);\nout:\n    return false;\n}\n',
         'free_trans:\n    kfree(trans);\nout:\n    return false;\n}\n'
-        '#else /* LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0) */\n'
+        '#else\n'
         'static bool add_filename_trans(struct policydb *db, const char *s, const char *t, const char *c, const char *d,\n'
         '                               const char *o)\n'
         '{\n'
         '    pr_warn("add_filename_trans non supporté avant 5.10\\n");\n'
         '    return false;\n'
         '}\n'
-        '#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) */\n',
+        '#endif\n',
         "sepolicy/fnametr-close")
 
     c = rep(c,
@@ -702,8 +702,7 @@ if os.path.isfile(p):
         "sepolicy/dup-open")
     c = rep(c,
         'out_free_data:\n    kvfree(data);\n\n    return ERR_PTR(ret);\n}\n',
-        'out_free_data:\n    kvfree(data);\n\n    return ERR_PTR(ret);\n}\n'
-        '#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) */\n',
+        'out_free_data:\n    kvfree(data);\n\n    return ERR_PTR(ret);\n}\n#endif\n',
         "sepolicy/dup-close")
 
     write(p, c, o)
@@ -784,7 +783,6 @@ if os.path.isfile(p):
         c = '\n'.join(out).replace('#include <linux/version.h>',
                                    '#include <linux/version.h>\n#define KSU_FILTER_COUNT_COMPAT 1', 1)
         write(p, c, o)
-    # Alias seccomp_filter_release -> put_seccomp_filter pour 4.19
     if 'seccomp_filter_release' in c and 'KSU_SECCOMP_RELEASE_COMPAT' not in c:
         c = ensure_inc(c, '<linux/version.h>')
         alias = ('\n#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)\n'
@@ -827,6 +825,7 @@ if os.path.isfile(p):
             '#define KSU_MINMAX_COMPAT 1')
         write(p, c, o)
 
+# su_mount_ns.c : include mount.h compat
 p = os.path.join(root, 'infra/su_mount_ns.c')
 if os.path.isfile(p):
     c = read(p); o = c
@@ -837,7 +836,56 @@ if os.path.isfile(p):
             '#define KSU_MOUNT_HDR_COMPAT 1')
         write(p, c, o)
 
-# selinux_hide stub — AJOUT de init/exit
+# ==========================================================
+# path_mount / path_umount : shim sûr pour 4.19
+# ==========================================================
+MOUNT_SHIM = '''#include <linux/version.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+/* path_mount/path_umount absents en 4.19 -> stubs static inline.
+ * Les features qui en dépendent (module mount, hide umount) sont
+ * de fait désactivées sur cette version de noyau. */
+static inline int path_mount(const char *dev_name, struct path *path,
+                             const char *type_page, unsigned long flags,
+                             void *data_page)
+{
+    (void)dev_name; (void)path; (void)type_page; (void)flags; (void)data_page;
+    return -EOPNOTSUPP;
+}
+static inline int path_umount(struct path *path, int flags)
+{
+    (void)path; (void)flags;
+    return -EOPNOTSUPP;
+}
+#endif
+'''
+
+for rel in ['feature/kernel_umount.c', 'infra/su_mount_ns.c']:
+    p = os.path.join(root, rel)
+    if not os.path.isfile(p): continue
+    c = read(p); o = c
+    if 'KSU_MOUNT_419_SHIM' in c:
+        continue
+    # 1. Supprimer les déclarations extern de path_mount/path_umount
+    c = re.sub(r'extern\s+int\s+path_mount\s*\([^;]*\)\s*;', '', c)
+    c = re.sub(r'extern\s+int\s+path_umount\s*\([^;]*\)\s*;', '', c)
+    # 2. Insérer le shim APRÈS tous les #include
+    lines = c.split('\n')
+    last_inc = -1
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith('#include'):
+            last_inc = i
+    if last_inc >= 0:
+        before = '\n'.join(lines[:last_inc + 1])
+        after = '\n'.join(lines[last_inc + 1:])
+        c = before + '\n' + MOUNT_SHIM + ('\n' + after if after else '')
+    else:
+        c = MOUNT_SHIM + '\n' + c
+    c = '#define KSU_MOUNT_419_SHIM 1\n' + c
+    write(p, c, o)
+
+# ==========================================================
+# selinux_hide.c : stub + init/exit
+# ==========================================================
 p = os.path.join(root, 'feature/selinux_hide.c')
 if os.path.isfile(p):
     c = read(p); o = c
@@ -865,43 +913,6 @@ if os.path.isfile(p):
                 removed = True; continue
             out.append(ln)
         c = stub + '\n'.join(out) + '\n#endif /* KSU_SELINUX_HIDE_4_19_STUB */\n'
-        write(p, c, o)
-    elif 'ksu_selinux_hide_init' not in c:
-        # Patch déjà appliqué mais sans init/exit : les ajouter
-        c = c.replace(
-            'void ksu_selinux_hide_handle_umount(void) { }\n#else',
-            'void ksu_selinux_hide_handle_umount(void) { }\n'
-            'int ksu_selinux_hide_init(void) { return 0; }\n'
-            'void ksu_selinux_hide_exit(void) { }\n#else')
-        write(p, c, o)
-
-# path_mount / path_umount : stub sur 4.19
-for rel in ['feature/kernel_umount.c', 'infra/su_mount_ns.c']:
-    p = os.path.join(root, rel)
-    if not os.path.isfile(p): continue
-    c = read(p); o = c
-    if 'KSU_PATH_MOUNT_COMPAT' not in c:
-        # Envelopper les appels à path_umount/path_mount pour 4.19
-        # On retire les déclarations extern et on remplace l'appel par un stub
-        if 'path_umount' in c:
-            c = c.replace('extern int path_umount(struct path *path, int flags);\n', '')
-            c = c.replace('extern int path_umount(struct path *path, int flags);', '')
-            # Remplacer l'appel réel par un retour neutre sur 4.19
-            import re
-            c = re.sub(r'(path_umount\s*\([^;]*\);)',
-                       r'#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n        \1\n#else\n        (void)path; (void)flags; /* stub 4.19 */\n#endif',
-                       c, count=1)
-        if 'path_mount' in c:
-            c = c.replace('extern int path_mount(const char *dev_name, struct path *path,\n'
-                          '                      const char *type_page, unsigned long flags,\n'
-                          '                      void *data_page);\n', '')
-            c = c.replace('extern int path_mount(const char *dev_name, struct path *path, const char *type_page, unsigned long flags, void *data_page);', '')
-            c = re.sub(r'(path_mount\s*\([^;]*\);)',
-                       r'#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n        \1\n#else\n        (void)dev_name; (void)path; (void)type_page; (void)flags; (void)data_page; /* stub 4.19 */\n#endif',
-                       c, count=1)
-        if 'KSU_PATH_MOUNT_COMPAT' not in c:
-            c = ensure_inc(c, '<linux/version.h>')
-            c = '#define KSU_PATH_MOUNT_COMPAT 1\n' + c
         write(p, c, o)
 
 for dp, dn, fn in os.walk(root):
