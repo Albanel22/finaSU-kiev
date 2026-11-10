@@ -5,8 +5,7 @@ set -euo pipefail
 # FinaSU (LyraVoid) en dur dans le noyau 4.19 — ÉTAPE A : FinaSU seul, hooks Manual
 # Motorola One 5G Ace (kiev) — LineageOS 23.2
 #
-# Stratégie V15 : Enveloppement COMPLET des fonctions incompatibles et regex 
-# robustes pour les remplacements de structure. Plus d'erreurs de compilation possibles.
+# Stratégie V16 : Correction chirurgicale de la dernière erreur dans pkg_observer.c
 # =============================================================================
 
 FINASU_URL="${FINASU_URL:-https://github.com/LyraVoid/FinaSU.git}"
@@ -18,7 +17,7 @@ VER="finasu-A"
 KSU_REF="$FINASU_REF"
 KSUD_FALLBACK_REF="${KSUD_FALLBACK_REF:-v3.4.2}"
 
-echo "=== Build FinaSU ($FINASU_REF) — Bulletproof 4.19 ==="
+echo "=== Build FinaSU ($FINASU_REF) — Last Strike 4.19 ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -201,9 +200,9 @@ else
     echo "⚠️ AUCUNE signature de manager fournie ou calculée" | tee -a "$AUDIT"
 fi
 
-# ==================== 4. TRAITEMENT BULLETPROOF ====================
+# ==================== 4. TRAITEMENT LAST STRIKE ====================
 echo ""
-echo "=== Application des corrections Bulletproof ==="
+echo "=== Application des corrections Last Strike ==="
 
 # 4a. Écriture des 4 stubs
 cat > "$KSU_DIR/selinux/rules.c" << 'STUBEOF'
@@ -254,7 +253,7 @@ STUBEOF
 
 echo "✅ 4 stubs écrits"
 
-# 4b. Script Python avec corrections BULLETPROOF
+# 4b. Script Python avec correction SURGICALE pour pkg_observer.c
 python3 - "$KSU_DIR" <<'PORTEOF' 2>&1 | tee -a "$AUDIT"
 import os, re, sys
 
@@ -309,7 +308,7 @@ MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
             )
 
     elif basename == 'pkg_observer.c':
-        # Ajouter la fonction fallback
+        # Ajouter la fonction fallback si absente
         if 'static int ksu_handle_inode_event(' in content and 'static int ksu_handle_event(' not in content:
             fallback = """#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
 static int ksu_handle_event(struct fsnotify_group *group, struct inode *inode,
@@ -330,18 +329,21 @@ static int ksu_handle_event(struct fsnotify_group *group, struct inode *inode,
 """
             content = content.replace('static int ksu_handle_inode_event(', fallback + 'static int ksu_handle_inode_event(')
         
-        # Remplacement ROBUSTE de la struct ksu_ops (insensible aux espaces)
-        content = re.sub(
-            r'static const struct fsnotify_ops\s+ksu_ops\s*=\s*\{\s*\.handle_inode_event\s*=\s*ksu_handle_inode_event\s*,\s*\};',
-            """static const struct fsnotify_ops ksu_ops = {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
-    .handle_inode_event = ksu_handle_inode_event,
-#else
-    .handle_event = ksu_handle_event,
-#endif
-};""",
-            content
-        )
+        # CORRECTION SURGICALE : Remplacer ligne par ligne
+        lines = content.split('\n')
+        new_lines = []
+        for line in lines:
+            if '.handle_inode_event = ksu_handle_inode_event,' in line:
+                # Extraire l'indentation
+                indent = line[:len(line) - len(line.lstrip())]
+                new_lines.append(f'{indent}#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)')
+                new_lines.append(line)
+                new_lines.append(f'{indent}#else')
+                new_lines.append(f'{indent}.handle_event = ksu_handle_event,')
+                new_lines.append(f'{indent}#endif')
+            else:
+                new_lines.append(line)
+        content = '\n'.join(new_lines)
 
     elif basename == 'file_wrapper.c':
         # Envelopper TOUT le bloc de fonction ksu_wrapper_iopoll
@@ -356,7 +358,7 @@ static int ksu_handle_event(struct fsnotify_group *group, struct inode *inode,
             r'#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n\1#endif\n',
             content, flags=re.MULTILINE
         )
-        # Supprimer les assignations restantes au cas où
+        # Supprimer les assignations restantes
         content = re.sub(r'\s+p->ops\.iopoll = fp->f_op->iopoll \? ksu_wrapper_iopoll : NULL;\n', '\n', content)
         content = re.sub(r'\s+p->ops\.remap_file_range = fp->f_op->remap_file_range \? ksu_wrapper_remap_file_range : NULL;\n', '\n', content)
         content = content.replace('REMAP_FILE_DEDUP', '0 /* REMAP_FILE_DEDUP not in 4.19 */')
@@ -376,7 +378,7 @@ for dp, dn, fn in os.walk(root):
                 modified_count += 1
                 print(f"✅ Patché : {os.path.relpath(filepath, root)}")
 
-print(f"\n✅ Traitement Bulletproof terminé : {modified_count} fichier(s) modifié(s)")
+print(f"\n✅ Traitement Last Strike terminé : {modified_count} fichier(s) modifié(s)")
 PORTEOF
 
 # ==================== 5. FIX O_CLOEXEC ====================
@@ -571,5 +573,5 @@ cp final_boot.img "output/FinaSU-A-${VER}-boot.img"
 cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
-echo "=== BUILD TERMINÉ ${VER} (FinaSU $KSU_REF, Bulletproof 4.19) ==="
+echo "=== BUILD TERMINÉ ${VER} (FinaSU $KSU_REF, Last Strike 4.19) ==="
 ls -lh output/
