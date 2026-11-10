@@ -5,8 +5,8 @@ set -euo pipefail
 # FinaSU (LyraVoid) en dur dans le noyau 4.19 — ÉTAPE A : FinaSU seul, hooks Manual
 # Motorola One 5G Ace (kiev) — LineageOS 23.2
 #
-# Stratégie V12 : UN SEUL script Python traite TOUS les fichiers .c en une passe.
-# Plus de sed sur les fichiers C (trop fragile).
+# Stratégie V13 : Corrections ciblées et robustes basées sur l'analyse exacte 
+# des fichiers sources fournis.
 # =============================================================================
 
 FINASU_URL="${FINASU_URL:-https://github.com/LyraVoid/FinaSU.git}"
@@ -18,7 +18,7 @@ VER="finasu-A"
 KSU_REF="$FINASU_REF"
 KSUD_FALLBACK_REF="${KSUD_FALLBACK_REF:-v3.4.2}"
 
-echo "=== Build FinaSU ($FINASU_REF) — Unified 4.19 ==="
+echo "=== Build FinaSU ($FINASU_REF) — Cible Précise 4.19 ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -201,9 +201,9 @@ else
     echo "⚠️ AUCUNE signature de manager fournie ou calculée" | tee -a "$AUDIT"
 fi
 
-# ==================== 4. TRAITEMENT UNIFIÉ DE TOUS LES FICHIERS ====================
+# ==================== 4. TRAITEMENT CIBLÉ DES FICHIERS ====================
 echo ""
-echo "=== Traitement unifié de tous les fichiers .c ==="
+echo "=== Application des corrections ciblées 4.19 ==="
 
 # 4a. Écriture des 4 stubs (inchangé, fonctionne bien)
 cat > "$KSU_DIR/selinux/rules.c" << 'STUBEOF'
@@ -254,54 +254,60 @@ STUBEOF
 
 echo "✅ 4 stubs écrits"
 
-# 4b. UN SEUL script Python pour TOUS les fichiers .c restants
+# 4b. Script Python avec corrections ROBUSTES basées sur les fichiers fournis
 python3 - "$KSU_DIR" <<'PORTEOF' 2>&1 | tee -a "$AUDIT"
 import os, re, sys
 
 root = sys.argv[1]
-modified_files = []
+modified_count = 0
 
-# Liste des transformations à appliquer à TOUS les fichiers .c
-def transform_file(filepath):
+def process_file(filepath):
     with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
         content = f.read()
     original = content
     basename = os.path.basename(filepath)
-    rel_path = os.path.relpath(filepath, root)
     
-    # 1. Remplacement global TWA_RESUME / TWA_NONE -> 0
-    if 'TWA_RESUME' in content:
-        content = content.replace('TWA_RESUME', '0')
-    if 'TWA_NONE' in content:
-        content = content.replace('TWA_NONE', '0')
-    
-    # 2. Remplacement des headers inexistants en 4.19
+    # Corrections globales
+    content = content.replace('TWA_RESUME', '0')
+    content = content.replace('TWA_NONE', '0')
     content = re.sub(r'#include\s*[<"]uapi/linux/mount\.h[>"]', '#include <linux/mount.h>', content)
     content = re.sub(r'#include\s*[<"]linux/minmax\.h[>"]', '#include <linux/kernel.h>', content)
     
-    # 3. Ajout des includes manquants pour task_struct, etc.
-    needs_sched_task = any(x in content for x in ['put_task_struct', 'tasklist_lock', 'init_task', 'task_pgrp', 'task_session'])
-    if needs_sched_task:
-        if '#include <linux/sched/task.h>' not in content:
-            content = '#include <linux/sched/task.h>\n' + content
-        if '#include <linux/sched/signal.h>' not in content:
-            content = '#include <linux/sched/signal.h>\n' + content
-    
-    # 4. Traitement SPÉCIFIQUE par fichier
-    
-    # 4a. core/init.c : MODULE_IMPORT_NS
-    if basename == 'init.c' and 'MODULE_IMPORT_NS(' in content:
-        # Enveloppe le BLOC COMPLET (avec #if/#else/#endif) dans un #if >= 5.4.0
-        pattern = r'#if LINUX_VERSION_CODE >= KERNEL_VERSION\(6, 13, 0\)\s*\n\s*MODULE_IMPORT_NS\("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver"\);\s*\n#else\s*\n\s*MODULE_IMPORT_NS\(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver\);\s*\n#endif'
-        replacement = '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)\n#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)\nMODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");\n#else\nMODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);\n#endif\n#endif'
-        new_content, n = re.subn(pattern, replacement, content)
-        if n > 0:
-            content = new_content
-            print(f"  ✅ {rel_path}: MODULE_IMPORT_NS conditionné")
-    
-    # 4b. manager/pkg_observer.c : fsnotify_ops
-    if basename == 'pkg_observer.c' and 'ksu_handle_inode_event' in content:
-        # Ajouter la fonction fallback si absente
+    if basename == 'file_wrapper.c':
+        # 1. Englober TOUT le bloc de fonction iopoll (6.1+ et else)
+        content = re.sub(
+            r'(#if LINUX_VERSION_CODE >= KERNEL_VERSION\(6, 1, 0\)[\s\S]*?^static int ksu_wrapper_iopoll\([^)]*\)[\s\S]*?^#endif\n)',
+            r'#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n\1#endif\n',
+            content, flags=re.MULTILINE
+        )
+        # 2. Englober l'assignment iopoll
+        content = re.sub(
+            r'(\s+p->ops\.iopoll = fp->f_op->iopoll \? ksu_wrapper_iopoll : NULL;)',
+            r'\n#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n\1\n#endif',
+            content
+        )
+        # 3. Englober TOUT le bloc de fonction remap_file_range
+        content = re.sub(
+            r'(// no REMAP_FILE_DEDUP: use file_in[\s\S]*?^static loff_t ksu_wrapper_remap_file_range\([^)]*\)[\s\S]*?^\}\n)',
+            r'#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n\1#endif\n',
+            content, flags=re.MULTILINE
+        )
+        # 4. Englober l'assignment remap_file_range
+        content = re.sub(
+            r'(\s+p->ops\.remap_file_range = fp->f_op->remap_file_range \? ksu_wrapper_remap_file_range : NULL;)',
+            r'\n#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n\1\n#endif',
+            content
+        )
+
+    elif basename == 'app_profile.c':
+        # Remplacement direct et sûr de filter_count
+        content = content.replace(
+            'atomic_set(&current->seccomp.filter_count, 0);',
+            '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)\n    atomic_set(&current->seccomp.filter_count, 0);\n#endif'
+        )
+
+    elif basename == 'pkg_observer.c':
+        # 1. Ajouter la fonction fallback si absente
         if 'static int ksu_handle_event(' not in content:
             fallback = """#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
 static int ksu_handle_event(struct fsnotify_group *group, struct inode *inode,
@@ -322,62 +328,35 @@ static int ksu_handle_event(struct fsnotify_group *group, struct inode *inode,
 """
             content = content.replace('static int ksu_handle_inode_event(', fallback + 'static int ksu_handle_inode_event(')
         
-        # Réécrire COMPLÈTEMENT la struct ksu_ops
-        pattern = r'static const struct fsnotify_ops ksu_ops\s*=\s*\{[^}]*\};'
-        replacement = """static const struct fsnotify_ops ksu_ops = {
+        # 2. Remplacer la struct ksu_ops de manière flexible (insensible aux espaces)
+        content = re.sub(
+            r'static const struct fsnotify_ops\s+ksu_ops\s*=\s*\{[^}]*\};',
+            """static const struct fsnotify_ops ksu_ops = {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
     .handle_inode_event = ksu_handle_inode_event,
 #else
     .handle_event = ksu_handle_event,
 #endif
-};"""
-        new_content, n = re.subn(pattern, replacement, content, flags=re.DOTALL)
-        if n > 0:
-            content = new_content
-            print(f"  ✅ {rel_path}: struct ksu_ops réécrite")
-    
-    # 4c. infra/file_wrapper.c : SUPPRIMER les lignes iopoll et remap_file_range
-    if basename == 'file_wrapper.c':
-        # Supprimer complètement les lignes qui assignent ces champs
-        lines = content.split('\n')
-        new_lines = []
-        removed_count = 0
-        for line in lines:
-            if re.search(r'p->ops\.iopoll\s*=', line) or re.search(r'p->ops\.remap_file_range\s*=', line):
-                removed_count += 1
-                continue  # On saute cette ligne
-            new_lines.append(line)
-        if removed_count > 0:
-            content = '\n'.join(new_lines)
-            print(f"  ✅ {rel_path}: {removed_count} lignes iopoll/remap_file_range supprimées")
-        content = content.replace('REMAP_FILE_DEDUP', '0 /* REMAP_FILE_DEDUP not in 4.19 */')
-    
-    # 4d. policy/app_profile.c : filter_count
-    if basename == 'app_profile.c' and 'current->seccomp.filter_count' in content:
-        pattern = r'(\s*atomic_set\(&current->seccomp\.filter_count, 0\);)'
-        replacement = r'#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)\n\1\n#endif'
-        new_content, n = re.subn(pattern, replacement, content)
-        if n > 0:
-            content = new_content
-            print(f"  ✅ {rel_path}: filter_count conditionné")
-    
+};""",
+            content, flags=re.DOTALL
+        )
+
     if content != original:
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(content)
-        modified_files.append(rel_path)
         return True
     return False
 
-# Parcourir TOUS les fichiers .c du dossier KSU_DIR
-total_modified = 0
+# Appliquer à tous les fichiers .c
 for dp, dn, fn in os.walk(root):
     for f in fn:
         if f.endswith('.c'):
             filepath = os.path.join(dp, f)
-            if transform_file(filepath):
-                total_modified += 1
+            if process_file(filepath):
+                modified_count += 1
+                print(f"✅ Patché : {os.path.relpath(filepath, root)}")
 
-print(f"\n✅ Traitement unifié terminé : {total_modified} fichier(s) modifié(s)")
+print(f"\n✅ Traitement ciblé terminé : {modified_count} fichier(s) modifié(s)")
 PORTEOF
 
 # ==================== 5. FIX O_CLOEXEC ====================
@@ -572,5 +551,5 @@ cp final_boot.img "output/FinaSU-A-${VER}-boot.img"
 cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
-echo "=== BUILD TERMINÉ ${VER} (FinaSU $KSU_REF, Unified 4.19) ==="
+echo "=== BUILD TERMINÉ ${VER} (FinaSU $KSU_REF, Cible Précise 4.19) ==="
 ls -lh output/
