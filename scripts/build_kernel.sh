@@ -5,7 +5,7 @@ set -euo pipefail
 # FinaSU (LyraVoid) en dur dans le noyau 4.19 — ÉTAPE A : FinaSU seul, hooks Manual
 # Motorola One 5G Ace (kiev) — LineageOS 23.2
 #
-# Stratégie V16 : Correction chirurgicale de la dernière erreur dans pkg_observer.c
+# Stratégie V17 : RÉÉCRITURE COMPLÈTE de pkg_observer.c pour éliminer la dernière erreur
 # =============================================================================
 
 FINASU_URL="${FINASU_URL:-https://github.com/LyraVoid/FinaSU.git}"
@@ -17,7 +17,7 @@ VER="finasu-A"
 KSU_REF="$FINASU_REF"
 KSUD_FALLBACK_REF="${KSUD_FALLBACK_REF:-v3.4.2}"
 
-echo "=== Build FinaSU ($FINASU_REF) — Last Strike 4.19 ==="
+echo "=== Build FinaSU ($FINASU_REF) — Rewrite 4.19 ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -200,9 +200,9 @@ else
     echo "⚠️ AUCUNE signature de manager fournie ou calculée" | tee -a "$AUDIT"
 fi
 
-# ==================== 4. TRAITEMENT LAST STRIKE ====================
+# ==================== 4. TRAITEMENT REWRITE ====================
 echo ""
-echo "=== Application des corrections Last Strike ==="
+echo "=== Application des corrections Rewrite ==="
 
 # 4a. Écriture des 4 stubs
 cat > "$KSU_DIR/selinux/rules.c" << 'STUBEOF'
@@ -253,7 +253,194 @@ STUBEOF
 
 echo "✅ 4 stubs écrits"
 
-# 4b. Script Python avec correction SURGICALE pour pkg_observer.c
+# 4b. RÉÉCRITURE COMPLÈTE de pkg_observer.c pour 4.19
+echo "✅ Réécriture complète de pkg_observer.c pour 4.19"
+cat > "$KSU_DIR/manager/pkg_observer.c" << 'OBSERVEREOF'
+// SPDX-License-Identifier: GPL-2.0
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/namei.h>
+#include <linux/fsnotify_backend.h>
+#include <linux/sched.h>
+#include <linux/slab.h>
+#include <linux/rculist.h>
+#include <linux/task_work.h>
+#include <linux/version.h>
+#ifdef CONFIG_KSU_SUSFS
+#include <linux/susfs.h>
+#include <linux/susfs_def.h>
+#endif
+#include "klog.h" // IWYU pragma: keep
+#include "manager/throne_tracker.h"
+
+#define MASK_SYSTEM (FS_CREATE | FS_MOVE | FS_EVENT_ON_CHILD)
+
+struct watch_dir {
+    const char *path;
+    u32 mask;
+    struct path kpath;
+    struct inode *inode;
+    struct fsnotify_mark *mark;
+};
+
+static struct fsnotify_group *g;
+
+static void ksu_track_throne_tw_func(struct callback_head *cb)
+{
+    kfree(cb);
+    if (current->flags & PF_EXITING)
+        return;
+    track_throne(false);
+#if defined(CONFIG_KSU_SUSFS) && defined(CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER) &&                                      \
+    defined(CMD_SUSFS_SET_PRIORITY_UID_FILTER)
+    susfs_parse_priority_app_strings();
+#endif
+}
+
+static void ksu_defer_track_throne(void)
+{
+    struct callback_head *cb;
+
+    if (!(current->flags & PF_KTHREAD)) {
+        cb = kzalloc(sizeof(*cb), GFP_KERNEL);
+        if (cb) {
+            cb->func = ksu_track_throne_tw_func;
+            if (!task_work_add(current, cb, 0))
+                return;
+            kfree(cb);
+        }
+    }
+    pr_warn("defer track_throne failed, run it inline\n");
+    track_throne(false);
+}
+
+/* Fallback pour noyaux < 5.9 (4.19 inclus) */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
+static int ksu_handle_event(struct fsnotify_group *group, struct inode *inode,
+                            struct fsnotify_mark *inode_mark, struct fsnotify_mark *vfsmount_mark,
+                            u32 mask, void *data, int data_type, const unsigned char *file_name, u32 cookie)
+{
+    if (!file_name)
+        return 0;
+    if (mask & FS_ISDIR)
+        return 0;
+    if (strlen((const char *)file_name) == 13 && !memcmp(file_name, "packages.list", 13)) {
+        pr_info("packages.list detected: %d\n", mask);
+        ksu_defer_track_throne();
+    }
+    return 0;
+}
+#else
+/* Signature moderne pour noyaux >= 5.9 */
+static int ksu_handle_inode_event(struct fsnotify_mark *mark, u32 mask, struct inode *inode, struct inode *dir,
+                                  const struct qstr *file_name, u32 cookie)
+{
+    if (!file_name)
+        return 0;
+    if (mask & FS_ISDIR)
+        return 0;
+    if (file_name->len == 13 && !memcmp(file_name->name, "packages.list", 13)) {
+        pr_info("packages.list detected: %d\n", mask);
+        ksu_defer_track_throne();
+    }
+    return 0;
+}
+#endif
+
+static const struct fsnotify_ops ksu_ops = {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+    .handle_inode_event = ksu_handle_inode_event,
+#else
+    .handle_event = ksu_handle_event,
+#endif
+};
+
+static int add_mark_on_inode(struct inode *inode, u32 mask, struct fsnotify_mark **out)
+{
+    struct fsnotify_mark *m;
+
+    m = kzalloc(sizeof(*m), GFP_KERNEL);
+    if (!m)
+        return -ENOMEM;
+
+    fsnotify_init_mark(m, g);
+    m->mask = mask;
+
+    if (fsnotify_add_inode_mark(m, inode, 0)) {
+        fsnotify_put_mark(m);
+        return -EINVAL;
+    }
+    *out = m;
+    return 0;
+}
+
+static int watch_one_dir(struct watch_dir *wd)
+{
+    int ret = kern_path(wd->path, LOOKUP_FOLLOW, &wd->kpath);
+    if (ret) {
+        pr_info("path not ready: %s (%d)\n", wd->path, ret);
+        return ret;
+    }
+    wd->inode = d_inode(wd->kpath.dentry);
+    ihold(wd->inode);
+
+    ret = add_mark_on_inode(wd->inode, wd->mask, &wd->mark);
+    if (ret) {
+        pr_err("Add mark failed for %s (%d)\n", wd->path, ret);
+        path_put(&wd->kpath);
+        iput(wd->inode);
+        wd->inode = NULL;
+        return ret;
+    }
+    pr_info("watching %s\n", wd->path);
+    return 0;
+}
+
+static void unwatch_one_dir(struct watch_dir *wd)
+{
+    if (wd->mark) {
+        fsnotify_destroy_mark(wd->mark, g);
+        fsnotify_put_mark(wd->mark);
+        wd->mark = NULL;
+    }
+    if (wd->inode) {
+        iput(wd->inode);
+        wd->inode = NULL;
+    }
+    if (wd->kpath.dentry) {
+        path_put(&wd->kpath);
+        memset(&wd->kpath, 0, sizeof(wd->kpath));
+    }
+}
+
+static struct watch_dir g_watch = { .path = "/data/system", .mask = MASK_SYSTEM };
+
+int ksu_observer_init(void)
+{
+    int ret = 0;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+    g = fsnotify_alloc_group(&ksu_ops, 0);
+#else
+    g = fsnotify_alloc_group(&ksu_ops);
+#endif
+    if (IS_ERR(g))
+        return PTR_ERR(g);
+
+    ret = watch_one_dir(&g_watch);
+    pr_info("observer init done\n");
+    return 0;
+}
+
+void __exit ksu_observer_exit(void)
+{
+    unwatch_one_dir(&g_watch);
+    fsnotify_put_group(g);
+    pr_info("observer exit done\n");
+}
+OBSERVEREOF
+
+# 4c. Corrections Python pour les autres fichiers
 python3 - "$KSU_DIR" <<'PORTEOF' 2>&1 | tee -a "$AUDIT"
 import os, re, sys
 
@@ -307,58 +494,17 @@ MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
                 '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)\n    atomic_set(&current->seccomp.filter_count, 0);\n#endif'
             )
 
-    elif basename == 'pkg_observer.c':
-        # Ajouter la fonction fallback si absente
-        if 'static int ksu_handle_inode_event(' in content and 'static int ksu_handle_event(' not in content:
-            fallback = """#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
-static int ksu_handle_event(struct fsnotify_group *group, struct inode *inode,
-                            struct fsnotify_mark *inode_mark, struct fsnotify_mark *vfsmount_mark,
-                            u32 mask, void *data, int data_type, const unsigned char *file_name, u32 cookie)
-{
-    if (!file_name) return 0;
-    if (mask & FS_ISDIR) return 0;
-    size_t len = strlen((const char *)file_name);
-    if (len == 13 && !memcmp(file_name, "packages.list", 13)) {
-        pr_info("packages.list detected: %d\\n", mask);
-        ksu_defer_track_throne();
-    }
-    return 0;
-}
-#endif
-
-"""
-            content = content.replace('static int ksu_handle_inode_event(', fallback + 'static int ksu_handle_inode_event(')
-        
-        # CORRECTION SURGICALE : Remplacer ligne par ligne
-        lines = content.split('\n')
-        new_lines = []
-        for line in lines:
-            if '.handle_inode_event = ksu_handle_inode_event,' in line:
-                # Extraire l'indentation
-                indent = line[:len(line) - len(line.lstrip())]
-                new_lines.append(f'{indent}#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)')
-                new_lines.append(line)
-                new_lines.append(f'{indent}#else')
-                new_lines.append(f'{indent}.handle_event = ksu_handle_event,')
-                new_lines.append(f'{indent}#endif')
-            else:
-                new_lines.append(line)
-        content = '\n'.join(new_lines)
-
     elif basename == 'file_wrapper.c':
-        # Envelopper TOUT le bloc de fonction ksu_wrapper_iopoll
         content = re.sub(
             r'(#if LINUX_VERSION_CODE >= KERNEL_VERSION\(6, 1, 0\)\s*\nstatic int ksu_wrapper_iopoll[\s\S]*?^#endif\n)',
             r'#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n\1#endif\n',
             content, flags=re.MULTILINE
         )
-        # Envelopper TOUTE la fonction ksu_wrapper_remap_file_range
         content = re.sub(
             r'(// no REMAP_FILE_DEDUP: use file_in[\s\S]*?^static loff_t ksu_wrapper_remap_file_range\([^)]*\)[\s\S]*?^\}\n)',
             r'#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n\1#endif\n',
             content, flags=re.MULTILINE
         )
-        # Supprimer les assignations restantes
         content = re.sub(r'\s+p->ops\.iopoll = fp->f_op->iopoll \? ksu_wrapper_iopoll : NULL;\n', '\n', content)
         content = re.sub(r'\s+p->ops\.remap_file_range = fp->f_op->remap_file_range \? ksu_wrapper_remap_file_range : NULL;\n', '\n', content)
         content = content.replace('REMAP_FILE_DEDUP', '0 /* REMAP_FILE_DEDUP not in 4.19 */')
@@ -369,7 +515,6 @@ static int ksu_handle_event(struct fsnotify_group *group, struct inode *inode,
         return True
     return False
 
-# Appliquer à tous les fichiers .c
 for dp, dn, fn in os.walk(root):
     for f in fn:
         if f.endswith('.c'):
@@ -378,7 +523,7 @@ for dp, dn, fn in os.walk(root):
                 modified_count += 1
                 print(f"✅ Patché : {os.path.relpath(filepath, root)}")
 
-print(f"\n✅ Traitement Last Strike terminé : {modified_count} fichier(s) modifié(s)")
+print(f"\n✅ Traitement Rewrite terminé : {modified_count} fichier(s) modifié(s)")
 PORTEOF
 
 # ==================== 5. FIX O_CLOEXEC ====================
@@ -573,5 +718,5 @@ cp final_boot.img "output/FinaSU-A-${VER}-boot.img"
 cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
-echo "=== BUILD TERMINÉ ${VER} (FinaSU $KSU_REF, Last Strike 4.19) ==="
+echo "=== BUILD TERMINÉ ${VER} (FinaSU $KSU_REF, Rewrite 4.19) ==="
 ls -lh output/
