@@ -25,7 +25,7 @@ BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
 DTBO_GDRIVE_ID="11451aa0CCzyVtNTYOK2n6oH6E0PT-2NX"
 
 mkdir -p "$GITHUB_WORKSPACE/output"
-AUDIT="\( GITHUB_WORKSPACE/output/audit- \){VER}.txt"
+AUDIT="$GITHUB_WORKSPACE/output/audit-${VER}.txt"
 : > "$AUDIT"
 
 summarize() {
@@ -104,7 +104,7 @@ if ! git checkout -q "$KERNEL_PIN" 2>/dev/null; then
     git fetch -q origin '+refs/heads/*:refs/remotes/origin/*'
     git checkout -q "$KERNEL_PIN" || { echo "❌ commit $KERNEL_PIN introuvable"; exit 1; }
 fi
-echo "Source figée : \( KERNEL_PIN ( \)(git rev-parse HEAD))" | tee -a "$AUDIT"
+echo "Source figée : $KERNEL_PIN ($(git rev-parse HEAD))" | tee -a "$AUDIT"
 
 # ==================== 2. INTÉGRATION FinaSU ====================
 echo "=== Intégration FinaSU ($FINASU_REF) ==="
@@ -163,7 +163,7 @@ print("0x%x" % len(cert))
 print(hashlib.sha256(cert).hexdigest())
 PYEOF
 )
-    [ -n "\( SIG_OUT" ] && FINASU_EXPECTED_SIZE= \)(echo "\( SIG_OUT" | sed -n '1p') && FINASU_EXPECTED_HASH= \)(echo "$SIG_OUT" | sed -n '2p')
+    [ -n "$SIG_OUT" ] && FINASU_EXPECTED_SIZE=$(echo "$SIG_OUT" | sed -n '1p') && FINASU_EXPECTED_HASH=$(echo "$SIG_OUT" | sed -n '2p')
 fi
 SIG_ARGS=""
 if [ -n "$FINASU_EXPECTED_SIZE" ] && [ -n "$FINASU_EXPECTED_HASH" ]; then
@@ -762,7 +762,7 @@ export CROSS_COMPILE=aarch64-linux-gnu-
 export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 CLANG_MAJOR=$(clang --version | sed -n 's/.*clang version \([0-9]*\).*/\1/p' | head -1)
 CC_ARGS=""
-if [ "\( {FORCE_CLANG_WRAP:-1}" = "1" ] || [ " \){CLANG_MAJOR:-99}" -lt 16 ]; then
+if [ "${FORCE_CLANG_WRAP:-1}" = "1" ] || [ "${CLANG_MAJOR:-99}" -lt 16 ]; then
     cat > "$GITHUB_WORKSPACE/clang-wrap" <<'W'
 #!/bin/bash
 args=()
@@ -819,8 +819,8 @@ if [ "$MAKE_RC" -ne 0 ] || [ ! -f out/arch/arm64/boot/Image ]; then
 fi
 echo "✅ Compilation réussie"
 sha256sum out/arch/arm64/boot/Image | cut -d' ' -f1 > /tmp/kernel_compiled_hash.txt
-cp out/arch/arm64/boot/Image "\( GITHUB_WORKSPACE/output/Image- \){VER}"
-cp out/System.map "\( GITHUB_WORKSPACE/output/System.map- \){VER}"
+cp out/arch/arm64/boot/Image "$GITHUB_WORKSPACE/output/Image-${VER}"
+cp out/System.map "$GITHUB_WORKSPACE/output/System.map-${VER}"
 
 # ==================== 8. KSUD ====================
 echo "=== ksud ==="
@@ -883,7 +883,7 @@ cd ..
 mkdir -p verify; cd verify
 cp ../final_boot.img verify_boot.img
 ../repack/magiskboot unpack verify_boot.img 2>/dev/null || true
-[ -f kernel ] && [ "\( (sha256sum kernel | cut -d' ' -f1)" = " \)(cat /tmp/kernel_compiled_hash.txt)" ] && echo "✅ Noyau IDENTIQUE"
+[ -f kernel ] && [ "$(sha256sum kernel | cut -d' ' -f1)" = "$(cat /tmp/kernel_compiled_hash.txt)" ] && echo "✅ Noyau IDENTIQUE"
 ../repack/magiskboot cpio ramdisk.cpio "exists data/adb/ksud/ksud" 2>/dev/null && echo "✅ ksud OK" || echo "❌ ksud absent"
 cd ..
 cp final_boot.img "output/FinaSU-A-${VER}-boot.img"
