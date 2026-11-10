@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # FinaSU (LyraVoid) — noyau 4.19 — ÉTAPE A (Tracepoint, sans SuSFS)
-# Complet : manager GDrive + $ intacts + file_wrapper/pkg_observer/allowlist
+# Complet corrigé : manager GDrive + file_wrapper + pkg_observer dual-path propre
 # =============================================================================
 
 export GITHUB_WORKSPACE="${GITHUB_WORKSPACE:-$PWD}"
@@ -173,7 +173,7 @@ else
     echo "⚠️ AUCUNE signature de manager fournie" | tee -a "$AUDIT"
 fi
 
-# ==================== 3g/3h SELinux exports + O_CLOEXEC ====================
+# ==================== 3g/3h exports + O_CLOEXEC ====================
 [ -f "security/selinux/selinuxfs.c" ] && {
     sed -i 's/^static ssize_t (\*write_op\[\])/ssize_t (*write_op[])/' security/selinux/selinuxfs.c
     sed -i 's/^static const struct file_operations sel_handle_status_ops/const struct file_operations sel_handle_status_ops/' security/selinux/selinuxfs.c
@@ -196,7 +196,6 @@ done || true
 # ==================== 4b. PORTAGE ====================
 echo "=== Portage 4.19 ==="
 
-# rules.c dual-path (chemin <5.10 utilisé, >=5.10 upstream-like)
 cat > "$KSU_DIR/selinux/rules.c" << 'RULESEOF'
 #include "linux/rcupdate.h"
 #include "security.h"
@@ -398,14 +397,12 @@ out_unlock:
 }
 int handle_sepolicy(void __user *user_data, u64 data_len)
 {
-	pr_info("handle_sepolicy modern path: use upstream batch if needed\n");
 	return -EOPNOTSUPP;
 }
 #endif
 RULESEOF
 echo "  ✅ rules.c dual-path"
 
-# Portage Python (file_wrapper / pkg_observer / allowlist / reste)
 python3 - "$KSU_DIR" <<'PORTEOF' 2>&1 | tee -a "$AUDIT"
 import os, re, sys
 
@@ -434,7 +431,7 @@ def ensure_inc(c, inc):
 def ensure_ver(c):
     return c if 'linux/version.h' in c else ensure_inc(c, '<linux/version.h>')
 
-# ----- selinux_hide stub <5.10 -----
+# selinux_hide
 p = os.path.join(root, "feature/selinux_hide.c")
 if os.path.isfile(p):
     c, o = read(p), None
@@ -452,7 +449,7 @@ if os.path.isfile(p):
         c = h + c + "\n#endif\n"
         write(p, c, o)
 
-# ----- sepolicy filename_trans only -----
+# sepolicy add_filename_trans
 p = os.path.join(root, "selinux/sepolicy.c")
 if os.path.isfile(p):
     c, o = read(p), None
@@ -469,91 +466,77 @@ if os.path.isfile(p):
                 c, count=1)
         write(p, c, o)
 
-# ----- file_wrapper : iopoll (>=5.1) + remap (>=4.20) -----
+# file_wrapper iopoll + remap
 p = os.path.join(root, "infra/file_wrapper.c")
 if os.path.isfile(p):
     c, o = read(p), None
     o = c
     c = ensure_ver(c)
-
-    # Envelopper les définitions ksu_wrapper_iopoll (bloc 6.1 / else) sous >= 5.1
     if "KSU_IOPOLL_WRAPPED_519" not in c and "ksu_wrapper_iopoll" in c:
-        # Si déjà #if 6.1 autour, ajouter garde externe 5.1
-        c2 = c
-        # Assignment p->ops.iopoll
         c2 = re.sub(
             r'^(\s*p->ops\.iopoll\s*=)',
             r'#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n\1',
-            c2, count=1, flags=re.M)
-        if c2 != c and '#endif' not in c2[c2.find('p->ops.iopoll'):c2.find('p->ops.iopoll')+120]:
-            c2 = re.sub(
-                r'(p->ops\.iopoll\s*=[^;]+;)',
-                r'\1\n#endif /* iopoll >= 5.1 */',
-                c2, count=1)
-        c = c2
-
-        # Wrap function block starting at #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0) for iopoll
-        # Pattern: from "#if ... 6, 1, 0" before ksu_wrapper_iopoll through the #endif of the else branch
+            c, count=1, flags=re.M)
+        c2 = re.sub(
+            r'(p->ops\.iopoll\s*=[^;]+;)',
+            r'\1\n#endif',
+            c2, count=1)
         m = re.search(
             r'(#if\s+LINUX_VERSION_CODE\s*>=\s*KERNEL_VERSION\(\s*6\s*,\s*1\s*,\s*0\s*\)\s*\n'
             r'static int ksu_wrapper_iopoll[\s\S]*?'
             r'#else\s*\nstatic int ksu_wrapper_iopoll[\s\S]*?\n\}\s*\n#endif)',
-            c)
+            c2)
         if m:
             block = m.group(1)
-            if 'KERNEL_VERSION(5, 1, 0)' not in block:
-                c = c[:m.start()] + (
-                    '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n'
-                    '#define KSU_IOPOLL_WRAPPED_519 1\n'
-                    + block +
-                    '\n#endif /* >= 5.1 iopoll */\n'
-                ) + c[m.end():]
-
-    # remap_file_range function + assignment
+            c2 = c2[:m.start()] + (
+                '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n'
+                '#define KSU_IOPOLL_WRAPPED_519 1\n'
+                + block +
+                '\n#endif\n'
+            ) + c2[m.end():]
+        c = c2
     if "KSU_REMAP_WRAPPED_420" not in c and "ksu_wrapper_remap_file_range" in c:
         if 'REMAP_FILE_DEDUP' in c and '#ifndef REMAP_FILE_DEDUP' not in c:
             last = 0
             for m in re.finditer(r'#include\s+[<"].*?[>"]\s*\n', c):
                 last = m.end()
-            c = c[:last] + (
-                '\n#ifndef REMAP_FILE_DEDUP\n#define REMAP_FILE_DEDUP 0\n#endif\n'
-            ) + c[last:]
-
-        m = re.search(
-            r'(static loff_t ksu_wrapper_remap_file_range\s*\([\s\S]*?\n\}\s*\n)',
-            c)
+            c = c[:last] + '\n#ifndef REMAP_FILE_DEDUP\n#define REMAP_FILE_DEDUP 0\n#endif\n' + c[last:]
+        m = re.search(r'(static loff_t ksu_wrapper_remap_file_range\s*\([\s\S]*?\n\}\s*\n)', c)
         if m:
             block = m.group(1)
             c = c[:m.start()] + (
                 '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n'
-                '#define KSU_REMAP_WRAPPED_420 1\n'
-                + block +
-                '#endif /* >= 4.20 remap */\n'
+                '#define KSU_REMAP_WRAPPED_420 1\n' + block + '#endif\n'
             ) + c[m.end():]
-
         c = re.sub(
             r'^(\s*p->ops\.remap_file_range\s*=)',
             r'#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n\1',
             c, count=1, flags=re.M)
         c = re.sub(
             r'(p->ops\.remap_file_range\s*=[^;]+;)',
-            r'\1\n#endif /* remap >= 4.20 */',
+            r'\1\n#endif',
             c, count=1)
-
     write(p, c, o)
 
-# ----- pkg_observer : handle_event 4.19 -----
+# pkg_observer dual-path PROPRE
 p = os.path.join(root, "manager/pkg_observer.c")
 if os.path.isfile(p):
     c, o = read(p), None
     o = c
     c = ensure_ver(c)
-    if "KSU_FSNOTIFY_DUAL_PATH" not in c and "handle_inode_event" in c:
-        # Remplace handler + ksu_ops par dual-path
-        new_block = r'''
+    if "KSU_FSNOTIFY_DUAL_PATH" not in c:
+        c = re.sub(
+            r'static int ksu_handle_inode_event\s*\([^;{]*\)\s*\{[\s\S]*?\n\}'
+            r'\s*static const struct fsnotify_ops ksu_ops\s*=\s*\{[\s\S]*?\};',
+            '',
+            c,
+            count=1,
+        )
+        insert = '''
 #define KSU_FSNOTIFY_DUAL_PATH 1
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0)
-static int ksu_handle_inode_event(struct fsnotify_mark *mark, u32 mask, struct inode *inode, struct inode *dir,
+static int ksu_handle_inode_event(struct fsnotify_mark *mark, u32 mask,
+				  struct inode *inode, struct inode *dir,
 				  const struct qstr *file_name, u32 cookie)
 {
 	if (!file_name)
@@ -561,7 +544,7 @@ static int ksu_handle_inode_event(struct fsnotify_mark *mark, u32 mask, struct i
 	if (mask & FS_ISDIR)
 		return 0;
 	if (file_name->len == 13 && !memcmp(file_name->name, "packages.list", 13)) {
-		pr_info("packages.list detected: %d\n", mask);
+		pr_info("packages.list detected: %d\\n", mask);
 		ksu_defer_track_throne();
 	}
 	return 0;
@@ -571,16 +554,17 @@ static const struct fsnotify_ops ksu_ops = {
 	.handle_inode_event = ksu_handle_inode_event,
 };
 #else
-static int ksu_handle_event(struct fsnotify_group *group, u32 mask, const void *data, int data_type,
-			    struct inode *inode, const struct qstr *file_name, u32 cookie,
-			    struct fsnotify_iter_info *iter_info)
+static int ksu_handle_event(struct fsnotify_group *group, u32 mask,
+			    const void *data, int data_type,
+			    struct inode *inode, const struct qstr *file_name,
+			    u32 cookie, struct fsnotify_iter_info *iter_info)
 {
 	if (!file_name)
 		return 0;
 	if (mask & FS_ISDIR)
 		return 0;
 	if (file_name->len == 13 && !memcmp(file_name->name, "packages.list", 13)) {
-		pr_info("packages.list detected: %d\n", mask);
+		pr_info("packages.list detected: %d\\n", mask);
 		ksu_defer_track_throne();
 	}
 	return 0;
@@ -590,20 +574,20 @@ static const struct fsnotify_ops ksu_ops = {
 	.handle_event = ksu_handle_event,
 };
 #endif
+
 '''
-        c = re.sub(
-            r'static int ksu_handle_inode_event\s*\([\s\S]*?\n\}\s*\n\s*'
-            r'static const struct fsnotify_ops ksu_ops\s*=\s*\{[\s\S]*?\};\s*',
-            new_block + '\n',
-            c, count=1)
-        if 'TWA_RESUME' in c and 'TWA_RESUME 0' not in c:
+        if "static int add_mark_on_inode" in c:
+            c = c.replace("static int add_mark_on_inode", insert + "static int add_mark_on_inode", 1)
+        elif "int ksu_observer_init" in c:
+            c = c.replace("int ksu_observer_init", insert + "int ksu_observer_init", 1)
+        if "TWA_RESUME" in c and "TWA_RESUME 0" not in c:
             last = 0
             for m in re.finditer(r'#include\s+[<"].*?[>"]\s*\n', c):
                 last = m.end()
-            c = c[:last] + '\n#ifndef TWA_RESUME\n#define TWA_RESUME 0\n#endif\n' + c[last:]
+            c = c[:last] + "\n#ifndef TWA_RESUME\n#define TWA_RESUME 0\n#endif\n" + c[last:]
         write(p, c, o)
 
-# ----- TWA_RESUME autres fichiers -----
+# TWA_RESUME autres
 TWA = '\n#ifndef TWA_RESUME\n#define TWA_RESUME 0\n#endif\n'
 for rel in ['manager/dynamic_manager.c', 'policy/allowlist.c', 'supercall/supercall.c']:
     p = os.path.join(root, rel)
@@ -619,7 +603,7 @@ for rel in ['manager/dynamic_manager.c', 'policy/allowlist.c', 'supercall/superc
         c = c[:last] + TWA + c[last:]
         write(p, c, o)
 
-# ----- SECCOMP -----
+# SECCOMP
 p = os.path.join(root, 'infra/seccomp_cache.c')
 if os.path.isfile(p):
     c, o = read(p), None
@@ -636,7 +620,7 @@ if os.path.isfile(p):
         ) + c[last:]
         write(p, c, o)
 
-# ----- filter_count -----
+# filter_count
 p = os.path.join(root, 'policy/app_profile.c')
 if os.path.isfile(p):
     c, o = read(p), None
@@ -654,7 +638,7 @@ if os.path.isfile(p):
                                    '#include <linux/version.h>\n#define KSU_FILTER_COUNT_COMPAT 1', 1)
         write(p, c, o)
 
-# ----- put_task_struct -----
+# put_task_struct
 for rel in ['manager/dynamic_manager.c', 'policy/allowlist.c']:
     p = os.path.join(root, rel)
     if not os.path.isfile(p):
@@ -666,7 +650,7 @@ for rel in ['manager/dynamic_manager.c', 'policy/allowlist.c']:
         c = ensure_inc(c, '<linux/sched/task.h>')
         write(p, c, o)
 
-# ----- tasklist_lock -----
+# tasklist_lock
 p = os.path.join(root, 'supercall/dispatch.c')
 if os.path.isfile(p):
     c, o = read(p), None
@@ -685,7 +669,7 @@ if os.path.isfile(p):
         ) + c[last:]
         write(p, c, o)
 
-# ----- headers -----
+# headers
 p = os.path.join(root, 'sulog/event.c')
 if os.path.isfile(p):
     c, o = read(p), None
