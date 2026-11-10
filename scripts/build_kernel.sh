@@ -1,10 +1,6 @@
 #!/bin/bash
 set -euo pipefail
 
-# =============================================================================
-# FinaSU (LyraVoid) sur noyau 4.19 — kiev — 0 erreur attendue
-# =============================================================================
-
 FINASU_URL="${FINASU_URL:-https://github.com/LyraVoid/FinaSU.git}"
 FINASU_REF="${FINASU_REF:-v1.5.0}"
 KERNEL_PIN="${KERNEL_PIN:-9426323c2acd0865fd565a6dd8a9f39f831cbec3}"
@@ -35,7 +31,7 @@ summarize() {
         if [ -f "$BL" ]; then
             python3 - "$BL" <<'SUMEOF'
 import re, sys
-from collections import Counter, OrderedDict
+from collections import Counter
 txt = open(sys.argv[1], encoding='utf-8', errors='replace').read().split('\n')
 err = re.compile(r'^(?:\.\./)*(\S+?):(\d+):(\d+): (?:fatal )?error: (.*)$')
 per_file, per_msg, first_loc = Counter(), Counter(), {}
@@ -47,13 +43,11 @@ for l in txt:
         key = re.sub(r"\s*\[-W[^\]]*\]", "", msg)[:110]
         per_msg[key] += 1
         first_loc.setdefault(key, f"{f}:{ln}")
-print(f"erreurs : {sum(per_file.values())}   fichiers touchés : {len(per_file)}")
+print(f"erreurs : {sum(per_file.values())}   fichiers : {len(per_file)}")
 for f, n in per_file.most_common(25): print(f"{n:4d}  {f}")
 print()
 for k, n in per_msg.most_common(25): print(f"{n:4d}  {k}   [{first_loc[k]}]")
 SUMEOF
-        else
-            echo "pas de build.log"
         fi
     } > "$SUM" 2>&1
     cat "$SUM"
@@ -366,7 +360,7 @@ int handle_sepolicy(void __user *user_data, u64 data_len) { return -EOPNOTSUPP; 
 RULESEOF
 echo "  ✅ rules.c dual-path"
 
-# ==================== 4b.2 Correctifs 4.19 (remplacements EXACTS) ====================
+# ==================== 4b.2 Correctifs 4.19 ====================
 python3 - "$KSU_DIR" <<'PORTEOF' 2>&1 | tee -a "$AUDIT"
 import os, sys
 
@@ -387,19 +381,24 @@ def write(p, c, o):
 
 def rep(c, old, new, where):
     if old not in c:
-        raise SystemExit(f"❌ ancre introuvable dans {where}:\n{old[:160]}")
+        raise SystemExit(f"❌ ancre introuvable dans {where}:\n{old[:200]}")
     return c.replace(old, new, 1)
 
 def ensure_inc(c, inc):
+    """Insère #include {inc} après le PREMIER #include existant (zone header)."""
     if inc in c:
         return c
-    last = 0
-    for line in c.splitlines(keepends=True):
+    lines = c.split('\n')
+    for i, line in enumerate(lines):
         if line.lstrip().startswith('#include'):
-            last += len(line)
-    return (c[:last] + f'#include {inc}\n' + c[last:]) if last else (f'#include {inc}\n' + c)
+            before = '\n'.join(lines[:i + 1])
+            after = '\n'.join(lines[i + 1:])
+            return before + f'\n#include {inc}' + ('\n' + after if after else '')
+    return f'#include {inc}\n' + c
 
-# --- 1. file_wrapper.c ---
+# ==========================================================
+# 1. infra/file_wrapper.c — iopoll / remap_file_range guards
+# ==========================================================
 p = os.path.join(root, "infra/file_wrapper.c")
 if os.path.isfile(p):
     c = read(p); o = c
@@ -410,14 +409,14 @@ if os.path.isfile(p):
         '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)\n'
         '    p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;\n'
         '#endif',
-        "file_wrapper.c/iopoll-assign")
+        "file_wrapper/iopoll-assign")
 
     c = rep(c,
         '    p->ops.remap_file_range = fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;',
         '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)\n'
         '    p->ops.remap_file_range = fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;\n'
         '#endif',
-        "file_wrapper.c/remap-assign")
+        "file_wrapper/remap-assign")
 
     c = rep(c,
         '#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)\n'
@@ -425,13 +424,13 @@ if os.path.isfile(p):
         '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)\n'
         '#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)\n'
         'static int ksu_wrapper_iopoll(struct kiocb *kiocb, struct io_comp_batch *icb, unsigned int v)',
-        "file_wrapper.c/iopoll-open")
+        "file_wrapper/iopoll-open")
 
     c = rep(c,
         '    return orig->f_op->iopoll(kiocb, spin);\n}\n#endif',
         '    return orig->f_op->iopoll(kiocb, spin);\n}\n#endif\n'
         '#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0) */',
-        "file_wrapper.c/iopoll-close")
+        "file_wrapper/iopoll-close")
 
     c = rep(c,
         'static loff_t ksu_wrapper_remap_file_range(struct file *file_in, loff_t pos_in, struct file *file_out, loff_t pos_out,\n'
@@ -439,7 +438,7 @@ if os.path.isfile(p):
         '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)\n'
         'static loff_t ksu_wrapper_remap_file_range(struct file *file_in, loff_t pos_in, struct file *file_out, loff_t pos_out,\n'
         '                                           loff_t len, unsigned int remap_flags)\n{',
-        "file_wrapper.c/remap-open")
+        "file_wrapper/remap-open")
 
     c = rep(c,
         '        return orig->f_op->remap_file_range(orig, pos_in, file_out, pos_out, len, remap_flags);\n'
@@ -447,22 +446,24 @@ if os.path.isfile(p):
         '        return orig->f_op->remap_file_range(orig, pos_in, file_out, pos_out, len, remap_flags);\n'
         '    }\n}\n'
         '#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0) */\n',
-        "file_wrapper.c/remap-close")
+        "file_wrapper/remap-close")
 
     write(p, c, o)
 
-# --- 2. sepolicy.c ---
+# ==========================================================
+# 2. selinux/sepolicy.c — add_type + add_typeattribute_raw
+# ==========================================================
 p = os.path.join(root, "selinux/sepolicy.c")
 if os.path.isfile(p):
     c = read(p); o = c
     c = ensure_inc(c, "<linux/version.h>")
     c = ensure_inc(c, "<linux/flex_array.h>")
 
+    # 2a. Helpers avtab (flex_array < 5.10)
     c = rep(c,
         '#define KSU_SUPPORT_ADD_TYPE\n',
         '#define KSU_SUPPORT_ADD_TYPE\n'
         '\n'
-        '/* Compat 4.19: avtab.htable est un flex_array avant 5.10 */\n'
         '#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n'
         '#define ksu_avtab_htable_get(htab, i) ((struct avtab_node *)flex_array_get_ptr((htab).htable, (i)))\n'
         '#define ksu_avtab_htable_set(htab, i, v) flex_array_put_ptr((htab).htable, (i), (v), GFP_ATOMIC)\n'
@@ -470,86 +471,253 @@ if os.path.isfile(p):
         '#define ksu_avtab_htable_get(htab, i) ((htab).htable[(i)])\n'
         '#define ksu_avtab_htable_set(htab, i, v) ((htab).htable[(i)] = (v))\n'
         '#endif\n',
-        "sepolicy.c/helpers")
+        "sepolicy/helpers")
 
+    # 2b. remove_avtab_node : 3 accès directs à htable[]
     c = rep(c,
         '        for (n = db->te_avtab.htable[i]; n; prev = n, n = n->next) {',
         '        for (n = ksu_avtab_htable_get(db->te_avtab, i); n; prev = n, n = n->next) {',
-        "sepolicy.c/remove-read")
-
+        "sepolicy/remove-read")
     c = rep(c,
         '                db->te_avtab.htable[i] = n->next;',
         '                ksu_avtab_htable_set(db->te_avtab, i, n->next);',
-        "sepolicy.c/remove-write")
-
+        "sepolicy/remove-write")
     c = rep(c,
         '            removed.htable[0] = n;',
         '            ksu_avtab_htable_set(removed, 0, n);',
-        "sepolicy.c/remove-temp")
+        "sepolicy/remove-temp")
 
+    # 2c. add_type : corps complet protégé #if >= 5.10 / #else flex_array
+    old_add_type_body = '''    u32 value = ++db->p_types.nprim;
+    type = (struct type_datum *)kzalloc(sizeof(struct type_datum), GFP_KERNEL);
+    if (!type) {
+        pr_err("add_type: alloc type_datum failed.\\n");
+        return false;
+    }
+
+    type->primary = 1;
+    type->value = value;
+    type->attribute = attr;
+
+    char *key = kstrdup(type_name, GFP_KERNEL);
+    if (!key) {
+        pr_err("add_type: alloc key failed.\\n");
+        return false;
+    }
+
+    if (symtab_insert(&db->p_types, key, type)) {
+        pr_err("add_type: insert symtab failed.\\n");
+        return false;
+    }
+
+    struct ebitmap *new_type_attr_map_array =
+        ksu_kvrealloc(db->type_attr_map_array, value * sizeof(struct ebitmap), (value - 1) * sizeof(struct ebitmap));
+
+    if (!new_type_attr_map_array) {
+        pr_err("add_type: alloc type_attr_map_array failed\\n");
+        return false;
+    }
+
+    struct type_datum **new_type_val_to_struct = ksu_kvrealloc(
+        db->type_val_to_struct, sizeof(*db->type_val_to_struct) * value, sizeof(*db->type_val_to_struct) * (value - 1));
+
+    if (!new_type_val_to_struct) {
+        pr_err("add_type: alloc type_val_to_struct failed\\n");
+        return false;
+    }
+
+    char **new_val_to_name_types =
+        ksu_kvrealloc(db->sym_val_to_name[SYM_TYPES], sizeof(char *) * value, sizeof(char *) * (value - 1));
+    if (!new_val_to_name_types) {
+        pr_err("add_type: alloc val_to_name failed\\n");
+        return false;
+    }
+
+    db->type_attr_map_array = new_type_attr_map_array;
+    ebitmap_init(&db->type_attr_map_array[value - 1]);
+    ebitmap_set_bit(&db->type_attr_map_array[value - 1], value - 1, 1);
+
+    db->type_val_to_struct = new_type_val_to_struct;
+    db->type_val_to_struct[value - 1] = type;
+
+    db->sym_val_to_name[SYM_TYPES] = new_val_to_name_types;
+    db->sym_val_to_name[SYM_TYPES][value - 1] = key;
+
+    int i;
+    for (i = 0; i < db->p_roles.nprim; ++i) {
+        ebitmap_set_bit(&db->role_val_to_struct[i]->types, value - 1, 1);
+    }
+
+    return true;
+'''
+
+    new_add_type_body = '''#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+    u32 value = ++db->p_types.nprim;
+    type = (struct type_datum *)kzalloc(sizeof(struct type_datum), GFP_KERNEL);
+    if (!type) {
+        pr_err("add_type: alloc type_datum failed.\\n");
+        return false;
+    }
+
+    type->primary = 1;
+    type->value = value;
+    type->attribute = attr;
+
+    char *key = kstrdup(type_name, GFP_KERNEL);
+    if (!key) {
+        pr_err("add_type: alloc key failed.\\n");
+        return false;
+    }
+
+    if (symtab_insert(&db->p_types, key, type)) {
+        pr_err("add_type: insert symtab failed.\\n");
+        return false;
+    }
+
+    struct ebitmap *new_type_attr_map_array =
+        ksu_kvrealloc(db->type_attr_map_array, value * sizeof(struct ebitmap), (value - 1) * sizeof(struct ebitmap));
+    if (!new_type_attr_map_array) {
+        pr_err("add_type: alloc type_attr_map_array failed\\n");
+        return false;
+    }
+
+    struct type_datum **new_type_val_to_struct = ksu_kvrealloc(
+        db->type_val_to_struct, sizeof(*db->type_val_to_struct) * value, sizeof(*db->type_val_to_struct) * (value - 1));
+    if (!new_type_val_to_struct) {
+        pr_err("add_type: alloc type_val_to_struct failed\\n");
+        return false;
+    }
+
+    char **new_val_to_name_types =
+        ksu_kvrealloc(db->sym_val_to_name[SYM_TYPES], sizeof(char *) * value, sizeof(char *) * (value - 1));
+    if (!new_val_to_name_types) {
+        pr_err("add_type: alloc val_to_name failed\\n");
+        return false;
+    }
+
+    db->type_attr_map_array = new_type_attr_map_array;
+    ebitmap_init(&db->type_attr_map_array[value - 1]);
+    ebitmap_set_bit(&db->type_attr_map_array[value - 1], value - 1, 1);
+
+    db->type_val_to_struct = new_type_val_to_struct;
+    db->type_val_to_struct[value - 1] = type;
+
+    db->sym_val_to_name[SYM_TYPES] = new_val_to_name_types;
+    db->sym_val_to_name[SYM_TYPES][value - 1] = key;
+
+    int i;
+    for (i = 0; i < db->p_roles.nprim; ++i) {
+        ebitmap_set_bit(&db->role_val_to_struct[i]->types, value - 1, 1);
+    }
+
+    return true;
+#else /* 4.19 flex_array path (type_attr_map_array + sym_val_to_name + type_val_to_struct_array sont des flex_array) */
+    u32 value = ++db->p_types.nprim;
+    int k;
+
+    type = (struct type_datum *)kzalloc(sizeof(struct type_datum), GFP_KERNEL);
+    if (!type) {
+        pr_err("add_type: alloc type_datum failed.\\n");
+        return false;
+    }
+    type->primary = 1;
+    type->value = value;
+    type->attribute = attr;
+
+    char *key = kstrdup(type_name, GFP_KERNEL);
+    if (!key) {
+        pr_err("add_type: alloc key failed.\\n");
+        return false;
+    }
+    if (symtab_insert(&db->p_types, key, type)) {
+        pr_err("add_type: insert symtab failed.\\n");
+        return false;
+    }
+
+    /* --- type_attr_map_array: flex_array of struct ebitmap --- */
+    struct flex_array *new_tama = flex_array_alloc(sizeof(struct ebitmap), value, GFP_KERNEL);
+    if (!new_tama) {
+        pr_err("add_type: flex_array_alloc type_attr_map_array failed\\n");
+        return false;
+    }
+    {
+        struct ebitmap empty = {0};
+        for (k = 0; k < value; k++)
+            flex_array_put(new_tama, k, &empty, GFP_KERNEL);
+    }
+    for (k = 0; k < value - 1; k++) {
+        struct ebitmap *old_bm = (struct ebitmap *)flex_array_get(db->type_attr_map_array, k);
+        struct ebitmap *new_bm = (struct ebitmap *)flex_array_get(new_tama, k);
+        if (old_bm && new_bm)
+            ebitmap_copy(new_bm, old_bm);
+    }
+    flex_array_free(db->type_attr_map_array);
+    db->type_attr_map_array = new_tama;
+    {
+        struct ebitmap *new_slot = (struct ebitmap *)flex_array_get(new_tama, value - 1);
+        if (new_slot) {
+            ebitmap_init(new_slot);
+            ebitmap_set_bit(new_slot, value - 1, 1);
+        }
+    }
+
+    /* --- type_val_to_struct_array: flex_array of void* --- */
+    struct flex_array *new_tvts = flex_array_alloc(sizeof(void *), value, GFP_KERNEL);
+    if (!new_tvts) {
+        pr_err("add_type: flex_array_alloc type_val_to_struct_array failed\\n");
+        return false;
+    }
+    for (k = 0; k < value; k++)
+        flex_array_put_ptr(new_tvts, k, NULL, GFP_KERNEL);
+    for (k = 0; k < value - 1; k++) {
+        void *pv = flex_array_get_ptr(db->type_val_to_struct_array, k);
+        if (pv)
+            flex_array_put_ptr(new_tvts, k, pv, GFP_KERNEL);
+    }
+    flex_array_free(db->type_val_to_struct_array);
+    db->type_val_to_struct_array = new_tvts;
+    flex_array_put_ptr(new_tvts, value - 1, type, GFP_KERNEL);
+
+    /* --- sym_val_to_name[SYM_TYPES]: flex_array of char* --- */
+    struct flex_array *new_names = flex_array_alloc(sizeof(char *), value, GFP_KERNEL);
+    if (!new_names) {
+        pr_err("add_type: flex_array_alloc sym_val_to_name failed\\n");
+        return false;
+    }
+    for (k = 0; k < value; k++)
+        flex_array_put_ptr(new_names, k, NULL, GFP_KERNEL);
+    for (k = 0; k < value - 1; k++) {
+        void *pv = flex_array_get_ptr(db->sym_val_to_name[SYM_TYPES], k);
+        if (pv)
+            flex_array_put_ptr(new_names, k, pv, GFP_KERNEL);
+    }
+    flex_array_free(db->sym_val_to_name[SYM_TYPES]);
+    db->sym_val_to_name[SYM_TYPES] = new_names;
+    flex_array_put_ptr(new_names, value - 1, key, GFP_KERNEL);
+
+    /* role_val_to_struct sur 4.19 : simple tableau, inchangé */
+    int i;
+    for (i = 0; i < db->p_roles.nprim; ++i) {
+        ebitmap_set_bit(&db->role_val_to_struct[i]->types, value - 1, 1);
+    }
+
+    return true;
+#endif
+'''
+
+    c = rep(c, old_add_type_body, new_add_type_body, "sepolicy/add_type-body")
+
+    # 2d. add_typeattribute_raw : flex_array_get sur 4.19
     c = rep(c,
-        '    struct type_datum **new_type_val_to_struct = ksu_kvrealloc(\n'
-        '        db->type_val_to_struct, sizeof(*db->type_val_to_struct) * value, sizeof(*db->type_val_to_struct) * (value - 1));\n'
-        '\n'
-        '    if (!new_type_val_to_struct) {\n'
-        '        pr_err("add_type: alloc type_val_to_struct failed\\n");\n'
-        '        return false;\n'
-        '    }',
+        '    struct ebitmap *sattr = &db->type_attr_map_array[type->value - 1];',
         '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n'
-        '    struct type_datum **new_type_val_to_struct = ksu_kvrealloc(\n'
-        '        db->type_val_to_struct, sizeof(*db->type_val_to_struct) * value, sizeof(*db->type_val_to_struct) * (value - 1));\n'
-        '\n'
-        '    if (!new_type_val_to_struct) {\n'
-        '        pr_err("add_type: alloc type_val_to_struct failed\\n");\n'
-        '        return false;\n'
-        '    }\n'
+        '    struct ebitmap *sattr = &db->type_attr_map_array[type->value - 1];\n'
         '#else\n'
-        '    struct flex_array *new_tvts = flex_array_alloc(sizeof(void *), value, GFP_KERNEL | __GFP_ZERO);\n'
-        '    if (!new_tvts) {\n'
-        '        pr_err("add_type: alloc type_val_to_struct failed\\n");\n'
-        '        return false;\n'
-        '    }\n'
-        '    {\n'
-        '        int k;\n'
-        '        for (k = 0; k < value - 1; k++) {\n'
-        '            void *pv = flex_array_get_ptr(db->type_val_to_struct_array, k);\n'
-        '            if (pv)\n'
-        '                flex_array_put_ptr(new_tvts, k, pv, GFP_KERNEL);\n'
-        '        }\n'
-        '    }\n'
-        '    flex_array_free(db->type_val_to_struct_array);\n'
-        '    db->type_val_to_struct_array = new_tvts;\n'
+        '    struct ebitmap *sattr = (struct ebitmap *)flex_array_get(db->type_attr_map_array, type->value - 1);\n'
         '#endif',
-        "sepolicy.c/add_type-tvts-alloc")
+        "sepolicy/add_typeattr-sattr")
 
-    c = rep(c,
-        '    db->type_val_to_struct = new_type_val_to_struct;\n'
-        '    db->type_val_to_struct[value - 1] = type;',
-        '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n'
-        '    db->type_val_to_struct = new_type_val_to_struct;\n'
-        '    db->type_val_to_struct[value - 1] = type;\n'
-        '#else\n'
-        '    flex_array_put_ptr(db->type_val_to_struct_array, value - 1, type, GFP_KERNEL);\n'
-        '#endif',
-        "sepolicy.c/add_type-tvts-assign")
-
-    c = rep(c,
-        '    int i;\n'
-        '    for (i = 0; i < db->p_roles.nprim; ++i) {\n'
-        '        ebitmap_set_bit(&db->role_val_to_struct[i]->types, value - 1, 1);\n'
-        '    }',
-        '    int i;\n'
-        '    for (i = 0; i < db->p_roles.nprim; ++i) {\n'
-        '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n'
-        '        ebitmap_set_bit(&db->role_val_to_struct[i]->types, value - 1, 1);\n'
-        '#else\n'
-        '        struct role_datum *rp = (struct role_datum *)flex_array_get_ptr(db->role_val_to_struct_array, i);\n'
-        '        if (rp)\n'
-        '            ebitmap_set_bit(&rp->types, value - 1, 1);\n'
-        '#endif\n'
-        '    }',
-        "sepolicy.c/add_type-roles")
-
+    # 2e. add_filename_trans : stub sur 4.19
     c = rep(c,
         'static bool add_filename_trans(struct policydb *db, const char *s, const char *t, const char *c, const char *d,\n'
         '                               const char *o)\n'
@@ -560,7 +728,7 @@ if os.path.isfile(p):
         '                               const char *o)\n'
         '{\n'
         '    struct type_datum *src, *tgt, *def;',
-        "sepolicy.c/fnametr-open")
+        "sepolicy/fnametr-open")
 
     c = rep(c,
         'free_trans:\n    kfree(trans);\nout:\n    return false;\n}\n',
@@ -573,8 +741,9 @@ if os.path.isfile(p):
         '    return false;\n'
         '}\n'
         '#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) */\n',
-        "sepolicy.c/fnametr-close")
+        "sepolicy/fnametr-close")
 
+    # 2f. ksu_dup_sepolicy / ksu_destroy_sepolicy : stubs sur 4.19
     c = rep(c,
         'void ksu_destroy_sepolicy(struct selinux_policy *pol)\n'
         '{\n'
@@ -593,17 +762,19 @@ if os.path.isfile(p):
         '\n'
         'struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)\n'
         '{',
-        "sepolicy.c/dup-open")
+        "sepolicy/dup-open")
 
     c = rep(c,
         'out_free_data:\n    kvfree(data);\n\n    return ERR_PTR(ret);\n}\n',
         'out_free_data:\n    kvfree(data);\n\n    return ERR_PTR(ret);\n}\n'
         '#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) */\n',
-        "sepolicy.c/dup-close")
+        "sepolicy/dup-close")
 
     write(p, c, o)
 
-# --- 3. Correctifs complémentaires (déjà validés, inchangés) ---
+# ==========================================================
+# 3. Correctifs complémentaires
+# ==========================================================
 for rel in ['manager/dynamic_manager.c', 'policy/allowlist.c']:
     p = os.path.join(root, rel)
     if not os.path.isfile(p): continue
@@ -620,11 +791,13 @@ for rel in ['manager/pkg_observer.c','manager/dynamic_manager.c','policy/allowli
     c = read(p); o = c
     if 'TWA_RESUME' in c and 'TWA_RESUME 0' not in c:
         c = ensure_inc(c, '<linux/version.h>')
-        last = 0
-        for line in c.splitlines(keepends=True):
+        lines = c.split('\n')
+        for i, line in enumerate(lines):
             if line.lstrip().startswith('#include'):
-                last += len(line)
-        c = c[:last] + TWA + c[last:]
+                before = '\n'.join(lines[:i + 1])
+                after = '\n'.join(lines[i + 1:])
+                c = before + TWA + '\n' + after if after else before + TWA
+                break
         write(p, c, o)
 
 p = os.path.join(root, 'manager/pkg_observer.c')
@@ -635,9 +808,7 @@ if os.path.isfile(p):
         out = []
         for line in c.split('\n'):
             if '.handle_inode_event' in line and not line.strip().startswith('#'):
-                out.append('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)')
-                out.append(line)
-                out.append('#endif')
+                out += ['#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)', line, '#endif']
             else:
                 out.append(line)
         c = '\n'.join(out).replace('#include <linux/version.h>',
@@ -653,11 +824,13 @@ if os.path.isfile(p):
                 '#ifndef SECCOMP_ARCH_NATIVE_NR\n#ifdef CONFIG_COMPAT\n'
                 '#define SECCOMP_ARCH_NATIVE_NR 2\n#else\n#define SECCOMP_ARCH_NATIVE_NR 1\n'
                 '#endif\n#endif\n#endif\n')
-        last = 0
-        for line in c.splitlines(keepends=True):
+        lines = c.split('\n')
+        for i, line in enumerate(lines):
             if line.lstrip().startswith('#include'):
-                last += len(line)
-        c = c[:last] + stub + c[last:]
+                before = '\n'.join(lines[:i + 1])
+                after = '\n'.join(lines[i + 1:])
+                c = before + stub + '\n' + after if after else before + stub
+                break
         write(p, c, o)
 
 p = os.path.join(root, 'policy/app_profile.c')
@@ -684,12 +857,15 @@ if os.path.isfile(p):
     c = ensure_inc(c, '<linux/sched/signal.h>')
     c = ensure_inc(c, '<linux/sched/task.h>')
     if 'tasklist_lock' in c and 'KSU_TASKLIST_COMPAT' not in c:
-        last = 0
-        for line in c.splitlines(keepends=True):
+        lines = c.split('\n')
+        for i, line in enumerate(lines):
             if line.lstrip().startswith('#include'):
-                last += len(line)
-        c = c[:last] + ('\n#ifndef KSU_TASKLIST_COMPAT\n#define KSU_TASKLIST_COMPAT 1\n'
-                        'extern rwlock_t tasklist_lock;\nextern struct task_struct init_task;\n#endif\n') + c[last:]
+                before = '\n'.join(lines[:i + 1])
+                after = '\n'.join(lines[i + 1:])
+                block = ('\n#ifndef KSU_TASKLIST_COMPAT\n#define KSU_TASKLIST_COMPAT 1\n'
+                         'extern rwlock_t tasklist_lock;\nextern struct task_struct init_task;\n#endif')
+                c = before + block + ('\n' + after if after else '')
+                break
         write(p, c, o)
 
 p = os.path.join(root, 'sulog/event.c')
@@ -731,10 +907,13 @@ if os.path.isfile(p):
             'void ksu_selinux_hide_drop_backup_if_unused(void) { }\n'
             'void ksu_selinux_hide_handle_umount(void) { }\n'
             '#else\n')
-        lines = c.split('\n'); removed = False; out = []
+        lines = c.split('\n')
+        removed = False
+        out = []
         for ln in lines:
             if not removed and ln.strip() == '#include <linux/version.h>':
-                removed = True; continue
+                removed = True
+                continue
             out.append(ln)
         c = stub + '\n'.join(out) + '\n#endif /* KSU_SELINUX_HIDE_4_19_STUB */\n'
         write(p, c, o)
