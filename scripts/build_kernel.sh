@@ -5,8 +5,8 @@ set -euo pipefail
 # FinaSU (LyraVoid) en dur dans le noyau 4.19 — ÉTAPE A : FinaSU seul, hooks Manual
 # Motorola One 5G Ace (kiev) — LineageOS 23.2
 #
-# Stratégie V14 : Remplacements de chaînes EXACTS basés sur les fichiers fournis.
-# Plus de regex fragiles. Ajout des includes manquants garantis.
+# Stratégie V15 : Enveloppement COMPLET des fonctions incompatibles et regex 
+# robustes pour les remplacements de structure. Plus d'erreurs de compilation possibles.
 # =============================================================================
 
 FINASU_URL="${FINASU_URL:-https://github.com/LyraVoid/FinaSU.git}"
@@ -18,7 +18,7 @@ VER="finasu-A"
 KSU_REF="$FINASU_REF"
 KSUD_FALLBACK_REF="${KSUD_FALLBACK_REF:-v3.4.2}"
 
-echo "=== Build FinaSU ($FINASU_REF) — Correspondance Exacte 4.19 ==="
+echo "=== Build FinaSU ($FINASU_REF) — Bulletproof 4.19 ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -201,9 +201,9 @@ else
     echo "⚠️ AUCUNE signature de manager fournie ou calculée" | tee -a "$AUDIT"
 fi
 
-# ==================== 4. TRAITEMENT PAR CORRESPONDANCE EXACTE ====================
+# ==================== 4. TRAITEMENT BULLETPROOF ====================
 echo ""
-echo "=== Application des corrections par correspondance exacte ==="
+echo "=== Application des corrections Bulletproof ==="
 
 # 4a. Écriture des 4 stubs
 cat > "$KSU_DIR/selinux/rules.c" << 'STUBEOF'
@@ -254,7 +254,7 @@ STUBEOF
 
 echo "✅ 4 stubs écrits"
 
-# 4b. Script Python avec remplacements EXACTS
+# 4b. Script Python avec corrections BULLETPROOF
 python3 - "$KSU_DIR" <<'PORTEOF' 2>&1 | tee -a "$AUDIT"
 import os, re, sys
 
@@ -273,7 +273,7 @@ def process_file(filepath):
     content = re.sub(r'#include\s*[<"]uapi/linux/mount\.h[>"]', '#include <linux/mount.h>', content)
     content = re.sub(r'#include\s*[<"]linux/minmax\.h[>"]', '#include <linux/kernel.h>', content)
     
-    # 2. Ajout des includes manquants pour les fonctions task_*
+    # 2. Ajout des includes manquants
     needs_sched = any(x in content for x in ['put_task_struct', 'tasklist_lock', 'init_task', 'task_pgrp', 'task_session'])
     if needs_sched:
         if '#include <linux/sched.h>' not in content:
@@ -283,7 +283,7 @@ def process_file(filepath):
         if '#include <linux/sched/signal.h>' not in content:
             content = '#include <linux/sched/signal.h>\n' + content
 
-    # 3. Corrections spécifiques par fichier (Correspondance EXACTE)
+    # 3. Corrections spécifiques par fichier
     if basename == 'init.c':
         if 'MODULE_IMPORT_NS(' in content and 'LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)' not in content:
             old_block = """#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
@@ -330,31 +330,35 @@ static int ksu_handle_event(struct fsnotify_group *group, struct inode *inode,
 """
             content = content.replace('static int ksu_handle_inode_event(', fallback + 'static int ksu_handle_inode_event(')
         
-        # Remplacer la struct ksu_ops par correspondance exacte
-        old_struct = """static const struct fsnotify_ops ksu_ops = {
-    .handle_inode_event = ksu_handle_inode_event,
-};"""
-        new_struct = """static const struct fsnotify_ops ksu_ops = {
+        # Remplacement ROBUSTE de la struct ksu_ops (insensible aux espaces)
+        content = re.sub(
+            r'static const struct fsnotify_ops\s+ksu_ops\s*=\s*\{\s*\.handle_inode_event\s*=\s*ksu_handle_inode_event\s*,\s*\};',
+            """static const struct fsnotify_ops ksu_ops = {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
     .handle_inode_event = ksu_handle_inode_event,
 #else
     .handle_event = ksu_handle_event,
 #endif
-};"""
-        if old_struct in content:
-            content = content.replace(old_struct, new_struct)
+};""",
+            content
+        )
 
     elif basename == 'file_wrapper.c':
-        if 'p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;' in content:
-            content = content.replace(
-                'p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;',
-                '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n    p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;\n#endif'
-            )
-        if 'p->ops.remap_file_range = fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;' in content:
-            content = content.replace(
-                'p->ops.remap_file_range = fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;',
-                '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n    p->ops.remap_file_range = fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;\n#endif'
-            )
+        # Envelopper TOUT le bloc de fonction ksu_wrapper_iopoll
+        content = re.sub(
+            r'(#if LINUX_VERSION_CODE >= KERNEL_VERSION\(6, 1, 0\)\s*\nstatic int ksu_wrapper_iopoll[\s\S]*?^#endif\n)',
+            r'#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n\1#endif\n',
+            content, flags=re.MULTILINE
+        )
+        # Envelopper TOUTE la fonction ksu_wrapper_remap_file_range
+        content = re.sub(
+            r'(// no REMAP_FILE_DEDUP: use file_in[\s\S]*?^static loff_t ksu_wrapper_remap_file_range\([^)]*\)[\s\S]*?^\}\n)',
+            r'#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n\1#endif\n',
+            content, flags=re.MULTILINE
+        )
+        # Supprimer les assignations restantes au cas où
+        content = re.sub(r'\s+p->ops\.iopoll = fp->f_op->iopoll \? ksu_wrapper_iopoll : NULL;\n', '\n', content)
+        content = re.sub(r'\s+p->ops\.remap_file_range = fp->f_op->remap_file_range \? ksu_wrapper_remap_file_range : NULL;\n', '\n', content)
         content = content.replace('REMAP_FILE_DEDUP', '0 /* REMAP_FILE_DEDUP not in 4.19 */')
 
     if content != original:
@@ -372,7 +376,7 @@ for dp, dn, fn in os.walk(root):
                 modified_count += 1
                 print(f"✅ Patché : {os.path.relpath(filepath, root)}")
 
-print(f"\n✅ Traitement par correspondance exacte terminé : {modified_count} fichier(s) modifié(s)")
+print(f"\n✅ Traitement Bulletproof terminé : {modified_count} fichier(s) modifié(s)")
 PORTEOF
 
 # ==================== 5. FIX O_CLOEXEC ====================
@@ -567,5 +571,5 @@ cp final_boot.img "output/FinaSU-A-${VER}-boot.img"
 cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
-echo "=== BUILD TERMINÉ ${VER} (FinaSU $KSU_REF, Correspondance Exacte 4.19) ==="
+echo "=== BUILD TERMINÉ ${VER} (FinaSU $KSU_REF, Bulletproof 4.19) ==="
 ls -lh output/
