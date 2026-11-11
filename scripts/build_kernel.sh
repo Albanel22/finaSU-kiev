@@ -253,7 +253,7 @@ grep -rl "anon_inode_getfile" "$KSU_DIR/" 2>/dev/null | while read -r f; do
     sed -i 's/O_RDWR | O_CLOEXEC/O_RDWR/g; s/O_RDWR|O_CLOEXEC/O_RDWR/g; s/, O_CLOEXEC)/)/g' "$f"
 done || true
 
-# ==================== 4a. rules.c dual-path (backport complet 4.19) ====================
+# ==================== 4a. rules.c dual-path ====================
 echo "=== Réécriture rules.c dual-path (handle_sepolicy préservé sur 4.19) ==="
 cat > "$KSU_DIR/selinux/rules.c" << 'RULESEOF'
 #include "linux/rcupdate.h"
@@ -266,7 +266,7 @@ cat > "$KSU_DIR/selinux/rules.c" << 'RULESEOF'
 #include <linux/string.h>
 
 #include "uapi/selinux.h"
-#include "klog.h" // IWYU pragma: keep
+#include "klog.h"
 #include "selinux.h"
 #include "sepolicy.h"
 #include "ss/services.h"
@@ -529,39 +529,30 @@ int handle_sepolicy(void __user *user_data, u64 data_len)
         pr_info("SELinux permissive or disabled when handle policy!\n");
 
     write_lock(&policy_rwlock);
-
     cursor.cur = payload;
     cursor.end = payload + (size_t)data_len;
     ret = 0;
     success_cmd_count = 0;
     cmd_index = 0;
-
     while (cursor.cur < cursor.end) {
         struct sepol_data header;
         const char *args[KSU_SEPOLICY_MAX_ARGS] = { 0 };
         int expected_argc;
         u32 arg_index;
-
         ret = sepol_read_cmd_header(&cursor, &header);
         if (ret < 0) { pr_err("sepol: failed header #%u\n", cmd_index); break; }
-
         expected_argc = sepol_expected_argc(header.cmd);
         if (expected_argc < 0 || expected_argc > KSU_SEPOLICY_MAX_ARGS) { ret = -EINVAL; break; }
-
         for (arg_index = 0; arg_index < (u32)expected_argc; arg_index++) {
             ret = sepol_read_string(&cursor, &args[arg_index]);
             if (ret < 0) break;
         }
         if (ret < 0) break;
-
         ret = apply_one_sepolicy_cmd(&policydb, &header, args);
-        if (ret < 0)
-            pr_err("sepol: cmd #%u failed cmd=%u subcmd=%u\n", cmd_index, header.cmd, header.subcmd);
-        else
-            success_cmd_count++;
+        if (ret < 0) pr_err("sepol: cmd #%u failed cmd=%u subcmd=%u\n", cmd_index, header.cmd, header.subcmd);
+        else success_cmd_count++;
         cmd_index++;
     }
-
     write_unlock(&policy_rwlock);
     reset_avc_cache_419();
 #ifdef CONFIG_KSU_SUSFS
@@ -609,8 +600,7 @@ void apply_kernelsu_rules(void)
     struct selinux_policy *pol, *old_pol;
     struct policydb *db;
 
-    if (!getenforce())
-        pr_info("SELinux permissive or disabled, apply rules!\n");
+    if (!getenforce()) pr_info("SELinux permissive or disabled, apply rules!\n");
 
     mutex_lock(&selinux_state.policy_mutex);
 
@@ -731,17 +721,11 @@ int handle_sepolicy(void __user *user_data, u64 data_len)
 
     if (!user_data || !data_len) return -EINVAL;
     if (data_len > KSU_SEPOLICY_MAX_BATCH_SIZE) return -E2BIG;
-
     payload = kvmalloc((size_t)data_len, GFP_KERNEL);
     if (!payload) return -ENOMEM;
-
     if (copy_from_user(payload, user_data, (size_t)data_len)) { ret = -EFAULT; goto out_free; }
-
-    if (!getenforce())
-        pr_info("SELinux permissive or disabled when handle policy!\n");
-
+    if (!getenforce()) pr_info("SELinux permissive or disabled when handle policy!\n");
     mutex_lock(&selinux_state.policy_mutex);
-
     old_pol = rcu_dereference_protected(selinux_state.policy, lockdep_is_held(&selinux_state.policy_mutex));
     pol = ksu_dup_sepolicy(old_pol);
     if (IS_ERR(pol)) {
@@ -750,7 +734,6 @@ int handle_sepolicy(void __user *user_data, u64 data_len)
         goto out_unlock;
     }
     db = &pol->policydb;
-
     cursor.cur = payload;
     cursor.end = payload + (size_t)data_len;
     ret = 0;
@@ -761,36 +744,27 @@ int handle_sepolicy(void __user *user_data, u64 data_len)
         const char *args[KSU_SEPOLICY_MAX_ARGS] = { 0 };
         int expected_argc;
         u32 arg_index;
-
         ret = sepol_read_cmd_header(&cursor, &header);
         if (ret < 0) { pr_err("sepol: failed header #%u\n", cmd_index); goto out_drop_new_policy; }
-
         expected_argc = sepol_expected_argc(header.cmd);
         if (expected_argc < 0 || expected_argc > KSU_SEPOLICY_MAX_ARGS) { ret = -EINVAL; goto out_drop_new_policy; }
-
         for (arg_index = 0; arg_index < (u32)expected_argc; arg_index++) {
             ret = sepol_read_string(&cursor, &args[arg_index]);
             if (ret < 0) goto out_drop_new_policy;
         }
-
         ret = apply_one_sepolicy_cmd(db, &header, args);
-        if (ret < 0)
-            pr_err("sepol: cmd #%u failed cmd=%u subcmd=%u\n", cmd_index, header.cmd, header.subcmd);
-        else
-            success_cmd_count++;
+        if (ret < 0) pr_err("sepol: cmd #%u failed cmd=%u subcmd=%u\n", cmd_index, header.cmd, header.subcmd);
+        else success_cmd_count++;
         cmd_index++;
     }
-
 #if !defined(CONFIG_KSU_SUSFS) || !defined(KSU_SUSFS_HAS_TYPE_REGISTRATION)
     pol->latest_granting = old_pol->latest_granting + 1;
     if (!ksu_advance_original_types(db, &old_pol->policydb, old_pol->latest_granting, pol->latest_granting))
         pr_warn("failed to carry original type metadata, use backup lookups\n");
 #endif
-
     rcu_assign_pointer(selinux_state.policy, pol);
     synchronize_rcu();
     ksu_destroy_sepolicy(old_pol);
-
 #ifdef KSU_SUSFS_HAS_TYPE_REGISTRATION
     reset_avc_cache(0);
 #else
@@ -801,7 +775,6 @@ int handle_sepolicy(void __user *user_data, u64 data_len)
 #endif
     ret = success_cmd_count;
     goto out_unlock;
-
 out_drop_new_policy:
     ksu_destroy_sepolicy(pol);
 out_unlock:
@@ -815,10 +788,10 @@ out_free:
 RULESEOF
 echo "  ✅ rules.c dual-path réinstallé"
 
-# ==================== 4b. COMPATIBILITÉ 4.19 ====================
-echo "=== Correctifs ciblés 4.19 (8 fixes) ==="
+# ==================== 4b. COMPATIBILITÉ 4.19 (9 fixes) ====================
+echo "=== Correctifs ciblés 4.19 (9 fixes) ==="
 python3 - "$GITHUB_WORKSPACE" <<'FIXEOF' 2>&1 | tee -a "$AUDIT"
-import os, sys
+import os, sys, re
 
 GW = sys.argv[1]
 kernel_root = os.path.join(GW, "kernel_sources")
@@ -1118,7 +1091,7 @@ void __exit ksu_observer_exit(void)
         write(p, new_c); total += 1
         print(f"  ✅ manager/pkg_observer.c: réécrit 4.19")
 
-# --- FIX 7 : TWA_RESUME + put_task_struct (walker) ---
+# --- FIX 7 : TWA_RESUME + put_task_struct ---
 if os.path.isdir(ksu_root):
     for dp, dn, fn in os.walk(ksu_root):
         for f in fn:
@@ -1146,41 +1119,271 @@ if os.path.isdir(ksu_root):
                 write(p, c); total += 1
                 print(f"  ✅ {os.path.relpath(p, GW)}: TWA_RESUME + sched/task.h")
 
-# --- FIX 8 : app_profile.c — backport propre seccomp_filter_release ---
+# --- FIX 8 : app_profile.c seccomp_filter_release ---
 p = os.path.join(ksu_root, "policy/app_profile.c")
 if os.path.isfile(p):
-    c = read(p)
-    original = c
-
+    c = read(p); original = c
     old = 'void seccomp_filter_release(struct task_struct *tsk);\n'
     if old in c and '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\nvoid seccomp_filter_release' not in c:
-        new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n'
-               'void seccomp_filter_release(struct task_struct *tsk);\n'
-               '#endif\n')
-        c = c.replace(old, new, 1)
-
+        c = c.replace(old, '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\nvoid seccomp_filter_release(struct task_struct *tsk);\n#endif\n', 1)
     old = '    atomic_set(&current->seccomp.filter_count, 0);\n'
     if old in c and '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n    atomic_set(&current->seccomp.filter_count' not in c:
-        new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n'
-               '    atomic_set(&current->seccomp.filter_count, 0);\n'
-               '#endif\n')
-        c = c.replace(old, new, 1)
-
+        c = c.replace(old, '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n    atomic_set(&current->seccomp.filter_count, 0);\n#endif\n', 1)
     old = '    seccomp_filter_release(fake);\n'
     if old in c and '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n    seccomp_filter_release(fake)' not in c:
         new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n'
                '    seccomp_filter_release(fake);\n'
                '#else\n'
-               '    /* put_seccomp_filter() : même libération via refcount.\n'
-               '     * fake->seccomp.filter contient toujours le vrai pointeur\n'
-               '     * (copié via memcpy avant current->seccomp.filter = NULL). */\n'
                '    put_seccomp_filter(fake);\n'
                '#endif\n')
+        c = c.replace(old, new, 1)
+    if c != original:
+        write(p, c); total += 1
+        print(f"  ✅ policy/app_profile.c: seccomp_filter_release backporté")
+
+# --- FIX 9 : sepolicy.c ---
+p = os.path.join(ksu_root, "selinux/sepolicy.c")
+if os.path.isfile(p):
+    c = read(p); original = c
+
+    c = ensure_inc_after_last(c, '<linux/flex_array.h>')
+
+    # 9b. helpers avtab htable
+    if 'ksu_avtab_htable_get' not in c and '#define KSU_SUPPORT_ADD_TYPE' in c:
+        c = c.replace(
+            '#define KSU_SUPPORT_ADD_TYPE\n',
+            '#define KSU_SUPPORT_ADD_TYPE\n'
+            '\n'
+            '#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n'
+            '#define ksu_avtab_htable_get(htab, i) ((struct avtab_node *)flex_array_get_ptr((htab).htable, (i)))\n'
+            '#define ksu_avtab_htable_set(htab, i, v) flex_array_put_ptr((htab).htable, (i), (v), GFP_ATOMIC)\n'
+            '#else\n'
+            '#define ksu_avtab_htable_get(htab, i) ((htab).htable[(i)])\n'
+            '#define ksu_avtab_htable_set(htab, i, v) ((htab).htable[(i)] = (v))\n'
+            '#endif\n',
+            1
+        )
+
+    # 9c. remove_avtab_node
+    c = c.replace(
+        'for (n = db->te_avtab.htable[i]; n; prev = n, n = n->next) {',
+        'for (n = ksu_avtab_htable_get(db->te_avtab, i); n; prev = n, n = n->next) {',
+        1
+    )
+    c = c.replace(
+        'db->te_avtab.htable[i] = n->next;',
+        'ksu_avtab_htable_set(db->te_avtab, i, n->next);',
+        1
+    )
+    c = c.replace(
+        'removed.htable[0] = n;',
+        'ksu_avtab_htable_set(removed, 0, n);',
+        1
+    )
+
+    # 9d. add_filename_trans — backport API 4.19 (hashtab filename_trans)
+    old_open = '''static bool add_filename_trans(struct policydb *db, const char *s, const char *t, const char *c, const char *d,
+                               const char *o)
+{
+    struct type_datum *src, *tgt, *def;'''
+    new_open = '''#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+static bool add_filename_trans(struct policydb *db, const char *s, const char *t, const char *c, const char *d,
+                               const char *o)
+{
+    struct type_datum *src, *tgt, *def;'''
+    if old_open in c and '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\nstatic bool add_filename_trans' not in c:
+        c = c.replace(old_open, new_open, 1)
+
+    old_close = '''free_trans:
+    kfree(trans);
+out:
+    return false;
+}'''
+    new_close = '''free_trans:
+    kfree(trans);
+out:
+    return false;
+}
+#else
+/* API 4.19 : struct filename_trans = {stype, ttype, tclass, name}
+ *             struct filename_trans_datum = {otype}
+ *             db->filename_trans = hashtab*
+ *             db->filename_trans_ttypes = ebitmap des ttypes
+ * La refonte 5.9 (filename_trans_key, filename_trans_datum.stypes/next,
+ * policydb_filenametr_search) n'existe pas sur 4.19. */
+static bool add_filename_trans(struct policydb *db, const char *s, const char *t, const char *c, const char *d,
+                               const char *o)
+{
+    struct type_datum *src, *tgt, *def;
+    struct class_datum *cls;
+    struct filename_trans key;
+    struct filename_trans_datum *datum;
+    struct filename_trans *new_key;
+    struct filename_trans_datum *new_datum;
+    int rc;
+
+    src = symtab_search(&db->p_types, s);
+    if (!src) { pr_warn("source type %s does not exist\\n", s); return false; }
+    tgt = symtab_search(&db->p_types, t);
+    if (!tgt) { pr_warn("target type %s does not exist\\n", t); return false; }
+    cls = symtab_search(&db->p_classes, c);
+    if (!cls) { pr_warn("class %s does not exist\\n", c); return false; }
+    def = symtab_search(&db->p_types, d);
+    if (!def) { pr_warn("default type %s does not exist\\n", d); return false; }
+
+    /* 1. Chercher une entrée existante */
+    key.stype = src->value;
+    key.ttype = tgt->value;
+    key.tclass = cls->value;
+    key.name = o;
+
+    datum = hashtab_search(db->filename_trans, &key);
+    if (datum) {
+        /* Entrée existante : mise à jour de l'otype */
+        datum->otype = def->value;
+        return true;
+    }
+
+    /* 2. Aucune entrée : insérer */
+    new_key = kzalloc(sizeof(*new_key), GFP_KERNEL);
+    if (!new_key) return false;
+    new_key->stype = src->value;
+    new_key->ttype = tgt->value;
+    new_key->tclass = cls->value;
+    new_key->name = kstrdup(o, GFP_KERNEL);
+    if (!new_key->name) { kfree(new_key); return false; }
+
+    new_datum = kzalloc(sizeof(*new_datum), GFP_KERNEL);
+    if (!new_datum) { kfree(new_key->name); kfree(new_key); return false; }
+    new_datum->otype = def->value;
+
+    rc = hashtab_insert(db->filename_trans, new_key, new_datum);
+    if (rc) {
+        kfree(new_datum);
+        kfree(new_key->name);
+        kfree(new_key);
+        return false;
+    }
+
+    ebitmap_set_bit(&db->filename_trans_ttypes, tgt->value, 1);
+    return true;
+}
+#endif'''
+    if old_close in c and '#else\n/* API 4.19 : struct filename_trans = {stype, ttype, tclass, name}' not in c:
+        c = c.replace(old_close, new_close, 1)
+
+    # 9e. add_type — walker pour remplacer le corps par version dual-path
+    m = re.search(r'^static bool add_type\(struct policydb \*db, const char \*type_name, bool attr\)\n\{', c, re.MULTILINE)
+    if m and 'KSU_ADD_TYPE_FLEX_ARRAY' not in c:
+        start = m.start()
+        depth = 0; end = -1; i = m.end() - 1
+        while i < len(c):
+            if c[i] == '{': depth += 1
+            elif c[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    end = i; break
+            i += 1
+        if end > 0:
+            orig_func = c[start:end+1]
+            flex_version = r'''static bool add_type_flex_419(struct policydb *db, const char *type_name, bool attr) {
+    /* KSU_ADD_TYPE_FLEX_ARRAY */
+    struct type_datum *type = symtab_search(&db->p_types, type_name);
+    if (type) { pr_warn("Type %s already exists\n", type_name); return true; }
+
+    u32 value = ++db->p_types.nprim;
+    int k;
+    void *zero = NULL;
+    struct ebitmap empty_bm;
+
+    type = (struct type_datum *)kzalloc(sizeof(struct type_datum), GFP_KERNEL);
+    if (!type) { pr_err("add_type: alloc type_datum failed.\n"); return false; }
+    type->primary = 1;
+    type->value = value;
+    type->attribute = attr;
+    char *key = kstrdup(type_name, GFP_KERNEL);
+    if (!key) { pr_err("add_type: alloc key failed.\n"); return false; }
+    if (symtab_insert(&db->p_types, key, type)) { pr_err("add_type: insert symtab failed.\n"); return false; }
+
+    struct flex_array *new_tama = flex_array_alloc(sizeof(struct ebitmap), value, GFP_KERNEL);
+    if (!new_tama) { pr_err("add_type: flex_array_alloc type_attr_map_array failed\n"); return false; }
+    memset(&empty_bm, 0, sizeof(empty_bm));
+    for (k = 0; k < value; k++)
+        flex_array_put(new_tama, k, &empty_bm, GFP_KERNEL);
+    for (k = 0; k < value - 1; k++) {
+        struct ebitmap *old_bm = (struct ebitmap *)flex_array_get(db->type_attr_map_array, k);
+        struct ebitmap *new_bm = (struct ebitmap *)flex_array_get(new_tama, k);
+        if (old_bm && new_bm)
+            ebitmap_cpy(new_bm, old_bm);
+    }
+    flex_array_free(db->type_attr_map_array);
+    db->type_attr_map_array = new_tama;
+    {
+        struct ebitmap *new_slot = (struct ebitmap *)flex_array_get(new_tama, value - 1);
+        if (new_slot) {
+            ebitmap_init(new_slot);
+            ebitmap_set_bit(new_slot, value - 1, 1);
+        }
+    }
+
+    struct flex_array *new_tvts = flex_array_alloc(sizeof(void *), value, GFP_KERNEL);
+    if (!new_tvts) { pr_err("add_type: flex_array_alloc type_val_to_struct_array failed\n"); return false; }
+    for (k = 0; k < value; k++)
+        flex_array_put_ptr(new_tvts, k, zero, GFP_KERNEL);
+    for (k = 0; k < value - 1; k++) {
+        void *pv = flex_array_get_ptr(db->type_val_to_struct_array, k);
+        if (pv) flex_array_put_ptr(new_tvts, k, pv, GFP_KERNEL);
+    }
+    flex_array_free(db->type_val_to_struct_array);
+    db->type_val_to_struct_array = new_tvts;
+    flex_array_put_ptr(new_tvts, value - 1, type, GFP_KERNEL);
+
+    struct flex_array *new_names = flex_array_alloc(sizeof(char *), value, GFP_KERNEL);
+    if (!new_names) { pr_err("add_type: flex_array_alloc sym_val_to_name failed\n"); return false; }
+    for (k = 0; k < value; k++)
+        flex_array_put_ptr(new_names, k, zero, GFP_KERNEL);
+    for (k = 0; k < value - 1; k++) {
+        void *pv = flex_array_get_ptr(db->sym_val_to_name[SYM_TYPES], k);
+        if (pv) flex_array_put_ptr(new_names, k, pv, GFP_KERNEL);
+    }
+    flex_array_free(db->sym_val_to_name[SYM_TYPES]);
+    db->sym_val_to_name[SYM_TYPES] = new_names;
+    flex_array_put_ptr(new_names, value - 1, key, GFP_KERNEL);
+
+    int i;
+    for (i = 0; i < db->p_roles.nprim; ++i) {
+        ebitmap_set_bit(&db->role_val_to_struct[i]->types, value - 1, 1);
+    }
+    return true;
+}
+'''
+            wrapped = (orig_func
+                       .replace('static bool add_type(struct policydb *db, const char *type_name, bool attr)\n{',
+                                'static bool add_type_5_10(struct policydb *db, const char *type_name, bool attr)\n{', 1))
+            new_func = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n' + wrapped + '\n#else\n'
+                        + flex_version + '\n#endif\n\n'
+                        'static bool add_type(struct policydb *db, const char *type_name, bool attr) {\n'
+                        '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n'
+                        '    return add_type_5_10(db, type_name, attr);\n'
+                        '#else\n'
+                        '    return add_type_flex_419(db, type_name, attr);\n'
+                        '#endif\n'
+                        '}')
+            c = c[:start] + new_func + c[end+1:]
+
+    # 9f. add_typeattribute_raw
+    old = '    struct ebitmap *sattr = &db->type_attr_map_array[type->value - 1];'
+    new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n'
+           '    struct ebitmap *sattr = &db->type_attr_map_array[type->value - 1];\n'
+           '#else\n'
+           '    struct ebitmap *sattr = (struct ebitmap *)flex_array_get(db->type_attr_map_array, type->value - 1);\n'
+           '#endif')
+    if old in c and new not in c:
         c = c.replace(old, new, 1)
 
     if c != original:
         write(p, c); total += 1
-        print(f"  ✅ policy/app_profile.c: seccomp_filter_release backporté")
+        print(f"  ✅ selinux/sepolicy.c: flex_array + filename_trans backport 4.19")
 
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
@@ -1239,8 +1442,31 @@ grep -q "^CONFIG_KSU_SUSFS=y" out/.config || { echo "❌ CONFIG_KSU_SUSFS off"; 
 grep -q "^CONFIG_KSU_SUSFS_SUS_KSTAT=y" out/.config || { echo "❌ CONFIG_KSU_SUSFS_SUS_KSTAT off"; exit 1; }
 
 # ==================== 6. MOTOROLA ====================
-sed -i 's/if (!check_version(/if (0 \&\& !check_version(/g' kernel/module.c
-printf "\n#include <linux/notifier.h>\n#include <linux/module.h>\nstatic BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);\nint panel_register_notifier(struct notifier_block *nb){return blocking_notifier_chain_register(&motorola_panel_notifier_list,nb);}\nEXPORT_SYMBOL(panel_register_notifier);\nint panel_unregister_notifier(struct notifier_block *nb){return blocking_notifier_chain_unregister(&motorola_panel_notifier_list,nb);}\nEXPORT_SYMBOL(panel_unregister_notifier);\nvoid touch_set_state(int s){return;}\nEXPORT_SYMBOL(touch_set_state);\n" >> techpack/display/msm/msm_drv.c
+cat >> techpack/display/msm/msm_drv.c <<'EOF'
+
+#include <linux/notifier.h>
+#include <linux/module.h>
+
+static BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);
+
+int panel_register_notifier(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_register(&motorola_panel_notifier_list, nb);
+}
+EXPORT_SYMBOL(panel_register_notifier);
+
+int panel_unregister_notifier(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_unregister(&motorola_panel_notifier_list, nb);
+}
+EXPORT_SYMBOL(panel_unregister_notifier);
+
+void touch_set_state(int state)
+{
+	(void)state;
+}
+EXPORT_SYMBOL(touch_set_state);
+EOF
 
 # ==================== 7. COMPILATION ====================
 echo "=== Compilation ==="
