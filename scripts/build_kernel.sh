@@ -5,8 +5,7 @@ set -euo pipefail
 # FinaSU (LyraVoid) en dur dans le noyau 4.19 — ÉTAPE A : FinaSU seul, hooks Manual
 # Motorola One 5G Ace (kiev) — LineageOS 23.2
 #
-# Stratégie V19 : Résolution des erreurs de linking en étendant les stubs et
-# en désactivant les fichiers dépendant de fonctions noyau 5.9+
+# Stratégie V20 : Correction finale des 2 derniers symboles manquants
 # =============================================================================
 
 FINASU_URL="${FINASU_URL:-https://github.com/LyraVoid/FinaSU.git}"
@@ -18,7 +17,7 @@ VER="finasu-A"
 KSU_REF="$FINASU_REF"
 KSUD_FALLBACK_REF="${KSUD_FALLBACK_REF:-v3.4.2}"
 
-echo "=== Build FinaSU ($FINASU_REF) — Linking Fix 4.19 ==="
+echo "=== Build FinaSU ($FINASU_REF) — Victory Lap 4.19 ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -201,13 +200,13 @@ else
     echo "⚠️ AUCUNE signature de manager fournie ou calculée" | tee -a "$AUDIT"
 fi
 
-# ==================== 4. TRAITEMENT LINKING FIX ====================
+# ==================== 4. TRAITEMENT VICTORY LAP ====================
 echo ""
-echo "=== Application des corrections Linking Fix ==="
+echo "=== Application des corrections Victory Lap ==="
 
-# 4a. Stubs ÉTENDUS pour résoudre les symboles manquants
+# 4a. Stubs COMPLÈTS pour résoudre TOUS les symboles manquants
 
-# selinux_hide.c étendu avec toutes les fonctions appelées
+# selinux_hide.c étendu avec toutes les fonctions
 cat > "$KSU_DIR/feature/selinux_hide.c" << 'STUBEOF'
 #include <linux/version.h>
 #include <linux/printk.h>
@@ -218,8 +217,6 @@ bool ksu_selinux_hide_running = false;
 int ksu_selinux_hide_enable(void) { return -EOPNOTSUPP; }
 void ksu_selinux_hide_unhook(void) {}
 void initialize_fake_status(void) {}
-
-/* Fonctions appelées par throne_tracker.c */
 void ksu_selinux_hide_init(void) { pr_info("selinux_hide disabled for 4.19\n"); }
 void ksu_selinux_hide_exit(void) {}
 void ksu_selinux_hide_drop_backup_if_unused(void) {}
@@ -227,17 +224,40 @@ void ksu_selinux_hide_handle_post_fs_data(void) {}
 void ksu_selinux_hide_handle_second_stage(void) {}
 STUBEOF
 
-# seccomp_cache.c étendu avec ksu_seccomp_allow_cache
+# seccomp_cache.c étendu
 cat > "$KSU_DIR/infra/seccomp_cache.c" << 'STUBEOF'
 #include <linux/version.h>
 #include <linux/printk.h>
 #include <linux/sched.h>
 
 void ksu_seccomp_cache_init(void) { pr_info("seccomp_cache disabled\n"); }
-void ksu_seccomp_allow_cache(struct task_struct *tsk) { /* no-op for 4.19 */ }
+void ksu_seccomp_allow_cache(struct task_struct *tsk) { }
 STUBEOF
 
-# selinux/rules.c et selinux/sepolicy.c (inchangés)
+# kernel_umount.c étendu avec TOUS les symboles nécessaires
+cat > "$KSU_DIR/feature/kernel_umount.c" << 'STUBEOF'
+#include <linux/version.h>
+#include <linux/printk.h>
+
+/* path_umount n'existe pas en 4.19, on désactive cette fonctionnalité */
+int ksu_handle_umount(void) { 
+    pr_info("kernel_umount disabled for 4.19\n");
+    return 0; 
+}
+void ksu_kernel_umount_init(void) { }
+void ksu_kernel_umount_exit(void) { }
+STUBEOF
+
+# su_mount_ns.c étendu
+cat > "$KSU_DIR/infra/su_mount_ns.c" << 'STUBEOF'
+#include <linux/version.h>
+#include <linux/printk.h>
+
+/* path_mount n'existe pas en 4.19 */
+void setup_mount_ns(void *profile) { }
+STUBEOF
+
+# selinux/rules.c et selinux/sepolicy.c
 cat > "$KSU_DIR/selinux/rules.c" << 'STUBEOF'
 #include <linux/version.h>
 #include <linux/printk.h>
@@ -268,31 +288,9 @@ bool ksu_type_member(void *db, const char *src, const char *tgt, const char *cls
 bool ksu_genfscon(void *db, const char *fs_name, const char *path, const char *ctx) { return true; }
 STUBEOF
 
-# 4b. Stubs pour kernel_umount.c et su_mount_ns.c (fonctions noyau 5.9+)
-cat > "$KSU_DIR/feature/kernel_umount.c" << 'STUBEOF'
-#include <linux/version.h>
-#include <linux/printk.h>
+echo "✅ Stubs complets écrits"
 
-/* path_umount n'existe pas en 4.19, on désactive cette fonctionnalité */
-int ksu_handle_umount(void) { 
-    pr_info("kernel_umount disabled for 4.19\n");
-    return 0; 
-}
-STUBEOF
-
-cat > "$KSU_DIR/infra/su_mount_ns.c" << 'STUBEOF'
-#include <linux/version.h>
-#include <linux/printk.h>
-
-/* path_mount n'existe pas en 4.19, on désactive cette fonctionnalité */
-void setup_mount_ns(void *profile) { 
-    /* no-op for 4.19 */
-}
-STUBEOF
-
-echo "✅ Stubs étendus écrits"
-
-# 4c. RÉÉCRITURE COMPLÈTE de pkg_observer.c avec la BONNE signature pour 4.19
+# 4b. RÉÉCRITURE COMPLÈTE de pkg_observer.c
 cat > "$KSU_DIR/manager/pkg_observer.c" << 'OBSERVEREOF'
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/module.h>
@@ -477,7 +475,7 @@ OBSERVEREOF
 
 echo "✅ pkg_observer.c réécrit"
 
-# 4d. Corrections Python pour les autres fichiers
+# 4c. Corrections Python pour les autres fichiers
 python3 - "$KSU_DIR" <<'PORTEOF' 2>&1 | tee -a "$AUDIT"
 import os, re, sys
 
@@ -525,13 +523,11 @@ MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
                 content = content.replace(old_block, new_block)
 
     elif basename == 'app_profile.c':
-        # Conditionner filter_count ET seccomp_filter_release
         if 'atomic_set(&current->seccomp.filter_count, 0);' in content:
             content = content.replace(
                 'atomic_set(&current->seccomp.filter_count, 0);',
                 '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)\n    atomic_set(&current->seccomp.filter_count, 0);\n#endif'
             )
-        # Conditionner seccomp_filter_release (n'existe pas en 4.19)
         if 'seccomp_filter_release(fake);' in content:
             content = content.replace(
                 'seccomp_filter_release(fake);',
@@ -572,7 +568,7 @@ for dp, dn, fn in os.walk(root):
                 modified_count += 1
                 print(f"✅ Patché : {os.path.relpath(filepath, root)}")
 
-print(f"\n✅ Traitement Linking Fix terminé : {modified_count} fichier(s) modifié(s)")
+print(f"\n✅ Traitement Victory Lap terminé : {modified_count} fichier(s) modifié(s)")
 PORTEOF
 
 # ==================== 5. FIX O_CLOEXEC ====================
@@ -760,5 +756,5 @@ cp final_boot.img "output/FinaSU-A-${VER}-boot.img"
 cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
-echo "=== BUILD TERMINÉ ${VER} (FinaSU $KSU_REF, Linking Fix 4.19) ==="
+echo "=== BUILD TERMINÉ ${VER} (FinaSU $KSU_REF, Victory Lap 4.19) ==="
 ls -lh output/
