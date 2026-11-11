@@ -403,6 +403,42 @@ if os.path.isfile(p):
         total += 1
         print(f"  ✅ infra/file_wrapper.c: guards 4.19 appliqués")
 
+	# --- FIX 4 : seccomp_cache.c — SECCOMP_ARCH_NATIVE_NR pour 4.19 ---
+# Cette macro (introduite avec le cache BPF seccomp en 5.9) n'existe pas
+# dans les headers 4.19. On la définit localement avec la valeur correcte
+# pour arm64 : 2 si CONFIG_COMPAT (AArch64 + AArch32), 1 sinon.
+p = os.path.join(ksu_root, "infra/seccomp_cache.c")
+if os.path.isfile(p):
+    c = read(p)
+    if 'SECCOMP_ARCH_NATIVE_NR' in c and 'KSU_SECCOMP_COMPAT' not in c:
+        compat_block = (
+            '\n#ifndef KSU_SECCOMP_COMPAT\n'
+            '#define KSU_SECCOMP_COMPAT 1\n'
+            '#ifndef SECCOMP_ARCH_NATIVE_NR\n'
+            '#ifdef CONFIG_COMPAT\n'
+            '#define SECCOMP_ARCH_NATIVE_NR 2\n'
+            '#else\n'
+            '#define SECCOMP_ARCH_NATIVE_NR 1\n'
+            '#endif\n'
+            '#endif\n'
+            '#endif\n')
+        # Insérer après le dernier #include du fichier
+        lines = c.split('\n')
+        last_inc = -1
+        for i, ln in enumerate(lines):
+            if ln.lstrip().startswith('#include'):
+                last_inc = i
+        if last_inc >= 0:
+            lines.insert(last_inc + 1, compat_block)
+            write(p, '\n'.join(lines))
+            total += 1
+            print(f"  ✅ infra/seccomp_cache.c: SECCOMP_ARCH_NATIVE_NR défini pour 4.19")
+        else:
+            c = compat_block + c
+            write(p, c)
+            total += 1
+            print(f"  ✅ infra/seccomp_cache.c: SECCOMP_ARCH_NATIVE_NR défini (préfixe)")
+
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
 
