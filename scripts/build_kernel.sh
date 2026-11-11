@@ -426,8 +426,10 @@ static int apply_one_sepolicy_cmd(struct policydb *db, const struct sepol_data *
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 
+struct selinux_avc;
 extern struct policydb policydb;
 extern rwlock_t policy_rwlock;
+extern int avc_ss_reset(struct selinux_avc *avc, u32 seqno);
 
 static void reset_avc_cache_419(void)
 {
