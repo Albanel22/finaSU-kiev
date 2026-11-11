@@ -1,8 +1,6 @@
 #!/bin/bash
 set -euo pipefail
 
-# GitHub Actions définit déjà cette variable. En exécution locale, utiliser
-# automatiquement le répertoire depuis lequel le script est lancé.
 GITHUB_WORKSPACE="${GITHUB_WORKSPACE:-$PWD}"
 export GITHUB_WORKSPACE
 
@@ -82,8 +80,7 @@ if ! git checkout -q "$KERNEL_PIN" 2>/dev/null; then
 fi
 echo "Source figée : $KERNEL_PIN ($(git rev-parse HEAD))" | tee -a "$AUDIT"
 
-# Patch SUSFS adapté au noyau 4.19.325, provenant d'un commit immuable
-# de la branche finaSU-kiev-Manus.
+# Patch SUSFS adapté au noyau 4.19.325
 SUSFS_419_PATCH_URL="${SUSFS_419_PATCH_URL:-https://raw.githubusercontent.com/Albanel22/finaSU-kiev/b592bd3b000c6538c17ea69395f342fba14b6dcc/patches/susfs_patch_to_4.19.patch}"
 SUSFS_419_PATCH="$GITHUB_WORKSPACE/patches/susfs_patch_to_4.19.patch"
 mkdir -p "$GITHUB_WORKSPACE/patches"
@@ -148,8 +145,6 @@ cik7CisjZW5kaWYgLy8gI2lmZGVmIENPTkZJR19LU1VfU1VTRlNfU1VTX01BUAogCS8qIGlnbm9y
 ZSBlcnJvcnMsIGp1c3QgY2hlY2sgaG93IG11Y2ggd2FzIHN1Y2Nlc3NmdWxseSB0cmFuc2ZlcnJl
 ZCAqLwogCXdoaWxlIChsZW4pIHsKIAkJaW50IGJ5dGVzLCByZXQsIG9mZnNldDsK
 SUSFS_MANUAL_B64_EOF
-# Le patch amont est historiquement proche de 4.19, mais cinq contextes
-# diffèrent dans ce commit précis. On accepte uniquement ces cinq rejets.
 set +e
  git apply --reject --whitespace=nowarn "$SUSFS_419_PATCH" 2>&1 | tee -a "$AUDIT"
 SUSFS_APPLY_RC=${PIPESTATUS[0]}
@@ -258,8 +253,8 @@ grep -rl "anon_inode_getfile" "$KSU_DIR/" 2>/dev/null | while read -r f; do
     sed -i 's/O_RDWR | O_CLOEXEC/O_RDWR/g; s/O_RDWR|O_CLOEXEC/O_RDWR/g; s/, O_CLOEXEC)/)/g' "$f"
 done || true
 
-# ==================== 4b. COMPATIBILITÉ 4.19 (ciblée, minimale) ====================
-echo "=== Correctifs ciblés 4.19 (fs/stat.c + MODULE_IMPORT_NS + file_wrapper.c + seccomp_cache.c + su_mount_ns.c) ==="
+# ==================== 4b. COMPATIBILITÉ 4.19 ====================
+echo "=== Correctifs ciblés 4.19 (6 fixes) ==="
 python3 - "$GITHUB_WORKSPACE" <<'FIXEOF' 2>&1 | tee -a "$AUDIT"
 import os, sys
 
@@ -276,7 +271,7 @@ def write(p, c):
     with open(p, 'w', encoding='utf-8') as f:
         f.write(c)
 
-# --- FIX 1 : fs/stat.c — ajouter l'include susfs_def.h ---
+# --- FIX 1 : fs/stat.c — include susfs_def.h ---
 p = os.path.join(kernel_root, "fs/stat.c")
 if os.path.isfile(p):
     c = read(p)
@@ -285,39 +280,22 @@ if os.path.isfile(p):
         if marker in c:
             idx = c.index(marker) + len(marker)
             eol = c.find('\n', idx)
-            if eol == -1:
-                eol = len(c)
+            if eol == -1: eol = len(c)
             insert = '\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif // CONFIG_KSU_SUSFS_SUS_KSTAT'
             c = c[:eol] + insert + c[eol:]
             write(p, c)
             total += 1
-            print(f"  ✅ fs/stat.c: include susfs_def.h ajouté après <asm/unistd.h>")
-        else:
-            lines = c.split('\n')
-            last_inc = -1
-            for i, ln in enumerate(lines):
-                if ln.lstrip().startswith('#include'):
-                    last_inc = i
-            if last_inc >= 0:
-                insert = '// CONFIG_KSU_SUSFS_SUS_KSTAT\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif // CONFIG_KSU_SUSFS_SUS_KSTAT'
-                lines.insert(last_inc + 1, insert)
-                write(p, '\n'.join(lines))
-                total += 1
-                print(f"  ✅ fs/stat.c: include susfs_def.h ajouté après dernier include")
+            print(f"  ✅ fs/stat.c: include susfs_def.h ajouté")
 
-# --- FIX 2 : MODULE_IMPORT_NS wrappé par #ifdef ---
+# --- FIX 2 : MODULE_IMPORT_NS wrappé ---
 if os.path.isdir(ksu_root):
     for dp, dn, fn in os.walk(ksu_root):
         for f in fn:
-            if not f.endswith(('.c', '.h')):
-                continue
+            if not f.endswith(('.c', '.h')): continue
             p = os.path.join(dp, f)
-            try:
-                c = read(p)
-            except Exception:
-                continue
-            if 'MODULE_IMPORT_NS' not in c:
-                continue
+            try: c = read(p)
+            except Exception: continue
+            if 'MODULE_IMPORT_NS' not in c: continue
             lines = c.split('\n')
             out = []
             changed = False
@@ -337,114 +315,280 @@ if os.path.isdir(ksu_root):
                 total += 1
                 print(f"  ✅ {os.path.relpath(p, GW)}: MODULE_IMPORT_NS wrappé")
 
-# --- FIX 3 : file_wrapper.c — guards 4.19 pour iopoll / remap_file_range ---
+# --- FIX 3 : file_wrapper.c — guards iopoll / remap_file_range ---
 p = os.path.join(ksu_root, "infra/file_wrapper.c")
 if os.path.isfile(p):
-    c = read(p)
-    original = c
+    c = read(p); original = c
 
     old = '    p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;'
     new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)\n'
-           '    p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;\n'
-           '#endif')
-    if old in c and new not in c:
-        c = c.replace(old, new, 1)
+           '    p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;\n#endif')
+    if old in c and new not in c: c = c.replace(old, new, 1)
 
     old = '    p->ops.remap_file_range = fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;'
     new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)\n'
-           '    p->ops.remap_file_range = fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;\n'
-           '#endif')
-    if old in c and new not in c:
-        c = c.replace(old, new, 1)
+           '    p->ops.remap_file_range = fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;\n#endif')
+    if old in c and new not in c: c = c.replace(old, new, 1)
 
     old = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)\n'
            'static int ksu_wrapper_iopoll(struct kiocb *kiocb, struct io_comp_batch *icb, unsigned int v)')
     new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)\n'
            '#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)\n'
            'static int ksu_wrapper_iopoll(struct kiocb *kiocb, struct io_comp_batch *icb, unsigned int v)')
-    if old in c and new not in c:
-        c = c.replace(old, new, 1)
+    if old in c and new not in c: c = c.replace(old, new, 1)
 
     old = '    return orig->f_op->iopoll(kiocb, spin);\n}\n#endif'
-    new = ('    return orig->f_op->iopoll(kiocb, spin);\n}\n#endif\n'
-           '#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0) */')
-    if old in c and '#endif\n#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0) */' not in c:
-        c = c.replace(old, new, 1)
+    new = '    return orig->f_op->iopoll(kiocb, spin);\n}\n#endif\n#endif /* 5.0.0 */'
+    if old in c and '#endif\n#endif /* 5.0.0 */' not in c: c = c.replace(old, new, 1)
 
     old = ('static loff_t ksu_wrapper_remap_file_range(struct file *file_in, loff_t pos_in, struct file *file_out, loff_t pos_out,\n'
-           '                                           loff_t len, unsigned int remap_flags)\n'
-           '{')
+           '                                           loff_t len, unsigned int remap_flags)\n{')
     new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)\n'
            'static loff_t ksu_wrapper_remap_file_range(struct file *file_in, loff_t pos_in, struct file *file_out, loff_t pos_out,\n'
-           '                                           loff_t len, unsigned int remap_flags)\n'
-           '{')
-    if old in c and new not in c:
-        c = c.replace(old, new, 1)
+           '                                           loff_t len, unsigned int remap_flags)\n{')
+    if old in c and new not in c: c = c.replace(old, new, 1)
 
     old = ('        return orig->f_op->remap_file_range(orig, pos_in, file_out, pos_out, len, remap_flags);\n'
-           '    }\n'
-           '}\n')
+           '    }\n}\n')
     new = ('        return orig->f_op->remap_file_range(orig, pos_in, file_out, pos_out, len, remap_flags);\n'
-           '    }\n'
-           '}\n'
-           '#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0) */\n')
-    if old in c and '#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0) */\n\nstatic int ksu_wrapper_fadvise' not in c:
+           '    }\n}\n#endif /* 5.0.0 */\n')
+    if old in c and '#endif /* 5.0.0 */\n\nstatic int ksu_wrapper_fadvise' not in c:
         c = c.replace(old, new, 1)
 
     if c != original:
-        write(p, c)
-        total += 1
+        write(p, c); total += 1
         print(f"  ✅ infra/file_wrapper.c: guards 4.19 appliqués")
 
-# --- FIX 4 : seccomp_cache.c — SECCOMP_ARCH_NATIVE_NR pour 4.19 ---
+# --- FIX 4 : seccomp_cache.c — SECCOMP_ARCH_NATIVE_NR ---
 p = os.path.join(ksu_root, "infra/seccomp_cache.c")
 if os.path.isfile(p):
     c = read(p)
     if 'SECCOMP_ARCH_NATIVE_NR' in c and 'KSU_SECCOMP_COMPAT' not in c:
-        compat_block = (
-            '\n#ifndef KSU_SECCOMP_COMPAT\n'
-            '#define KSU_SECCOMP_COMPAT 1\n'
-            '#ifndef SECCOMP_ARCH_NATIVE_NR\n'
-            '#ifdef CONFIG_COMPAT\n'
-            '#define SECCOMP_ARCH_NATIVE_NR 2\n'
-            '#else\n'
-            '#define SECCOMP_ARCH_NATIVE_NR 1\n'
-            '#endif\n'
-            '#endif\n'
-            '#endif\n')
-        lines = c.split('\n')
-        last_inc = -1
+        compat = ('\n#ifndef KSU_SECCOMP_COMPAT\n#define KSU_SECCOMP_COMPAT 1\n'
+                  '#ifndef SECCOMP_ARCH_NATIVE_NR\n#ifdef CONFIG_COMPAT\n'
+                  '#define SECCOMP_ARCH_NATIVE_NR 2\n#else\n#define SECCOMP_ARCH_NATIVE_NR 1\n'
+                  '#endif\n#endif\n#endif\n')
+        lines = c.split('\n'); last_inc = -1
         for i, ln in enumerate(lines):
-            if ln.lstrip().startswith('#include'):
-                last_inc = i
+            if ln.lstrip().startswith('#include'): last_inc = i
         if last_inc >= 0:
-            lines.insert(last_inc + 1, compat_block)
-            write(p, '\n'.join(lines))
-            total += 1
-            print(f"  ✅ infra/seccomp_cache.c: SECCOMP_ARCH_NATIVE_NR défini pour 4.19")
-        else:
-            c = compat_block + c
-            write(p, c)
-            total += 1
-            print(f"  ✅ infra/seccomp_cache.c: SECCOMP_ARCH_NATIVE_NR défini (préfixe)")
+            lines.insert(last_inc + 1, compat)
+            write(p, '\n'.join(lines)); total += 1
+            print(f"  ✅ infra/seccomp_cache.c: SECCOMP_ARCH_NATIVE_NR défini")
 
 # --- FIX 5 : su_mount_ns.c — guard uapi/linux/mount.h ---
 p = os.path.join(ksu_root, "infra/su_mount_ns.c")
 if os.path.isfile(p):
     c = read(p)
     if '#include <uapi/linux/mount.h>' in c and 'KSU_MOUNT_HDR_COMPAT' not in c:
-        c = c.replace(
-            '#include <uapi/linux/mount.h>',
-            '#include <linux/version.h>\n'
-            '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0)\n'
-            '#include <uapi/linux/mount.h>\n'
-            '#else\n'
-            '#include <linux/mount.h>\n'
-            '#endif\n'
+        c = c.replace('#include <uapi/linux/mount.h>',
+            '#include <linux/version.h>\n#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0)\n'
+            '#include <uapi/linux/mount.h>\n#else\n#include <linux/mount.h>\n#endif\n'
             '#define KSU_MOUNT_HDR_COMPAT 1')
-        write(p, c)
+        write(p, c); total += 1
+        print(f"  ✅ infra/su_mount_ns.c: uapi/linux/mount.h guardé")
+
+# --- FIX 6 : pkg_observer.c — réécriture complète compatible 4.19 ---
+# On préserve à 100% la fonctionnalité manager (détection packages.list) :
+#   - TWA_RESUME = 0 sur 4.19 (task_work_add bool notify, sémantique identique)
+#   - handle_inode_event (5.9+) → handle_event (4.18-5.8) avec même filtrage
+p = os.path.join(ksu_root, "manager/pkg_observer.c")
+if os.path.isfile(p):
+    c = read(p)
+    if 'KSU_PKG_OBSERVER_419' not in c:
+        new_c = r'''// SPDX-License-Identifier: GPL-2.0
+// KSU_PKG_OBSERVER_419 : version corrigée pour 4.19 par FIX 6
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/namei.h>
+#include <linux/fsnotify_backend.h>
+#include <linux/sched.h>
+#include <linux/slab.h>
+#include <linux/rculist.h>
+#include <linux/task_work.h>
+#include <linux/version.h>
+#ifdef CONFIG_KSU_SUSFS
+#include <linux/susfs.h>
+#include <linux/susfs_def.h>
+#endif
+#include "klog.h" // IWYU pragma: keep
+#include "manager/throne_tracker.h"
+
+#define MASK_SYSTEM (FS_CREATE | FS_MOVE | FS_EVENT_ON_CHILD)
+
+#ifndef TWA_RESUME
+#define TWA_RESUME 0
+#endif
+
+struct watch_dir {
+    const char *path;
+    u32 mask;
+    struct path kpath;
+    struct inode *inode;
+    struct fsnotify_mark *mark;
+};
+
+static struct fsnotify_group *g;
+
+static void ksu_track_throne_tw_func(struct callback_head *cb)
+{
+    kfree(cb);
+    if (current->flags & PF_EXITING)
+        return;
+    track_throne(false);
+#if defined(CONFIG_KSU_SUSFS) && defined(CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER) && \
+    defined(CMD_SUSFS_SET_PRIORITY_UID_FILTER)
+    susfs_parse_priority_app_strings();
+#endif
+}
+
+static void ksu_defer_track_throne(void)
+{
+    struct callback_head *cb;
+
+    if (!(current->flags & PF_KTHREAD)) {
+        cb = kzalloc(sizeof(*cb), GFP_KERNEL);
+        if (cb) {
+            cb->func = ksu_track_throne_tw_func;
+            if (!task_work_add(current, cb, TWA_RESUME))
+                return;
+            kfree(cb);
+        }
+    }
+    pr_warn("defer track_throne failed, run it inline\n");
+    track_throne(false);
+}
+
+static void ksu_maybe_track_packages_list(void)
+{
+    pr_info("packages.list detected\n");
+    ksu_defer_track_throne();
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+static int ksu_handle_inode_event(struct fsnotify_mark *mark, u32 mask, struct inode *inode, struct inode *dir,
+                                  const struct qstr *file_name, u32 cookie)
+{
+    if (!file_name)
+        return 0;
+    if (mask & FS_ISDIR)
+        return 0;
+    if (file_name->len == 13 && !memcmp(file_name->name, "packages.list", 13))
+        ksu_maybe_track_packages_list();
+    return 0;
+}
+#else
+/* Signature 4.18–5.8 : file_name est un const unsigned char * null-terminé */
+static int ksu_handle_event_compat(struct fsnotify_group *group, struct inode *inode, u32 mask,
+                                    const void *data, int data_type, const unsigned char *file_name,
+                                    u32 cookie, struct fsnotify_iter_info *iter_info)
+{
+    (void)group; (void)inode; (void)data; (void)data_type; (void)cookie; (void)iter_info;
+    if (!file_name)
+        return 0;
+    if (mask & FS_ISDIR)
+        return 0;
+    if (strlen((const char *)file_name) == 13 && !memcmp(file_name, "packages.list", 13))
+        ksu_maybe_track_packages_list();
+    return 0;
+}
+#endif
+
+static const struct fsnotify_ops ksu_ops = {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+    .handle_inode_event = ksu_handle_inode_event,
+#else
+    .handle_event = ksu_handle_event_compat,
+#endif
+};
+
+static int add_mark_on_inode(struct inode *inode, u32 mask, struct fsnotify_mark **out)
+{
+    struct fsnotify_mark *m;
+
+    m = kzalloc(sizeof(*m), GFP_KERNEL);
+    if (!m)
+        return -ENOMEM;
+
+    fsnotify_init_mark(m, g);
+    m->mask = mask;
+
+    if (fsnotify_add_inode_mark(m, inode, 0)) {
+        fsnotify_put_mark(m);
+        return -EINVAL;
+    }
+    *out = m;
+    return 0;
+}
+
+static int watch_one_dir(struct watch_dir *wd)
+{
+    int ret = kern_path(wd->path, LOOKUP_FOLLOW, &wd->kpath);
+    if (ret) {
+        pr_info("path not ready: %s (%d)\n", wd->path, ret);
+        return ret;
+    }
+    wd->inode = d_inode(wd->kpath.dentry);
+    ihold(wd->inode);
+
+    ret = add_mark_on_inode(wd->inode, wd->mask, &wd->mark);
+    if (ret) {
+        pr_err("Add mark failed for %s (%d)\n", wd->path, ret);
+        path_put(&wd->kpath);
+        iput(wd->inode);
+        wd->inode = NULL;
+        return ret;
+    }
+    pr_info("watching %s\n", wd->path);
+    return 0;
+}
+
+static void unwatch_one_dir(struct watch_dir *wd)
+{
+    if (wd->mark) {
+        fsnotify_destroy_mark(wd->mark, g);
+        fsnotify_put_mark(wd->mark);
+        wd->mark = NULL;
+    }
+    if (wd->inode) {
+        iput(wd->inode);
+        wd->inode = NULL;
+    }
+    if (wd->kpath.dentry) {
+        path_put(&wd->kpath);
+        memset(&wd->kpath, 0, sizeof(wd->kpath));
+    }
+}
+
+static struct watch_dir g_watch = { .path = "/data/system", .mask = MASK_SYSTEM };
+
+int ksu_observer_init(void)
+{
+    int ret = 0;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+    g = fsnotify_alloc_group(&ksu_ops, 0);
+#else
+    g = fsnotify_alloc_group(&ksu_ops);
+#endif
+    if (IS_ERR(g))
+        return PTR_ERR(g);
+
+    ret = watch_one_dir(&g_watch);
+    pr_info("observer init done\n");
+    return 0;
+}
+
+void __exit ksu_observer_exit(void)
+{
+    unwatch_one_dir(&g_watch);
+    fsnotify_put_group(g);
+    pr_info("observer exit done\n");
+}
+'''
+        write(p, new_c)
         total += 1
-        print(f"  ✅ infra/su_mount_ns.c: uapi/linux/mount.h guardé pour 4.19")
+        print(f"  ✅ manager/pkg_observer.c: réécrit (handle_event compat + TWA_RESUME=0)")
 
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
