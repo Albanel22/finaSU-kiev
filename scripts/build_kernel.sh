@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # FinaSU (LyraVoid) — noyau 4.19 — ÉTAPE A (Tracepoint, sans SuSFS)
-# Compile OK + correctifs link : hide stubs, policydb, path_*, seccomp
+# Complet : link fix policydb (selinux_state.ss uniquement, PAS d'extern)
 # =============================================================================
 
 export GITHUB_WORKSPACE="${GITHUB_WORKSPACE:-$PWD}"
@@ -142,7 +142,7 @@ if [ -z "$FINASU_EXPECTED_SIZE" ] && [ -f "$MGR_APK" ]; then
     SIG_OUT=$(python3 - "$MGR_APK" <<'PYEOF' || true
 import hashlib, struct, sys
 data = open(sys.argv[1], 'rb').read()
-e = data.rfind(b'PK\x05\x06')
+e = data.rfind(b'PK\x05\x06')')
 if e < 0: sys.exit(2)
 cd_off = struct.unpack_from('<I', data, e + 16)[0]
 if data[cd_off - 16:cd_off] != b'APK Sig Block 42': sys.exit(3)
@@ -176,7 +176,7 @@ else
     echo "⚠️ AUCUNE signature de manager fournie" | tee -a "$AUDIT"
 fi
 
-# ==================== 3g/3h exports SELinux + policydb ====================
+# ==================== 3g/3h exports SELinux ====================
 [ -f "security/selinux/selinuxfs.c" ] && {
     sed -i 's/^static ssize_t (\*write_op\[\])/ssize_t (*write_op[])/' security/selinux/selinuxfs.c
     sed -i 's/^static const struct file_operations sel_handle_status_ops/const struct file_operations sel_handle_status_ops/' security/selinux/selinuxfs.c
@@ -188,23 +188,8 @@ fi
 }
 [ -f "security/selinux/ss/services.c" ] && {
     sed -i 's/^static DEFINE_RWLOCK(policy_rwlock)/DEFINE_RWLOCK(policy_rwlock)/' security/selinux/ss/services.c
-    # Exporter policydb global si présent en static
-    sed -i 's/^static struct policydb policydb;/struct policydb policydb;/' security/selinux/ss/services.c
-    sed -i 's/^static struct policydb\tpolicydb;/struct policydb policydb;/' security/selinux/ss/services.c
 }
-# Certains trees ont policydb dans un autre fichier
-for f in security/selinux/ss/*.c security/selinux/*.c; do
-    [ -f "$f" ] || continue
-    sed -i 's/^static struct policydb policydb;/struct policydb policydb;/' "$f" 2>/dev/null || true
-done
 [ -f "security/selinux/hooks.c" ] && sed -i 's/^static struct security_operations selinux_ops/struct security_operations selinux_ops/' security/selinux/hooks.c
-
-# Exporter path_mount / path_umount si présents en static (rare en 4.19)
-for f in fs/namespace.c fs/mount.c; do
-    [ -f "$f" ] || continue
-    sed -i 's/^static int path_mount(/int path_mount(/' "$f" 2>/dev/null || true
-    sed -i 's/^static int path_umount(/int path_umount(/' "$f" 2>/dev/null || true
-done
 
 grep -rl "get_unused_fd_flags(O_CLOEXEC)" "$KSU_DIR/" 2>/dev/null | while read -r f; do
     sed -i 's/get_unused_fd_flags(O_CLOEXEC)/get_unused_fd_flags(0)/g' "$f"
@@ -216,7 +201,7 @@ done || true
 # ==================== 4b. PORTAGE ====================
 echo "=== Portage 4.19 ==="
 
-# rules.c : policydb via selinux_state.ss en priorité (Android 4.19)
+# rules.c — policydb UNIQUEMENT via selinux_state.ss (pas d'extern policydb)
 cat > "$KSU_DIR/selinux/rules.c" << 'RULESEOF'
 #include "linux/rcupdate.h"
 #include "security.h"
@@ -259,25 +244,22 @@ static void reset_avc_cache(u32 seqno)
 	selinux_xfrm_notify_policyload();
 }
 
+/* PAS d'extern policydb — symbole absent sur ce tree Android 4.19 */
 static struct policydb *ksu_get_policydb(void)
 {
-	/*
-	 * Android 4.19 typique : policydb dans selinux_state.ss
-	 * Fallback : symbole global exporté par le script (static retiré)
-	 */
-#if defined(CONFIG_SECURITY_SELINUX)
-	if (selinux_state.ss)
-		return &selinux_state.ss->policydb;
-#endif
-	{
-		extern struct policydb policydb;
-		return &policydb;
-	}
+	if (!selinux_state.ss)
+		return NULL;
+	return &selinux_state.ss->policydb;
 }
 
 void apply_kernelsu_rules(void)
 {
 	struct policydb *db = ksu_get_policydb();
+
+	if (!db) {
+		pr_err("KernelSU: policydb unavailable (selinux_state.ss NULL)\n");
+		return;
+	}
 
 	if (!getenforce())
 		pr_info("SELinux permissive or disabled, apply rules! (old kernel path)\n");
@@ -331,13 +313,12 @@ int handle_sepolicy(void __user *user_data, u64 data_len)
 	return -EOPNOTSUPP;
 }
 #else
-/* chemin moderne inchangé — non compilé sur 4.19 */
 struct selinux_policy *backup_sepolicy;
 void apply_kernelsu_rules(void) {}
 int handle_sepolicy(void __user *user_data, u64 data_len) { return -EOPNOTSUPP; }
 #endif
 RULESEOF
-echo "  ✅ rules.c dual-path (selinux_state.ss + fallback)"
+echo "  ✅ rules.c (selinux_state.ss only)"
 
 python3 - "$KSU_DIR" <<'PORTEOF' 2>&1 | tee -a "$AUDIT"
 import os, re, sys
@@ -367,7 +348,7 @@ def ensure_inc(c, inc):
 def ensure_ver(c):
     return c if 'linux/version.h' in c else ensure_inc(c, '<linux/version.h>')
 
-# ----- selinux_hide : stubs COMPLETS -----
+# selinux_hide stubs complets
 p = os.path.join(root, "feature/selinux_hide.c")
 if os.path.isfile(p):
     c, o = read(p), None
@@ -391,12 +372,11 @@ void ksu_selinux_hide_handle_second_stage(void) {}
 void ksu_selinux_hide_drop_backup_if_unused(void) {}
 #else
 '''
-        # Préfixer le fichier original sous #else
         c = re.sub(r'#include\s*[<"]linux/version\.h[>"]\s*\n', '', c)
         c = stub + c + "\n#endif /* selinux_hide dual */\n"
         write(p, c, o)
 
-# ----- sepolicy dual-path (comme avant) -----
+# sepolicy dual-path
 p = os.path.join(root, "selinux/sepolicy.c")
 if os.path.isfile(p):
     c, o = read(p), None
@@ -409,9 +389,7 @@ if os.path.isfile(p):
             '''#define KSU_REMOVE_AVTAB_COMPAT 1
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
 static bool remove_avtab_node(struct policydb *db, struct avtab_node *node)
-{
-	(void)db; (void)node; return true;
-}
+{ (void)db; (void)node; return true; }
 #else
 static bool remove_avtab_node(struct policydb *db, struct avtab_node *node)
 {''',
@@ -445,8 +423,7 @@ static bool add_type(struct policydb *db, const char *type_name, bool attr)
             c, count=1)
         c = re.sub(
             r'(static bool add_type[\s\S]*?return true;\s*\n\}\s*\n)(static bool set_type_state\s*\()',
-            r'\1#endif\n ro\n\2', c, count=1)
-        c = c.replace('#endif\n ro\n', '#endif\n\n')
+            r'\1#endif\n\n\2', c, count=1)
 
     if "KSU_TYPEATTR_RAW_COMPAT" not in c and "static void add_typeattribute_raw" in c:
         c = re.sub(
@@ -475,9 +452,8 @@ struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)
 void ksu_destroy_sepolicy(struct selinux_policy *pol)
 {''',
             c, count=1)
-        if "KSU_DUP_SEPOLICY_COMPAT" in c and c.count("#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)") >= 1:
-            if not c.rstrip().endswith("#endif"):
-                c = c.rstrip() + "\n#endif /* dup_sepolicy */\n"
+        if "KSU_DUP_SEPOLICY_COMPAT" in c and not c.rstrip().endswith("#endif"):
+            c = c.rstrip() + "\n#endif /* dup_sepolicy */\n"
 
     if "KSU_FILENAME_TRANS_GUARD" not in c and "static bool add_filename_trans" in c:
         pat = r'(static\s+bool\s+add_filename_trans\s*\([^)]*\)\s*\{)'
@@ -494,42 +470,36 @@ void ksu_destroy_sepolicy(struct selinux_policy *pol)
 
     write(p, c, o)
 
-# ----- path_mount / path_umount stubs -----
-for rel, name in [
-    ("infra/su_mount_ns.c", "path_mount"),
-    ("feature/kernel_umount.c", "path_umount"),
-]:
+# path_mount / path_umount
+for rel in ["infra/su_mount_ns.c", "feature/kernel_umount.c"]:
     p = os.path.join(root, rel)
     if not os.path.isfile(p):
         continue
     c, o = read(p), None
     o = c
     c = ensure_ver(c)
-    marker = f"KSU_{name.upper()}_STUB_419"
-    if marker not in c and name in c:
+    if "KSU_PATH_MOUNT_STUB_419" not in c and ("path_mount" in c or "path_umount" in c):
         last = 0
         for m in re.finditer(r'#include\s+[<"].*?[>"]\s*\n', c):
             last = m.end()
-        stub = f'''
-#ifndef {marker}
-#define {marker} 1
+        c = c[:last] + '''
+#ifndef KSU_PATH_MOUNT_STUB_419
+#define KSU_PATH_MOUNT_STUB_419 1
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 2, 0)
-/* path_mount / path_umount absents ou non exportés en 4.19 */
 #include <linux/errno.h>
 static inline int ksu_compat_path_mount(const char *dev_name, struct path *path,
 		const char *type, unsigned long flags, void *data)
-{{ (void)dev_name; (void)path; (void)type; (void)flags; (void)data; return -EOPNOTSUPP; }}
+{ (void)dev_name; (void)path; (void)type; (void)flags; (void)data; return -EOPNOTSUPP; }
 static inline int ksu_compat_path_umount(struct path *path, int flags)
-{{ (void)path; (void)flags; return -EOPNOTSUPP; }}
+{ (void)path; (void)flags; return -EOPNOTSUPP; }
 #define path_mount ksu_compat_path_mount
 #define path_umount ksu_compat_path_umount
 #endif
 #endif
-'''
-        c = c[:last] + stub + c[last:]
+''' + c[last:]
         write(p, c, o)
 
-# ----- seccomp_filter_release -----
+# seccomp_filter_release
 p = os.path.join(root, "policy/app_profile.c")
 if os.path.isfile(p):
     c, o = read(p), None
@@ -544,15 +514,14 @@ if os.path.isfile(p):
 #define KSU_SECCOMP_RELEASE_STUB 1
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
 #include <linux/sched.h>
-static inline void ksu_seccomp_filter_release(struct task_struct *tsk)
-{ (void)tsk; }
+static inline void ksu_seccomp_filter_release(struct task_struct *tsk) { (void)tsk; }
 #define seccomp_filter_release ksu_seccomp_filter_release
 #endif
 #endif
 ''' + c[last:]
         write(p, c, o)
 
-# ----- file_wrapper -----
+# file_wrapper
 p = os.path.join(root, "infra/file_wrapper.c")
 if os.path.isfile(p):
     c, o = read(p), None
@@ -583,7 +552,7 @@ if os.path.isfile(p):
         c = re.sub(r'(p->ops\.remap_file_range\s*=[^;]+;)', r'\1\n#endif', c, count=1)
     write(p, c, o)
 
-# ----- pkg_observer -----
+# pkg_observer
 p = os.path.join(root, "manager/pkg_observer.c")
 if os.path.isfile(p):
     c, o = read(p), None
