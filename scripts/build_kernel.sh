@@ -5,7 +5,7 @@ set -euo pipefail
 # FinaSU (LyraVoid) en dur dans le noyau 4.19 — ÉTAPE A : FinaSU seul, hooks Manual
 # Motorola One 5G Ace (kiev) — LineageOS 23.2
 #
-# Stratégie V17 : RÉÉCRITURE COMPLÈTE de pkg_observer.c pour éliminer la dernière erreur
+# Stratégie V18 : Signature fsnotify CORRECTE pour 4.19 (basée sur SUSFS)
 # =============================================================================
 
 FINASU_URL="${FINASU_URL:-https://github.com/LyraVoid/FinaSU.git}"
@@ -17,7 +17,7 @@ VER="finasu-A"
 KSU_REF="$FINASU_REF"
 KSUD_FALLBACK_REF="${KSUD_FALLBACK_REF:-v3.4.2}"
 
-echo "=== Build FinaSU ($FINASU_REF) — Rewrite 4.19 ==="
+echo "=== Build FinaSU ($FINASU_REF) — Final Victory 4.19 ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -200,9 +200,9 @@ else
     echo "⚠️ AUCUNE signature de manager fournie ou calculée" | tee -a "$AUDIT"
 fi
 
-# ==================== 4. TRAITEMENT REWRITE ====================
+# ==================== 4. TRAITEMENT FINAL VICTORY ====================
 echo ""
-echo "=== Application des corrections Rewrite ==="
+echo "=== Application des corrections Final Victory ==="
 
 # 4a. Écriture des 4 stubs
 cat > "$KSU_DIR/selinux/rules.c" << 'STUBEOF'
@@ -253,8 +253,8 @@ STUBEOF
 
 echo "✅ 4 stubs écrits"
 
-# 4b. RÉÉCRITURE COMPLÈTE de pkg_observer.c pour 4.19
-echo "✅ Réécriture complète de pkg_observer.c pour 4.19"
+# 4b. RÉÉCRITURE COMPLÈTE de pkg_observer.c avec la BONNE signature pour 4.19
+echo "✅ Réécriture complète de pkg_observer.c avec signature fsnotify correcte pour 4.19"
 cat > "$KSU_DIR/manager/pkg_observer.c" << 'OBSERVEREOF'
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/module.h>
@@ -314,11 +314,27 @@ static void ksu_defer_track_throne(void)
     track_throne(false);
 }
 
-/* Fallback pour noyaux < 5.9 (4.19 inclus) */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
+/* Signature pour noyaux >= 5.9 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+static int ksu_handle_inode_event(struct fsnotify_mark *mark, u32 mask, struct inode *inode, struct inode *dir,
+                                  const struct qstr *file_name, u32 cookie)
+{
+    if (!file_name)
+        return 0;
+    if (mask & FS_ISDIR)
+        return 0;
+    if (file_name->len == 13 && !memcmp(file_name->name, "packages.list", 13)) {
+        pr_info("packages.list detected: %d\n", mask);
+        ksu_defer_track_throne();
+    }
+    return 0;
+}
+/* Signature pour noyaux 4.18 à 5.8 (inclut 4.19) */
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 18, 0)
 static int ksu_handle_event(struct fsnotify_group *group, struct inode *inode,
-                            struct fsnotify_mark *inode_mark, struct fsnotify_mark *vfsmount_mark,
-                            u32 mask, void *data, int data_type, const unsigned char *file_name, u32 cookie)
+                            u32 mask, const void *data, int data_type,
+                            const unsigned char *file_name, u32 cookie,
+                            struct fsnotify_iter_info *iter_info)
 {
     if (!file_name)
         return 0;
@@ -330,16 +346,18 @@ static int ksu_handle_event(struct fsnotify_group *group, struct inode *inode,
     }
     return 0;
 }
+/* Signature pour noyaux < 4.18 */
 #else
-/* Signature moderne pour noyaux >= 5.9 */
-static int ksu_handle_inode_event(struct fsnotify_mark *mark, u32 mask, struct inode *inode, struct inode *dir,
-                                  const struct qstr *file_name, u32 cookie)
+static int ksu_handle_event(struct fsnotify_group *group, struct inode *inode,
+                            struct fsnotify_mark *inode_mark, struct fsnotify_mark *vfsmount_mark,
+                            u32 mask, void *data, int data_type,
+                            const unsigned char *file_name, u32 cookie)
 {
     if (!file_name)
         return 0;
     if (mask & FS_ISDIR)
         return 0;
-    if (file_name->len == 13 && !memcmp(file_name->name, "packages.list", 13)) {
+    if (strlen((const char *)file_name) == 13 && !memcmp(file_name, "packages.list", 13)) {
         pr_info("packages.list detected: %d\n", mask);
         ksu_defer_track_throne();
     }
@@ -523,7 +541,7 @@ for dp, dn, fn in os.walk(root):
                 modified_count += 1
                 print(f"✅ Patché : {os.path.relpath(filepath, root)}")
 
-print(f"\n✅ Traitement Rewrite terminé : {modified_count} fichier(s) modifié(s)")
+print(f"\n✅ Traitement Final Victory terminé : {modified_count} fichier(s) modifié(s)")
 PORTEOF
 
 # ==================== 5. FIX O_CLOEXEC ====================
@@ -718,5 +736,5 @@ cp final_boot.img "output/FinaSU-A-${VER}-boot.img"
 cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
-echo "=== BUILD TERMINÉ ${VER} (FinaSU $KSU_REF, Rewrite 4.19) ==="
+echo "=== BUILD TERMINÉ ${VER} (FinaSU $KSU_REF, Final Victory 4.19) ==="
 ls -lh output/
