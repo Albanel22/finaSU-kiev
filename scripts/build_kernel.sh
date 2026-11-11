@@ -259,7 +259,7 @@ grep -rl "anon_inode_getfile" "$KSU_DIR/" 2>/dev/null | while read -r f; do
 done || true
 
 # ==================== 4b. COMPATIBILITÉ 4.19 (ciblée, minimale) ====================
-echo "=== Correctifs ciblés 4.19 (fs/stat.c + MODULE_IMPORT_NS) ==="
+echo "=== Correctifs ciblés 4.19 (fs/stat.c + MODULE_IMPORT_NS + file_wrapper.c) ==="
 python3 - "$GITHUB_WORKSPACE" <<'FIXEOF' 2>&1 | tee -a "$AUDIT"
 import os, sys
 
@@ -277,13 +277,10 @@ def write(p, c):
         f.write(c)
 
 # --- FIX 1 : fs/stat.c — ajouter l'include susfs_def.h ---
-# Le patch SuSFS utilise STATX_SUS_KSTAT, STATX_SUS_KSTAT_FUSE et
-# susfs_is_current_app_uid() dans fs/stat.c mais oublie l'include.
 p = os.path.join(kernel_root, "fs/stat.c")
 if os.path.isfile(p):
     c = read(p)
     if '#include <linux/susfs_def.h>' not in c:
-        # Insérer après <asm/unistd.h> (contexte connu du patch SuSFS)
         marker = '#include <asm/unistd.h>'
         if marker in c:
             idx = c.index(marker) + len(marker)
@@ -296,7 +293,6 @@ if os.path.isfile(p):
             total += 1
             print(f"  ✅ fs/stat.c: include susfs_def.h ajouté après <asm/unistd.h>")
         else:
-            # Fallback : après le dernier #include du fichier
             lines = c.split('\n')
             last_inc = -1
             for i, ln in enumerate(lines):
@@ -308,12 +304,8 @@ if os.path.isfile(p):
                 write(p, '\n'.join(lines))
                 total += 1
                 print(f"  ✅ fs/stat.c: include susfs_def.h ajouté après dernier include")
-    else:
-        print(f"  - fs/stat.c: include déjà présent")
 
-# --- FIX 2 : FinaSU — wrap MODULE_IMPORT_NS dans #ifdef MODULE_IMPORT_NS ---
-# MODULE_IMPORT_NS n'existe pas sur 4.19 ; sans wrapper, le compilateur
-# l'interprète comme une fonction K&R sans type -> -Werror.
+# --- FIX 2 : MODULE_IMPORT_NS wrappé par #ifdef ---
 if os.path.isdir(ksu_root):
     for dp, dn, fn in os.walk(ksu_root):
         for f in fn:
@@ -344,8 +336,72 @@ if os.path.isdir(ksu_root):
                 write(p, '\n'.join(out))
                 total += 1
                 print(f"  ✅ {os.path.relpath(p, GW)}: MODULE_IMPORT_NS wrappé")
-else:
-    print(f"  ⚠️ {ksu_root} introuvable, MODULE_IMPORT_NS non wrappé")
+
+# --- FIX 3 : file_wrapper.c — guards 4.19 pour iopoll / remap_file_range ---
+# Ces membres de struct file_operations n'existent pas avant 5.0.
+p = os.path.join(ksu_root, "infra/file_wrapper.c")
+if os.path.isfile(p):
+    c = read(p)
+    original = c
+
+    # 3a. Guard l'assignation p->ops.iopoll
+    old = '    p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;'
+    new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)\n'
+           '    p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;\n'
+           '#endif')
+    if old in c and new not in c:
+        c = c.replace(old, new, 1)
+
+    # 3b. Guard l'assignation p->ops.remap_file_range
+    old = '    p->ops.remap_file_range = fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;'
+    new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)\n'
+           '    p->ops.remap_file_range = fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;\n'
+           '#endif')
+    if old in c and new not in c:
+        c = c.replace(old, new, 1)
+
+    # 3c. Enveloppe ksu_wrapper_iopoll (déjà conditionné 6.1, ajouter #if 5.0)
+    old = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)\n'
+           'static int ksu_wrapper_iopoll(struct kiocb *kiocb, struct io_comp_batch *icb, unsigned int v)')
+    new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)\n'
+           '#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)\n'
+           'static int ksu_wrapper_iopoll(struct kiocb *kiocb, struct io_comp_batch *icb, unsigned int v)')
+    if old in c and new not in c:
+        c = c.replace(old, new, 1)
+
+    # Fermeture du #if 5.0 pour iopoll
+    old = '    return orig->f_op->iopoll(kiocb, spin);\n}\n#endif'
+    new = ('    return orig->f_op->iopoll(kiocb, spin);\n}\n#endif\n'
+           '#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0) */')
+    if old in c and '#endif\n#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0) */' not in c:
+        c = c.replace(old, new, 1)
+
+    # 3d. Enveloppe ksu_wrapper_remap_file_range
+    old = ('static loff_t ksu_wrapper_remap_file_range(struct file *file_in, loff_t pos_in, struct file *file_out, loff_t pos_out,\n'
+           '                                           loff_t len, unsigned int remap_flags)\n'
+           '{')
+    new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)\n'
+           'static loff_t ksu_wrapper_remap_file_range(struct file *file_in, loff_t pos_in, struct file *file_out, loff_t pos_out,\n'
+           '                                           loff_t len, unsigned int remap_flags)\n'
+           '{')
+    if old in c and new not in c:
+        c = c.replace(old, new, 1)
+
+    # Fermeture du #if 5.0 pour remap_file_range
+    old = ('        return orig->f_op->remap_file_range(orig, pos_in, file_out, pos_out, len, remap_flags);\n'
+           '    }\n'
+           '}\n')
+    new = ('        return orig->f_op->remap_file_range(orig, pos_in, file_out, pos_out, len, remap_flags);\n'
+           '    }\n'
+           '}\n'
+           '#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0) */\n')
+    if old in c and '#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0) */\n\nstatic int ksu_wrapper_fadvise' not in c:
+        c = c.replace(old, new, 1)
+
+    if c != original:
+        write(p, c)
+        total += 1
+        print(f"  ✅ infra/file_wrapper.c: guards 4.19 appliqués")
 
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
