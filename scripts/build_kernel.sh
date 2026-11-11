@@ -1,6 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
+# GitHub Actions définit déjà cette variable. En exécution locale, utiliser
+# automatiquement le répertoire depuis lequel le script est lancé.
+GITHUB_WORKSPACE="${GITHUB_WORKSPACE:-$PWD}"
+export GITHUB_WORKSPACE
+
 FINASU_URL="${FINASU_URL:-https://github.com/LyraVoid/FinaSU.git}"
 FINASU_REF="${FINASU_REF:-v1.5.0}"
 KERNEL_PIN="${KERNEL_PIN:-9426323c2acd0865fd565a6dd8a9f39f831cbec3}"
