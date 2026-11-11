@@ -5,7 +5,8 @@ set -euo pipefail
 # FinaSU (LyraVoid) en dur dans le noyau 4.19 — ÉTAPE A : FinaSU seul, hooks Manual
 # Motorola One 5G Ace (kiev) — LineageOS 23.2
 #
-# Stratégie V18 : Signature fsnotify CORRECTE pour 4.19 (basée sur SUSFS)
+# Stratégie V19 : Résolution des erreurs de linking en étendant les stubs et
+# en désactivant les fichiers dépendant de fonctions noyau 5.9+
 # =============================================================================
 
 FINASU_URL="${FINASU_URL:-https://github.com/LyraVoid/FinaSU.git}"
@@ -17,7 +18,7 @@ VER="finasu-A"
 KSU_REF="$FINASU_REF"
 KSUD_FALLBACK_REF="${KSUD_FALLBACK_REF:-v3.4.2}"
 
-echo "=== Build FinaSU ($FINASU_REF) — Final Victory 4.19 ==="
+echo "=== Build FinaSU ($FINASU_REF) — Linking Fix 4.19 ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -200,11 +201,43 @@ else
     echo "⚠️ AUCUNE signature de manager fournie ou calculée" | tee -a "$AUDIT"
 fi
 
-# ==================== 4. TRAITEMENT FINAL VICTORY ====================
+# ==================== 4. TRAITEMENT LINKING FIX ====================
 echo ""
-echo "=== Application des corrections Final Victory ==="
+echo "=== Application des corrections Linking Fix ==="
 
-# 4a. Écriture des 4 stubs
+# 4a. Stubs ÉTENDUS pour résoudre les symboles manquants
+
+# selinux_hide.c étendu avec toutes les fonctions appelées
+cat > "$KSU_DIR/feature/selinux_hide.c" << 'STUBEOF'
+#include <linux/version.h>
+#include <linux/printk.h>
+
+bool ksu_selinux_hide_enabled = false;
+bool ksu_selinux_hide_running = false;
+
+int ksu_selinux_hide_enable(void) { return -EOPNOTSUPP; }
+void ksu_selinux_hide_unhook(void) {}
+void initialize_fake_status(void) {}
+
+/* Fonctions appelées par throne_tracker.c */
+void ksu_selinux_hide_init(void) { pr_info("selinux_hide disabled for 4.19\n"); }
+void ksu_selinux_hide_exit(void) {}
+void ksu_selinux_hide_drop_backup_if_unused(void) {}
+void ksu_selinux_hide_handle_post_fs_data(void) {}
+void ksu_selinux_hide_handle_second_stage(void) {}
+STUBEOF
+
+# seccomp_cache.c étendu avec ksu_seccomp_allow_cache
+cat > "$KSU_DIR/infra/seccomp_cache.c" << 'STUBEOF'
+#include <linux/version.h>
+#include <linux/printk.h>
+#include <linux/sched.h>
+
+void ksu_seccomp_cache_init(void) { pr_info("seccomp_cache disabled\n"); }
+void ksu_seccomp_allow_cache(struct task_struct *tsk) { /* no-op for 4.19 */ }
+STUBEOF
+
+# selinux/rules.c et selinux/sepolicy.c (inchangés)
 cat > "$KSU_DIR/selinux/rules.c" << 'STUBEOF'
 #include <linux/version.h>
 #include <linux/printk.h>
@@ -235,26 +268,31 @@ bool ksu_type_member(void *db, const char *src, const char *tgt, const char *cls
 bool ksu_genfscon(void *db, const char *fs_name, const char *path, const char *ctx) { return true; }
 STUBEOF
 
-cat > "$KSU_DIR/feature/selinux_hide.c" << 'STUBEOF'
+# 4b. Stubs pour kernel_umount.c et su_mount_ns.c (fonctions noyau 5.9+)
+cat > "$KSU_DIR/feature/kernel_umount.c" << 'STUBEOF'
 #include <linux/version.h>
 #include <linux/printk.h>
-bool ksu_selinux_hide_enabled = false;
-bool ksu_selinux_hide_running = false;
-int ksu_selinux_hide_enable(void) { return -EOPNOTSUPP; }
-void ksu_selinux_hide_unhook(void) {}
-void initialize_fake_status(void) {}
+
+/* path_umount n'existe pas en 4.19, on désactive cette fonctionnalité */
+int ksu_handle_umount(void) { 
+    pr_info("kernel_umount disabled for 4.19\n");
+    return 0; 
+}
 STUBEOF
 
-cat > "$KSU_DIR/infra/seccomp_cache.c" << 'STUBEOF'
+cat > "$KSU_DIR/infra/su_mount_ns.c" << 'STUBEOF'
 #include <linux/version.h>
 #include <linux/printk.h>
-void ksu_seccomp_cache_init(void) { pr_info("seccomp_cache disabled\n"); }
+
+/* path_mount n'existe pas en 4.19, on désactive cette fonctionnalité */
+void setup_mount_ns(void *profile) { 
+    /* no-op for 4.19 */
+}
 STUBEOF
 
-echo "✅ 4 stubs écrits"
+echo "✅ Stubs étendus écrits"
 
-# 4b. RÉÉCRITURE COMPLÈTE de pkg_observer.c avec la BONNE signature pour 4.19
-echo "✅ Réécriture complète de pkg_observer.c avec signature fsnotify correcte pour 4.19"
+# 4c. RÉÉCRITURE COMPLÈTE de pkg_observer.c avec la BONNE signature pour 4.19
 cat > "$KSU_DIR/manager/pkg_observer.c" << 'OBSERVEREOF'
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/module.h>
@@ -270,7 +308,7 @@ cat > "$KSU_DIR/manager/pkg_observer.c" << 'OBSERVEREOF'
 #include <linux/susfs.h>
 #include <linux/susfs_def.h>
 #endif
-#include "klog.h" // IWYU pragma: keep
+#include "klog.h"
 #include "manager/throne_tracker.h"
 
 #define MASK_SYSTEM (FS_CREATE | FS_MOVE | FS_EVENT_ON_CHILD)
@@ -291,10 +329,6 @@ static void ksu_track_throne_tw_func(struct callback_head *cb)
     if (current->flags & PF_EXITING)
         return;
     track_throne(false);
-#if defined(CONFIG_KSU_SUSFS) && defined(CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER) &&                                      \
-    defined(CMD_SUSFS_SET_PRIORITY_UID_FILTER)
-    susfs_parse_priority_app_strings();
-#endif
 }
 
 static void ksu_defer_track_throne(void)
@@ -314,49 +348,40 @@ static void ksu_defer_track_throne(void)
     track_throne(false);
 }
 
-/* Signature pour noyaux >= 5.9 */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
 static int ksu_handle_inode_event(struct fsnotify_mark *mark, u32 mask, struct inode *inode, struct inode *dir,
                                   const struct qstr *file_name, u32 cookie)
 {
-    if (!file_name)
-        return 0;
-    if (mask & FS_ISDIR)
-        return 0;
+    if (!file_name) return 0;
+    if (mask & FS_ISDIR) return 0;
     if (file_name->len == 13 && !memcmp(file_name->name, "packages.list", 13)) {
         pr_info("packages.list detected: %d\n", mask);
         ksu_defer_track_throne();
     }
     return 0;
 }
-/* Signature pour noyaux 4.18 à 5.8 (inclut 4.19) */
 #elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 18, 0)
 static int ksu_handle_event(struct fsnotify_group *group, struct inode *inode,
                             u32 mask, const void *data, int data_type,
                             const unsigned char *file_name, u32 cookie,
                             struct fsnotify_iter_info *iter_info)
 {
-    if (!file_name)
-        return 0;
-    if (mask & FS_ISDIR)
-        return 0;
+    if (!file_name) return 0;
+    if (mask & FS_ISDIR) return 0;
     if (strlen((const char *)file_name) == 13 && !memcmp(file_name, "packages.list", 13)) {
         pr_info("packages.list detected: %d\n", mask);
         ksu_defer_track_throne();
     }
     return 0;
 }
-/* Signature pour noyaux < 4.18 */
 #else
 static int ksu_handle_event(struct fsnotify_group *group, struct inode *inode,
                             struct fsnotify_mark *inode_mark, struct fsnotify_mark *vfsmount_mark,
                             u32 mask, void *data, int data_type,
                             const unsigned char *file_name, u32 cookie)
 {
-    if (!file_name)
-        return 0;
-    if (mask & FS_ISDIR)
-        return 0;
+    if (!file_name) return 0;
+    if (mask & FS_ISDIR) return 0;
     if (strlen((const char *)file_name) == 13 && !memcmp(file_name, "packages.list", 13)) {
         pr_info("packages.list detected: %d\n", mask);
         ksu_defer_track_throne();
@@ -376,14 +401,10 @@ static const struct fsnotify_ops ksu_ops = {
 static int add_mark_on_inode(struct inode *inode, u32 mask, struct fsnotify_mark **out)
 {
     struct fsnotify_mark *m;
-
     m = kzalloc(sizeof(*m), GFP_KERNEL);
-    if (!m)
-        return -ENOMEM;
-
+    if (!m) return -ENOMEM;
     fsnotify_init_mark(m, g);
     m->mask = mask;
-
     if (fsnotify_add_inode_mark(m, inode, 0)) {
         fsnotify_put_mark(m);
         return -EINVAL;
@@ -401,7 +422,6 @@ static int watch_one_dir(struct watch_dir *wd)
     }
     wd->inode = d_inode(wd->kpath.dentry);
     ihold(wd->inode);
-
     ret = add_mark_on_inode(wd->inode, wd->mask, &wd->mark);
     if (ret) {
         pr_err("Add mark failed for %s (%d)\n", wd->path, ret);
@@ -436,15 +456,12 @@ static struct watch_dir g_watch = { .path = "/data/system", .mask = MASK_SYSTEM 
 int ksu_observer_init(void)
 {
     int ret = 0;
-
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
     g = fsnotify_alloc_group(&ksu_ops, 0);
 #else
     g = fsnotify_alloc_group(&ksu_ops);
 #endif
-    if (IS_ERR(g))
-        return PTR_ERR(g);
-
+    if (IS_ERR(g)) return PTR_ERR(g);
     ret = watch_one_dir(&g_watch);
     pr_info("observer init done\n");
     return 0;
@@ -458,7 +475,9 @@ void __exit ksu_observer_exit(void)
 }
 OBSERVEREOF
 
-# 4c. Corrections Python pour les autres fichiers
+echo "✅ pkg_observer.c réécrit"
+
+# 4d. Corrections Python pour les autres fichiers
 python3 - "$KSU_DIR" <<'PORTEOF' 2>&1 | tee -a "$AUDIT"
 import os, re, sys
 
@@ -487,7 +506,7 @@ def process_file(filepath):
         if '#include <linux/sched/signal.h>' not in content:
             content = '#include <linux/sched/signal.h>\n' + content
 
-    # 3. Corrections spécifiques par fichier
+    # 3. Corrections spécifiques
     if basename == 'init.c':
         if 'MODULE_IMPORT_NS(' in content and 'LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)' not in content:
             old_block = """#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
@@ -506,10 +525,22 @@ MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
                 content = content.replace(old_block, new_block)
 
     elif basename == 'app_profile.c':
+        # Conditionner filter_count ET seccomp_filter_release
         if 'atomic_set(&current->seccomp.filter_count, 0);' in content:
             content = content.replace(
                 'atomic_set(&current->seccomp.filter_count, 0);',
                 '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)\n    atomic_set(&current->seccomp.filter_count, 0);\n#endif'
+            )
+        # Conditionner seccomp_filter_release (n'existe pas en 4.19)
+        if 'seccomp_filter_release(fake);' in content:
+            content = content.replace(
+                'seccomp_filter_release(fake);',
+                '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)\n    seccomp_filter_release(fake);\n#endif'
+            )
+        if 'void seccomp_filter_release(struct task_struct *tsk);' in content:
+            content = content.replace(
+                'void seccomp_filter_release(struct task_struct *tsk);',
+                '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)\nvoid seccomp_filter_release(struct task_struct *tsk);\n#endif'
             )
 
     elif basename == 'file_wrapper.c':
@@ -541,7 +572,7 @@ for dp, dn, fn in os.walk(root):
                 modified_count += 1
                 print(f"✅ Patché : {os.path.relpath(filepath, root)}")
 
-print(f"\n✅ Traitement Final Victory terminé : {modified_count} fichier(s) modifié(s)")
+print(f"\n✅ Traitement Linking Fix terminé : {modified_count} fichier(s) modifié(s)")
 PORTEOF
 
 # ==================== 5. FIX O_CLOEXEC ====================
@@ -551,7 +582,6 @@ FILES_GET_UNUSED=$(grep -rl "get_unused_fd_flags(O_CLOEXEC)" "$KSU_DIR/" 2>/dev/
 if [ -n "$FILES_GET_UNUSED" ]; then
     for f in $FILES_GET_UNUSED; do
         sed -i 's/get_unused_fd_flags(O_CLOEXEC)/get_unused_fd_flags(0)/g' "$f"
-        echo "  ✅ get_unused_fd_flags fixé dans $f"
     done
 fi
 FILES_ANON_INODE=$(grep -rl "anon_inode_getfile" "$KSU_DIR/" 2>/dev/null || true)
@@ -560,7 +590,6 @@ if [ -n "$FILES_ANON_INODE" ]; then
         sed -i 's/O_RDWR | O_CLOEXEC/O_RDWR/g' "$f"
         sed -i 's/O_RDWR|O_CLOEXEC/O_RDWR/g' "$f"
         sed -i 's/, O_CLOEXEC)/)/g' "$f"
-        echo "  ✅ anon_inode_getfile nettoyé dans $f"
     done
 fi
 
@@ -600,12 +629,7 @@ sed -i 's/^# CONFIG_KSU_MANUAL_HOOK is not set$/CONFIG_KSU_MANUAL_HOOK=y/' out/.
 sed -i 's/^CONFIG_KSU_HOOK_TRACEPOINT=y$/# CONFIG_KSU_HOOK_TRACEPOINT is not set/' out/.config
 
 echo "=== État final .config ==="
-{
-    for o in KSU KSU_MANUAL_HOOK KPROBES KALLSYMS_ALL EXT4_FS THREAD_INFO_IN_TASK FTRACE_SYSCALLS; do
-        if grep -q "^CONFIG_${o}=y" out/.config; then echo "  ✅ CONFIG_${o}"; else echo "  ℹ️ CONFIG_${o} absent ou inactif"; fi
-    done
-    true
-} 2>&1 | tee -a "$AUDIT"
+grep -E "^CONFIG_KSU=|^CONFIG_KSU_MANUAL_HOOK=" out/.config || echo "❌ ERREUR CRITIQUE"
 
 if ! grep -q "^CONFIG_KSU=y" out/.config; then
     echo "❌ CONFIG_KSU non activé" | tee -a "$AUDIT"
@@ -736,5 +760,5 @@ cp final_boot.img "output/FinaSU-A-${VER}-boot.img"
 cp kernel_sources/build.log output/
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
 echo ""
-echo "=== BUILD TERMINÉ ${VER} (FinaSU $KSU_REF, Final Victory 4.19) ==="
+echo "=== BUILD TERMINÉ ${VER} (FinaSU $KSU_REF, Linking Fix 4.19) ==="
 ls -lh output/
