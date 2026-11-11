@@ -259,7 +259,7 @@ grep -rl "anon_inode_getfile" "$KSU_DIR/" 2>/dev/null | while read -r f; do
 done || true
 
 # ==================== 4b. COMPATIBILITÉ 4.19 (ciblée, minimale) ====================
-echo "=== Correctifs ciblés 4.19 (fs/stat.c + MODULE_IMPORT_NS + file_wrapper.c) ==="
+echo "=== Correctifs ciblés 4.19 (fs/stat.c + MODULE_IMPORT_NS + file_wrapper.c + seccomp_cache.c + su_mount_ns.c) ==="
 python3 - "$GITHUB_WORKSPACE" <<'FIXEOF' 2>&1 | tee -a "$AUDIT"
 import os, sys
 
@@ -338,13 +338,11 @@ if os.path.isdir(ksu_root):
                 print(f"  ✅ {os.path.relpath(p, GW)}: MODULE_IMPORT_NS wrappé")
 
 # --- FIX 3 : file_wrapper.c — guards 4.19 pour iopoll / remap_file_range ---
-# Ces membres de struct file_operations n'existent pas avant 5.0.
 p = os.path.join(ksu_root, "infra/file_wrapper.c")
 if os.path.isfile(p):
     c = read(p)
     original = c
 
-    # 3a. Guard l'assignation p->ops.iopoll
     old = '    p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;'
     new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)\n'
            '    p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;\n'
@@ -352,7 +350,6 @@ if os.path.isfile(p):
     if old in c and new not in c:
         c = c.replace(old, new, 1)
 
-    # 3b. Guard l'assignation p->ops.remap_file_range
     old = '    p->ops.remap_file_range = fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;'
     new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)\n'
            '    p->ops.remap_file_range = fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;\n'
@@ -360,7 +357,6 @@ if os.path.isfile(p):
     if old in c and new not in c:
         c = c.replace(old, new, 1)
 
-    # 3c. Enveloppe ksu_wrapper_iopoll (déjà conditionné 6.1, ajouter #if 5.0)
     old = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)\n'
            'static int ksu_wrapper_iopoll(struct kiocb *kiocb, struct io_comp_batch *icb, unsigned int v)')
     new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)\n'
@@ -369,14 +365,12 @@ if os.path.isfile(p):
     if old in c and new not in c:
         c = c.replace(old, new, 1)
 
-    # Fermeture du #if 5.0 pour iopoll
     old = '    return orig->f_op->iopoll(kiocb, spin);\n}\n#endif'
     new = ('    return orig->f_op->iopoll(kiocb, spin);\n}\n#endif\n'
            '#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0) */')
     if old in c and '#endif\n#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0) */' not in c:
         c = c.replace(old, new, 1)
 
-    # 3d. Enveloppe ksu_wrapper_remap_file_range
     old = ('static loff_t ksu_wrapper_remap_file_range(struct file *file_in, loff_t pos_in, struct file *file_out, loff_t pos_out,\n'
            '                                           loff_t len, unsigned int remap_flags)\n'
            '{')
@@ -387,7 +381,6 @@ if os.path.isfile(p):
     if old in c and new not in c:
         c = c.replace(old, new, 1)
 
-    # Fermeture du #if 5.0 pour remap_file_range
     old = ('        return orig->f_op->remap_file_range(orig, pos_in, file_out, pos_out, len, remap_flags);\n'
            '    }\n'
            '}\n')
@@ -403,10 +396,7 @@ if os.path.isfile(p):
         total += 1
         print(f"  ✅ infra/file_wrapper.c: guards 4.19 appliqués")
 
-	# --- FIX 4 : seccomp_cache.c — SECCOMP_ARCH_NATIVE_NR pour 4.19 ---
-# Cette macro (introduite avec le cache BPF seccomp en 5.9) n'existe pas
-# dans les headers 4.19. On la définit localement avec la valeur correcte
-# pour arm64 : 2 si CONFIG_COMPAT (AArch64 + AArch32), 1 sinon.
+# --- FIX 4 : seccomp_cache.c — SECCOMP_ARCH_NATIVE_NR pour 4.19 ---
 p = os.path.join(ksu_root, "infra/seccomp_cache.c")
 if os.path.isfile(p):
     c = read(p)
@@ -422,7 +412,6 @@ if os.path.isfile(p):
             '#endif\n'
             '#endif\n'
             '#endif\n')
-        # Insérer après le dernier #include du fichier
         lines = c.split('\n')
         last_inc = -1
         for i, ln in enumerate(lines):
@@ -438,6 +427,24 @@ if os.path.isfile(p):
             write(p, c)
             total += 1
             print(f"  ✅ infra/seccomp_cache.c: SECCOMP_ARCH_NATIVE_NR défini (préfixe)")
+
+# --- FIX 5 : su_mount_ns.c — guard uapi/linux/mount.h ---
+p = os.path.join(ksu_root, "infra/su_mount_ns.c")
+if os.path.isfile(p):
+    c = read(p)
+    if '#include <uapi/linux/mount.h>' in c and 'KSU_MOUNT_HDR_COMPAT' not in c:
+        c = c.replace(
+            '#include <uapi/linux/mount.h>',
+            '#include <linux/version.h>\n'
+            '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0)\n'
+            '#include <uapi/linux/mount.h>\n'
+            '#else\n'
+            '#include <linux/mount.h>\n'
+            '#endif\n'
+            '#define KSU_MOUNT_HDR_COMPAT 1')
+        write(p, c)
+        total += 1
+        print(f"  ✅ infra/su_mount_ns.c: uapi/linux/mount.h guardé pour 4.19")
 
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
