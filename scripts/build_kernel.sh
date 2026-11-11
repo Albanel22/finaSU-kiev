@@ -633,6 +633,93 @@ if os.path.isdir(ksu_root):
                 write(p, c); total += 1
                 print(f"  ✅ {os.path.relpath(p, GW)}: TWA_RESUME + sched/task.h")
 
+            # --- FIX 8 : filter_count — absent avant 5.9, stubs fonction/ligne ---
+# `struct seccomp.filter_count` a été ajouté en 5.9. Pour les noyaux
+# antérieurs, on stubbe la(les) fonction(s) qui y accèdent, avec fallback
+# ligne-par-ligne (pattern validé Option A → 0 erreur).
+import re as _re
+if os.path.isdir(ksu_root):
+    for dp, dn, fn in os.walk(ksu_root):
+        for f in fn:
+            if not f.endswith(('.c', '.h')): continue
+            p = os.path.join(dp, f)
+            try: c = read(p)
+            except Exception: continue
+            if 'filter_count' not in c or 'KSU_FILTER_COUNT_COMPAT' in c:
+                continue
+
+            # --- Étape A : trouver et wrapper la fonction complète si possible ---
+            lines = c.split('\n')
+            new_lines = []
+            i = 0
+            wrapped = False
+            while i < len(lines):
+                line = lines[i]
+                is_func_start = bool(_re.match(r'^\s*(static\s+)?[\w\*\s]+?\s+\w+\s*\(', line))
+                if is_func_start:
+                    depth = 0
+                    started = False
+                    end_line = -1
+                    j = i
+                    while j < len(lines):
+                        for ch in lines[j]:
+                            if ch == '{':
+                                depth += 1; started = True
+                            elif ch == '}':
+                                depth -= 1
+                                if started and depth == 0:
+                                    end_line = j; break
+                        if end_line >= 0: break
+                        j += 1
+                    if end_line > 0:
+                        body = '\n'.join(lines[i:end_line + 1])
+                        if 'filter_count' in body:
+                            name_m = _re.search(r'\b(\w+)\s*\(', line)
+                            func_name = name_m.group(1) if name_m else None
+                            ret_m = _re.match(r'^\s*(static\s+)?([\w\*\s]+?)\s+' + (func_name or '') + r'\s*\(', line)
+                            ret_type = ret_m.group(2).strip() if ret_m else 'int'
+                            if func_name and ret_type:
+                                new_lines.append('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)')
+                                new_lines.extend(lines[i:end_line + 1])
+                                new_lines.append('#else')
+                                new_lines.append(f'static {ret_type} {func_name}(void) {{ return 0; }}')
+                                new_lines.append('#endif')
+                                wrapped = True
+                                i = end_line + 1
+                                continue
+                new_lines.append(line)
+                i += 1
+            c = '\n'.join(new_lines)
+
+            # --- Étape B : fallback ligne-par-ligne si aucune fonction wrappée ---
+            if not wrapped:
+                out = []
+                for ln in c.split('\n'):
+                    s = ln.strip()
+                    if 'filter_count' in ln and not s.startswith(('/', '#', '*')):
+                        out.append('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)')
+                        out.append(ln)
+                        out.append('#else')
+                        out.append('\treturn 0;' if 'return' in ln else '\t/* filter_count absent avant 5.9 */')
+                        out.append('#endif')
+                    else:
+                        out.append(ln)
+                c = '\n'.join(out)
+
+            # --- ensure version.h ---
+            if '#include <linux/version.h>' not in c:
+                lines = c.split('\n')
+                for i, ln in enumerate(lines):
+                    if ln.lstrip().startswith('#include'):
+                        lines.insert(i + 1, '#include <linux/version.h>')
+                        break
+                c = '\n'.join(lines)
+            c = c.replace('#include <linux/version.h>',
+                           '#include <linux/version.h>\n#define KSU_FILTER_COUNT_COMPAT 1', 1)
+            write(p, c)
+            total += 1
+            print(f"  ✅ {os.path.relpath(p, GW)}: filter_count guardé")
+
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
 
