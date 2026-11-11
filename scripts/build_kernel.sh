@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # FinaSU (LyraVoid) — noyau 4.19 — ÉTAPE A (Tracepoint, sans SuSFS)
-# Complet : manager GDrive + file_wrapper + pkg_observer (proto 4.19)
+# Complet : manager GDrive + non-SELinux + sepolicy dual-path 4.19
 # =============================================================================
 
 export GITHUB_WORKSPACE="${GITHUB_WORKSPACE:-$PWD}"
@@ -431,7 +431,7 @@ def ensure_inc(c, inc):
 def ensure_ver(c):
     return c if 'linux/version.h' in c else ensure_inc(c, '<linux/version.h>')
 
-# selinux_hide
+# ----- selinux_hide -----
 p = os.path.join(root, "feature/selinux_hide.c")
 if os.path.isfile(p):
     c, o = read(p), None
@@ -449,24 +449,156 @@ if os.path.isfile(p):
         c = h + c + "\n#endif\n"
         write(p, c, o)
 
-# sepolicy add_filename_trans
+# ----- sepolicy.c dual-path 4.19 -----
 p = os.path.join(root, "selinux/sepolicy.c")
 if os.path.isfile(p):
     c, o = read(p), None
     o = c
-    if "KSU_FILENAME_TRANS_GUARD" not in c:
-        c = ensure_ver(c)
+    c = ensure_ver(c)
+
+    # remove_avtab_node : pas de walk htable sur flex_array
+    if "KSU_REMOVE_AVTAB_COMPAT" not in c and "static bool remove_avtab_node" in c:
+        c = re.sub(
+            r'static bool remove_avtab_node\s*\(\s*struct policydb \*db\s*,\s*struct avtab_node \*node\s*\)\s*\{',
+            '''#define KSU_REMOVE_AVTAB_COMPAT 1
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
+static bool remove_avtab_node(struct policydb *db, struct avtab_node *node)
+{
+	(void)db;
+	(void)node;
+	return true;
+}
+#else
+static bool remove_avtab_node(struct policydb *db, struct avtab_node *node)
+{''',
+            c, count=1)
+        # fermer le #else avant la fonction suivante (add_rule)
+        c = re.sub(
+            r'(static bool remove_avtab_node[\s\S]*?\n\}\s*\n)(static bool add_rule\s*\()',
+            r'\1#endif /* remove_avtab_node dual */\n\n\2',
+            c, count=1)
+
+    # add_type simplifié < 5.10
+    if "KSU_ADD_TYPE_COMPAT_419" not in c and "static bool add_type" in c:
+        c = re.sub(
+            r'static bool add_type\s*\(\s*struct policydb \*db\s*,\s*const char \*type_name\s*,\s*bool attr\s*\)\s*\{',
+            r'''#define KSU_ADD_TYPE_COMPAT_419 1
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+static bool add_type(struct policydb *db, const char *type_name, bool attr)
+{
+	struct type_datum *type;
+	char *key;
+	u32 value;
+
+	type = symtab_search(&db->p_types, type_name);
+	if (type) {
+		pr_warn("Type %s already exists\\n", type_name);
+		return true;
+	}
+	value = ++db->p_types.nprim;
+	type = kzalloc(sizeof(*type), GFP_KERNEL);
+	if (!type)
+		return false;
+	type->primary = 1;
+	type->value = value;
+	type->attribute = attr;
+	key = kstrdup(type_name, GFP_KERNEL);
+	if (!key) {
+		kfree(type);
+		return false;
+	}
+	if (symtab_insert(&db->p_types, key, type)) {
+		kfree(key);
+		kfree(type);
+		return false;
+	}
+	return true;
+}
+#else
+static bool add_type(struct policydb *db, const char *type_name, bool attr)
+{''',
+            c, count=1)
+        c = re.sub(
+            r'(static bool add_type[\s\S]*?return true;\s*\n\}\s*\n)(static bool set_type_state\s*\()',
+            r'\1#endif /* add_type dual */\n\n\2',
+            c, count=1)
+
+    # add_typeattribute_raw no-op < 5.10
+    if "KSU_TYPEATTR_RAW_COMPAT" not in c and "static void add_typeattribute_raw" in c:
+        c = re.sub(
+            r'static void add_typeattribute_raw\s*\(\s*struct policydb \*db\s*,\s*struct type_datum \*type\s*,\s*struct type_datum \*attr\s*\)\s*\{',
+            r'''#define KSU_TYPEATTR_RAW_COMPAT 1
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+static void add_typeattribute_raw(struct policydb *db, struct type_datum *type, struct type_datum *attr)
+{
+	(void)db;
+	(void)type;
+	(void)attr;
+}
+#else
+static void add_typeattribute_raw(struct policydb *db, struct type_datum *type, struct type_datum *attr)
+{''',
+            c, count=1)
+        c = re.sub(
+            r'(static void add_typeattribute_raw[\s\S]*?\n\}\s*;\s*\n\}\s*\n)(static bool add_typeattribute\s*\()',
+            r'\1#endif /* typeattr_raw dual */\n\n\2',
+            c, count=1)
+        # fallback si le pattern de fermeture diffère
+        if "typeattr_raw dual" not in c:
+            c = re.sub(
+                r'(static void add_typeattribute_raw[\s\S]*?\n\}\s*\n)(static bool add_typeattribute\s*\()',
+                r'\1#endif /* typeattr_raw dual */\n\n\2',
+                c, count=1)
+
+    # ksu_destroy / ksu_dup stubs < 5.10
+    if "KSU_DUP_SEPOLICY_COMPAT" not in c and "ksu_dup_sepolicy" in c:
+        c = re.sub(
+            r'void ksu_destroy_sepolicy\s*\(\s*struct selinux_policy \*pol\s*\)\s*\{',
+            r'''#define KSU_DUP_SEPOLICY_COMPAT 1
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+void ksu_destroy_sepolicy(struct selinux_policy *pol)
+{
+	(void)pol;
+}
+struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)
+{
+	(void)old_pol;
+	return ERR_PTR(-EOPNOTSUPP);
+}
+#else
+void ksu_destroy_sepolicy(struct selinux_policy *pol)
+{''',
+            c, count=1)
+        # fermer à la fin du fichier après ksu_dup_sepolicy
+        if c.rstrip().endswith('}'):
+            # s'assurer d'un #endif final si dual ouvert
+            if c.count('#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)') > c.count('#endif /* dup_sepolicy'):
+                # fermer après la dernière fonction ksu_dup
+                c = re.sub(
+                    r'(struct selinux_policy \*ksu_dup_sepolicy[\s\S]*return ERR_PTR\(ret\);\s*\n\})',
+                    r'\1\n#endif /* dup_sepolicy dual */\n',
+                    c, count=1)
+                # le #else path a ksu_destroy + ksu_dup; le regex ci-dessus peut matcher le stub.
+                # Si double match raté, ajouter #endif en fin de fichier
+                if "dup_sepolicy dual" not in c:
+                    c = c.rstrip() + "\n#endif /* dup_sepolicy dual */\n"
+
+    # add_filename_trans stub si pas déjà gardé
+    if "KSU_FILENAME_TRANS_GUARD" not in c and "static bool add_filename_trans" in c:
         pat = r'(static\s+bool\s+add_filename_trans\s*\([^)]*\)\s*\{)'
         if re.search(pat, c):
-            c = re.sub(pat, r'#define KSU_FILENAME_TRANS_GUARD 1\n#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)\n\1', c, count=1)
-            c = re.sub(
-                r'(#if LINUX_VERSION_CODE >= KERNEL_VERSION\(5, 8, 0\)\nstatic bool add_filename_trans[\s\S]*?\n\})',
-                r'\1\n#else\nstatic bool add_filename_trans(struct policydb *db, const char *s, const char *t,\n'
-                r' const char *cls, const char *d, const char *o) { return true; }\n#endif',
+            c = re.sub(pat,
+                r'#define KSU_FILENAME_TRANS_GUARD 1\n#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)\n\1',
                 c, count=1)
-        write(p, c, o)
+            c = re.sub(
+                r'(#if LINUX_VERSION_CODE >= KERNEL_VERSION\(5, 8, 0\)\nstatic bool add_filename_trans[\s\S]*?\n\}\s*\n)(static bool add_genfscon)',
+                r'\1#else\nstatic bool add_filename_trans(struct policydb *db, const char *s, const char *t,\n'
+                r' const char *cls, const char *d, const char *o) { (void)db;(void)s;(void)t;(void)cls;(void)d;(void)o; return true; }\n#endif\n\n\2',
+                c, count=1)
 
-# file_wrapper iopoll + remap
+    write(p, c, o)
+
+# ----- file_wrapper -----
 p = os.path.join(root, "infra/file_wrapper.c")
 if os.path.isfile(p):
     c, o = read(p), None
@@ -477,10 +609,7 @@ if os.path.isfile(p):
             r'^(\s*p->ops\.iopoll\s*=)',
             r'#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n\1',
             c, count=1, flags=re.M)
-        c2 = re.sub(
-            r'(p->ops\.iopoll\s*=[^;]+;)',
-            r'\1\n#endif',
-            c2, count=1)
+        c2 = re.sub(r'(p->ops\.iopoll\s*=[^;]+;)', r'\1\n#endif', c2, count=1)
         m = re.search(
             r'(#if\s+LINUX_VERSION_CODE\s*>=\s*KERNEL_VERSION\(\s*6\s*,\s*1\s*,\s*0\s*\)\s*\n'
             r'static int ksu_wrapper_iopoll[\s\S]*?'
@@ -490,9 +619,7 @@ if os.path.isfile(p):
             block = m.group(1)
             c2 = c2[:m.start()] + (
                 '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n'
-                '#define KSU_IOPOLL_WRAPPED_519 1\n'
-                + block +
-                '\n#endif\n'
+                '#define KSU_IOPOLL_WRAPPED_519 1\n' + block + '\n#endif\n'
             ) + c2[m.end():]
         c = c2
     if "KSU_REMAP_WRAPPED_420" not in c and "ksu_wrapper_remap_file_range" in c:
@@ -512,13 +639,10 @@ if os.path.isfile(p):
             r'^(\s*p->ops\.remap_file_range\s*=)',
             r'#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n\1',
             c, count=1, flags=re.M)
-        c = re.sub(
-            r'(p->ops\.remap_file_range\s*=[^;]+;)',
-            r'\1\n#endif',
-            c, count=1)
+        c = re.sub(r'(p->ops\.remap_file_range\s*=[^;]+;)', r'\1\n#endif', c, count=1)
     write(p, c, o)
 
-# pkg_observer dual-path — proto 4.19 (group, inode, u32, const unsigned char *)
+# ----- pkg_observer proto 4.19 -----
 p = os.path.join(root, "manager/pkg_observer.c")
 if os.path.isfile(p):
     c, o = read(p), None
@@ -529,9 +653,7 @@ if os.path.isfile(p):
             r'static int ksu_handle_inode_event\s*\([^;{]*\)\s*\{[\s\S]*?\n\}'
             r'\s*static const struct fsnotify_ops ksu_ops\s*=\s*\{[\s\S]*?\};',
             '',
-            c,
-            count=1,
-        )
+            c, count=1)
         insert = '''
 #define KSU_FSNOTIFY_DUAL_PATH 1
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0)
@@ -554,7 +676,6 @@ static const struct fsnotify_ops ksu_ops = {
 	.handle_inode_event = ksu_handle_inode_event,
 };
 #else
-/* Linux 4.19 : handle_event(group, inode, mask, data, data_type, file_name, cookie, iter) */
 static int ksu_handle_event(struct fsnotify_group *group, struct inode *inode,
 			    u32 mask, const void *data, int data_type,
 			    const unsigned char *file_name, u32 cookie,
@@ -589,7 +710,7 @@ static const struct fsnotify_ops ksu_ops = {
             c = c[:last] + "\n#ifndef TWA_RESUME\n#define TWA_RESUME 0\n#endif\n" + c[last:]
         write(p, c, o)
 
-# TWA_RESUME autres
+# TWA_RESUME
 TWA = '\n#ifndef TWA_RESUME\n#define TWA_RESUME 0\n#endif\n'
 for rel in ['manager/dynamic_manager.c', 'policy/allowlist.c', 'supercall/supercall.c']:
     p = os.path.join(root, rel)
