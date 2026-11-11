@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # FinaSU (LyraVoid) — noyau 4.19 — ÉTAPE A (Tracepoint, sans SuSFS)
-# Complet : manager GDrive + non-SELinux + sepolicy dual-path 4.19
+# Compile OK + correctifs link : hide stubs, policydb, path_*, seccomp
 # =============================================================================
 
 export GITHUB_WORKSPACE="${GITHUB_WORKSPACE:-$PWD}"
@@ -56,6 +56,9 @@ for l in txt:
         continue
     u = re.search(r'undefined (?:symbol|reference to)[: ]+[`]?([^\s\'`]+)', l)
     if u: undefined[u.group(1)] += 1
+    if 'undefined symbol:' in l:
+        u2 = re.search(r'undefined symbol:\s*(\S+)', l)
+        if u2: undefined[u2.group(1)] += 1
     t = re.search(r'\*\*\* \[[^\]]*?:(\d+): ([^\]]+)\] Error', l)
     if t and t.group(2) not in targets: targets.append(t.group(2))
 print(f"erreurs : {total}   fichiers touchés : {len(per_file)}   messages distincts : {len(per_msg)}")
@@ -173,7 +176,7 @@ else
     echo "⚠️ AUCUNE signature de manager fournie" | tee -a "$AUDIT"
 fi
 
-# ==================== 3g/3h exports + O_CLOEXEC ====================
+# ==================== 3g/3h exports SELinux + policydb ====================
 [ -f "security/selinux/selinuxfs.c" ] && {
     sed -i 's/^static ssize_t (\*write_op\[\])/ssize_t (*write_op[])/' security/selinux/selinuxfs.c
     sed -i 's/^static const struct file_operations sel_handle_status_ops/const struct file_operations sel_handle_status_ops/' security/selinux/selinuxfs.c
@@ -183,8 +186,25 @@ fi
     sed -i 's/^static struct page \*selinux_status_page/struct page *selinux_status_page/' security/selinux/ss/status.c
     sed -i 's/^static DEFINE_MUTEX(selinux_status_lock)/DEFINE_MUTEX(selinux_status_lock)/' security/selinux/ss/status.c
 }
-[ -f "security/selinux/ss/services.c" ] && sed -i 's/^static DEFINE_RWLOCK(policy_rwlock)/DEFINE_RWLOCK(policy_rwlock)/' security/selinux/ss/services.c
+[ -f "security/selinux/ss/services.c" ] && {
+    sed -i 's/^static DEFINE_RWLOCK(policy_rwlock)/DEFINE_RWLOCK(policy_rwlock)/' security/selinux/ss/services.c
+    # Exporter policydb global si présent en static
+    sed -i 's/^static struct policydb policydb;/struct policydb policydb;/' security/selinux/ss/services.c
+    sed -i 's/^static struct policydb\tpolicydb;/struct policydb policydb;/' security/selinux/ss/services.c
+}
+# Certains trees ont policydb dans un autre fichier
+for f in security/selinux/ss/*.c security/selinux/*.c; do
+    [ -f "$f" ] || continue
+    sed -i 's/^static struct policydb policydb;/struct policydb policydb;/' "$f" 2>/dev/null || true
+done
 [ -f "security/selinux/hooks.c" ] && sed -i 's/^static struct security_operations selinux_ops/struct security_operations selinux_ops/' security/selinux/hooks.c
+
+# Exporter path_mount / path_umount si présents en static (rare en 4.19)
+for f in fs/namespace.c fs/mount.c; do
+    [ -f "$f" ] || continue
+    sed -i 's/^static int path_mount(/int path_mount(/' "$f" 2>/dev/null || true
+    sed -i 's/^static int path_umount(/int path_umount(/' "$f" 2>/dev/null || true
+done
 
 grep -rl "get_unused_fd_flags(O_CLOEXEC)" "$KSU_DIR/" 2>/dev/null | while read -r f; do
     sed -i 's/get_unused_fd_flags(O_CLOEXEC)/get_unused_fd_flags(0)/g' "$f"
@@ -196,6 +216,7 @@ done || true
 # ==================== 4b. PORTAGE ====================
 echo "=== Portage 4.19 ==="
 
+# rules.c : policydb via selinux_state.ss en priorité (Android 4.19)
 cat > "$KSU_DIR/selinux/rules.c" << 'RULESEOF'
 #include "linux/rcupdate.h"
 #include "security.h"
@@ -217,36 +238,50 @@ cat > "$KSU_DIR/selinux/rules.c" << 'RULESEOF'
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 struct selinux_policy *backup_sepolicy = NULL;
+
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
 extern int avc_ss_reset(u32 seqno);
 #else
 extern int avc_ss_reset(struct selinux_avc *avc, u32 seqno);
 #endif
+
 static void reset_avc_cache(u32 seqno)
 {
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
-	avc_ss_reset(seqno); selnl_notify_policyload(seqno);
+	avc_ss_reset(seqno);
+	selnl_notify_policyload(seqno);
 #else
 	struct selinux_avc *avc = selinux_state.avc;
-	if (avc) avc_ss_reset(avc, seqno);
+	if (avc)
+		avc_ss_reset(avc, seqno);
 	selnl_notify_policyload(seqno);
 #endif
 	selinux_xfrm_notify_policyload();
 }
+
 static struct policydb *ksu_get_policydb(void)
 {
-#if defined(KSU_COMPAT_USE_SELINUX_STATE)
-	return &selinux_state.ss->policydb;
-#else
-	extern struct policydb policydb;
-	return &policydb;
+	/*
+	 * Android 4.19 typique : policydb dans selinux_state.ss
+	 * Fallback : symbole global exporté par le script (static retiré)
+	 */
+#if defined(CONFIG_SECURITY_SELINUX)
+	if (selinux_state.ss)
+		return &selinux_state.ss->policydb;
 #endif
+	{
+		extern struct policydb policydb;
+		return &policydb;
+	}
 }
+
 void apply_kernelsu_rules(void)
 {
 	struct policydb *db = ksu_get_policydb();
+
 	if (!getenforce())
 		pr_info("SELinux permissive or disabled, apply rules! (old kernel path)\n");
+
 	ksu_type(db, KERNEL_SU_DOMAIN, "domain");
 	ksu_permissive(db, KERNEL_SU_DOMAIN);
 	ksu_typeattribute(db, KERNEL_SU_DOMAIN, "mlstrustedsubject");
@@ -289,119 +324,20 @@ void apply_kernelsu_rules(void)
 	reset_avc_cache(0);
 	pr_info("KernelSU rules applied (4.19 compatibility path)\n");
 }
+
 int handle_sepolicy(void __user *user_data, u64 data_len)
 {
 	pr_info("handle_sepolicy not supported on kernel < 5.10\n");
 	return -EOPNOTSUPP;
 }
 #else
+/* chemin moderne inchangé — non compilé sur 4.19 */
 struct selinux_policy *backup_sepolicy;
-#define SELINUX_POLICY_INSTEAD_SELINUX_SS
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
-extern int avc_ss_reset(u32 seqno);
-#else
-extern int avc_ss_reset(struct selinux_avc *avc, u32 seqno);
-#endif
-static void reset_avc_cache(u32 seqno)
-{
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
-	avc_ss_reset(seqno); selnl_notify_policyload(seqno); selinux_status_update_policyload(seqno);
-#else
-	struct selinux_avc *avc = selinux_state.avc;
-	avc_ss_reset(avc, seqno); selnl_notify_policyload(seqno);
-	selinux_status_update_policyload(&selinux_state, seqno);
-#endif
-	selinux_xfrm_notify_policyload();
-}
-void apply_kernelsu_rules(void)
-{
-	struct selinux_policy *pol, *old_pol;
-	struct policydb *db;
-	if (!getenforce()) pr_info("SELinux permissive or disabled, apply rules!\n");
-	mutex_lock(&selinux_state.policy_mutex);
-	old_pol = rcu_dereference_protected(selinux_state.policy, lockdep_is_held(&selinux_state.policy_mutex));
-	backup_sepolicy = ksu_dup_sepolicy(old_pol);
-	if (IS_ERR(backup_sepolicy)) backup_sepolicy = NULL;
-	else {
-		backup_sepolicy->sidtab = kzalloc(sizeof(*backup_sepolicy->sidtab), GFP_KERNEL);
-		if (!backup_sepolicy->sidtab) { ksu_destroy_sepolicy(backup_sepolicy); backup_sepolicy = NULL; }
-		else if (policydb_load_isids(&backup_sepolicy->policydb, backup_sepolicy->sidtab)) {
-			kfree(backup_sepolicy->sidtab); ksu_destroy_sepolicy(backup_sepolicy); backup_sepolicy = NULL;
-		}
-	}
-	pol = ksu_dup_sepolicy(old_pol);
-	if (IS_ERR(pol)) goto out_unlock;
-	db = &pol->policydb;
-	pol->latest_granting = old_pol->latest_granting + 1;
-	ksu_set_original_types(db, &old_pol->policydb, pol->latest_granting);
-	ksu_type(db, KERNEL_SU_DOMAIN, "domain");
-	ksu_permissive(db, KERNEL_SU_DOMAIN);
-	ksu_typeattribute(db, KERNEL_SU_DOMAIN, "mlstrustedsubject");
-	ksu_typeattribute(db, KERNEL_SU_DOMAIN, "netdomain");
-	ksu_typeattribute(db, KERNEL_SU_DOMAIN, "bluetoothdomain");
-	ksu_type(db, KERNEL_SU_FILE, "file_type");
-	ksu_typeattribute(db, KERNEL_SU_FILE, "mlstrustedobject");
-	ksu_allow(db, "domain", KERNEL_SU_FILE, ALL, ALL);
-	ksu_allow(db, KERNEL_SU_DOMAIN, ALL, ALL, ALL);
-	if (db->policyvers >= POLICYDB_VERSION_XPERMS_IOCTL) {
-		ksu_allowxperm(db, KERNEL_SU_DOMAIN, ALL, "blk_file", ALL);
-		ksu_allowxperm(db, KERNEL_SU_DOMAIN, ALL, "fifo_file", ALL);
-		ksu_allowxperm(db, KERNEL_SU_DOMAIN, ALL, "chr_file", ALL);
-		ksu_allowxperm(db, KERNEL_SU_DOMAIN, ALL, "file", ALL);
-	}
-	ksu_allow(db, "init", KERNEL_SU_DOMAIN, ALL, ALL);
-	ksu_allow(db, "servicemanager", KERNEL_SU_DOMAIN, "dir", "search");
-	ksu_allow(db, "servicemanager", KERNEL_SU_DOMAIN, "dir", "read");
-	ksu_allow(db, "servicemanager", KERNEL_SU_DOMAIN, "file", "open");
-	ksu_allow(db, "servicemanager", KERNEL_SU_DOMAIN, "file", "read");
-	ksu_allow(db, "servicemanager", KERNEL_SU_DOMAIN, "process", "getattr");
-	ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "process", "sigchld");
-	ksu_allow(db, "logd", KERNEL_SU_DOMAIN, "dir", "search");
-	ksu_allow(db, "logd", KERNEL_SU_DOMAIN, "file", "read");
-	ksu_allow(db, "logd", KERNEL_SU_DOMAIN, "file", "open");
-	ksu_allow(db, "logd", KERNEL_SU_DOMAIN, "file", "getattr");
-	ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "fd", "use");
-	ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "fifo_file", "write");
-	ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "fifo_file", "read");
-	ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "fifo_file", "open");
-	ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "fifo_file", "getattr");
-	ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "read");
-	ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "write");
-	ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "connectto");
-	ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "getopt");
-	ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "getattr");
-	ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "memfd_file", "execute");
-	ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "memfd_file", "getattr");
-	ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "memfd_file", "map");
-	ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "memfd_file", "read");
-	ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "memfd_file", "write");
-	ksu_allow(db, "hwservicemanager", KERNEL_SU_DOMAIN, "dir", "search");
-	ksu_allow(db, "hwservicemanager", KERNEL_SU_DOMAIN, "file", "read");
-	ksu_allow(db, "hwservicemanager", KERNEL_SU_DOMAIN, "file", "open");
-	ksu_allow(db, "hwservicemanager", KERNEL_SU_DOMAIN, "process", "getattr");
-	ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "binder", ALL);
-	ksu_allow(db, "system_server", KERNEL_SU_DOMAIN, "process", "getpgid");
-	ksu_allow(db, "system_server", KERNEL_SU_DOMAIN, "process", "sigkill");
-#ifdef CONFIG_KSU_SUSFS
-	ksu_allow(db, "zygote", "labeledfs", "filesystem", "unmount");
-#endif
-	rcu_assign_pointer(selinux_state.policy, pol);
-	synchronize_rcu();
-	ksu_destroy_sepolicy(old_pol);
-	reset_avc_cache(pol->latest_granting);
-#ifdef CONFIG_KSU_SUSFS
-	susfs_set_batch_sid();
-#endif
-out_unlock:
-	mutex_unlock(&selinux_state.policy_mutex);
-}
-int handle_sepolicy(void __user *user_data, u64 data_len)
-{
-	return -EOPNOTSUPP;
-}
+void apply_kernelsu_rules(void) {}
+int handle_sepolicy(void __user *user_data, u64 data_len) { return -EOPNOTSUPP; }
 #endif
 RULESEOF
-echo "  ✅ rules.c dual-path"
+echo "  ✅ rules.c dual-path (selinux_state.ss + fallback)"
 
 python3 - "$KSU_DIR" <<'PORTEOF' 2>&1 | tee -a "$AUDIT"
 import os, re, sys
@@ -431,32 +367,42 @@ def ensure_inc(c, inc):
 def ensure_ver(c):
     return c if 'linux/version.h' in c else ensure_inc(c, '<linux/version.h>')
 
-# ----- selinux_hide -----
+# ----- selinux_hide : stubs COMPLETS -----
 p = os.path.join(root, "feature/selinux_hide.c")
 if os.path.isfile(p):
     c, o = read(p), None
     o = c
-    if "KSU_SELINUX_HIDE_DISABLED_ON_OLD_KERNEL" not in c:
-        h = (
-            "#include <linux/version.h>\n#include <linux/types.h>\n#include <linux/errno.h>\n"
-            "#define KSU_SELINUX_HIDE_DISABLED_ON_OLD_KERNEL 1\n"
-            "#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n"
-            "bool ksu_selinux_hide_enabled = false;\nbool ksu_selinux_hide_running = false;\n"
-            "int ksu_selinux_hide_enable(void) { return -EOPNOTSUPP; }\n"
-            "void ksu_selinux_hide_unhook(void) {}\nvoid initialize_fake_status(void) {}\n#else\n"
-        )
+    if "KSU_SELINUX_HIDE_FULL_STUB_419" not in c:
+        stub = r'''
+#include <linux/version.h>
+#include <linux/types.h>
+#include <linux/errno.h>
+#define KSU_SELINUX_HIDE_FULL_STUB_419 1
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+bool ksu_selinux_hide_enabled;
+bool ksu_selinux_hide_running;
+int ksu_selinux_hide_enable(void) { return -EOPNOTSUPP; }
+void ksu_selinux_hide_unhook(void) {}
+void initialize_fake_status(void) {}
+void ksu_selinux_hide_init(void) {}
+void ksu_selinux_hide_exit(void) {}
+void ksu_selinux_hide_handle_post_fs_data(void) {}
+void ksu_selinux_hide_handle_second_stage(void) {}
+void ksu_selinux_hide_drop_backup_if_unused(void) {}
+#else
+'''
+        # Préfixer le fichier original sous #else
         c = re.sub(r'#include\s*[<"]linux/version\.h[>"]\s*\n', '', c)
-        c = h + c + "\n#endif\n"
+        c = stub + c + "\n#endif /* selinux_hide dual */\n"
         write(p, c, o)
 
-# ----- sepolicy.c dual-path 4.19 -----
+# ----- sepolicy dual-path (comme avant) -----
 p = os.path.join(root, "selinux/sepolicy.c")
 if os.path.isfile(p):
     c, o = read(p), None
     o = c
     c = ensure_ver(c)
 
-    # remove_avtab_node : pas de walk htable sur flex_array
     if "KSU_REMOVE_AVTAB_COMPAT" not in c and "static bool remove_avtab_node" in c:
         c = re.sub(
             r'static bool remove_avtab_node\s*\(\s*struct policydb \*db\s*,\s*struct avtab_node \*node\s*\)\s*\{',
@@ -464,21 +410,16 @@ if os.path.isfile(p):
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
 static bool remove_avtab_node(struct policydb *db, struct avtab_node *node)
 {
-	(void)db;
-	(void)node;
-	return true;
+	(void)db; (void)node; return true;
 }
 #else
 static bool remove_avtab_node(struct policydb *db, struct avtab_node *node)
 {''',
             c, count=1)
-        # fermer le #else avant la fonction suivante (add_rule)
         c = re.sub(
             r'(static bool remove_avtab_node[\s\S]*?\n\}\s*\n)(static bool add_rule\s*\()',
-            r'\1#endif /* remove_avtab_node dual */\n\n\2',
-            c, count=1)
+            r'\1#endif\n\n\2', c, count=1)
 
-    # add_type simplifié < 5.10
     if "KSU_ADD_TYPE_COMPAT_419" not in c and "static bool add_type" in c:
         c = re.sub(
             r'static bool add_type\s*\(\s*struct policydb \*db\s*,\s*const char \*type_name\s*,\s*bool attr\s*\)\s*\{',
@@ -486,32 +427,16 @@ static bool remove_avtab_node(struct policydb *db, struct avtab_node *node)
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 static bool add_type(struct policydb *db, const char *type_name, bool attr)
 {
-	struct type_datum *type;
-	char *key;
-	u32 value;
-
+	struct type_datum *type; char *key; u32 value;
 	type = symtab_search(&db->p_types, type_name);
-	if (type) {
-		pr_warn("Type %s already exists\\n", type_name);
-		return true;
-	}
+	if (type) return true;
 	value = ++db->p_types.nprim;
 	type = kzalloc(sizeof(*type), GFP_KERNEL);
-	if (!type)
-		return false;
-	type->primary = 1;
-	type->value = value;
-	type->attribute = attr;
+	if (!type) return false;
+	type->primary = 1; type->value = value; type->attribute = attr;
 	key = kstrdup(type_name, GFP_KERNEL);
-	if (!key) {
-		kfree(type);
-		return false;
-	}
-	if (symtab_insert(&db->p_types, key, type)) {
-		kfree(key);
-		kfree(type);
-		return false;
-	}
+	if (!key) { kfree(type); return false; }
+	if (symtab_insert(&db->p_types, key, type)) { kfree(key); kfree(type); return false; }
 	return true;
 }
 #else
@@ -520,70 +445,40 @@ static bool add_type(struct policydb *db, const char *type_name, bool attr)
             c, count=1)
         c = re.sub(
             r'(static bool add_type[\s\S]*?return true;\s*\n\}\s*\n)(static bool set_type_state\s*\()',
-            r'\1#endif /* add_type dual */\n\n\2',
-            c, count=1)
+            r'\1#endif\n ro\n\2', c, count=1)
+        c = c.replace('#endif\n ro\n', '#endif\n\n')
 
-    # add_typeattribute_raw no-op < 5.10
     if "KSU_TYPEATTR_RAW_COMPAT" not in c and "static void add_typeattribute_raw" in c:
         c = re.sub(
             r'static void add_typeattribute_raw\s*\(\s*struct policydb \*db\s*,\s*struct type_datum \*type\s*,\s*struct type_datum \*attr\s*\)\s*\{',
             r'''#define KSU_TYPEATTR_RAW_COMPAT 1
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 static void add_typeattribute_raw(struct policydb *db, struct type_datum *type, struct type_datum *attr)
-{
-	(void)db;
-	(void)type;
-	(void)attr;
-}
+{ (void)db; (void)type; (void)attr; }
 #else
 static void add_typeattribute_raw(struct policydb *db, struct type_datum *type, struct type_datum *attr)
 {''',
             c, count=1)
         c = re.sub(
-            r'(static void add_typeattribute_raw[\s\S]*?\n\}\s*;\s*\n\}\s*\n)(static bool add_typeattribute\s*\()',
-            r'\1#endif /* typeattr_raw dual */\n\n\2',
-            c, count=1)
-        # fallback si le pattern de fermeture diffère
-        if "typeattr_raw dual" not in c:
-            c = re.sub(
-                r'(static void add_typeattribute_raw[\s\S]*?\n\}\s*\n)(static bool add_typeattribute\s*\()',
-                r'\1#endif /* typeattr_raw dual */\n\n\2',
-                c, count=1)
+            r'(static void add_typeattribute_raw[\s\S]*?\n\}\s*\n)(static bool add_typeattribute\s*\()',
+            r'\1#endif\n\n\2', c, count=1)
 
-    # ksu_destroy / ksu_dup stubs < 5.10
     if "KSU_DUP_SEPOLICY_COMPAT" not in c and "ksu_dup_sepolicy" in c:
         c = re.sub(
             r'void ksu_destroy_sepolicy\s*\(\s*struct selinux_policy \*pol\s*\)\s*\{',
             r'''#define KSU_DUP_SEPOLICY_COMPAT 1
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
-void ksu_destroy_sepolicy(struct selinux_policy *pol)
-{
-	(void)pol;
-}
+void ksu_destroy_sepolicy(struct selinux_policy *pol) { (void)pol; }
 struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)
-{
-	(void)old_pol;
-	return ERR_PTR(-EOPNOTSUPP);
-}
+{ (void)old_pol; return ERR_PTR(-EOPNOTSUPP); }
 #else
 void ksu_destroy_sepolicy(struct selinux_policy *pol)
 {''',
             c, count=1)
-        # fermer à la fin du fichier après ksu_dup_sepolicy
-        if c.rstrip().endswith('}'):
-            # s'assurer d'un #endif final si dual ouvert
-            if c.count('#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)') > c.count('#endif /* dup_sepolicy'):
-                # fermer après la dernière fonction ksu_dup
-                c = re.sub(
-                    r'(struct selinux_policy \*ksu_dup_sepolicy[\s\S]*return ERR_PTR\(ret\);\s*\n\})',
-                    r'\1\n#endif /* dup_sepolicy dual */\n',
-                    c, count=1)
-                # le #else path a ksu_destroy + ksu_dup; le regex ci-dessus peut matcher le stub.
-                # Si double match raté, ajouter #endif en fin de fichier
-                if "dup_sepolicy dual" not in c:
-                    c = c.rstrip() + "\n#endif /* dup_sepolicy dual */\n"
+        if "KSU_DUP_SEPOLICY_COMPAT" in c and c.count("#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)") >= 1:
+            if not c.rstrip().endswith("#endif"):
+                c = c.rstrip() + "\n#endif /* dup_sepolicy */\n"
 
-    # add_filename_trans stub si pas déjà gardé
     if "KSU_FILENAME_TRANS_GUARD" not in c and "static bool add_filename_trans" in c:
         pat = r'(static\s+bool\s+add_filename_trans\s*\([^)]*\)\s*\{)'
         if re.search(pat, c):
@@ -593,10 +488,69 @@ void ksu_destroy_sepolicy(struct selinux_policy *pol)
             c = re.sub(
                 r'(#if LINUX_VERSION_CODE >= KERNEL_VERSION\(5, 8, 0\)\nstatic bool add_filename_trans[\s\S]*?\n\}\s*\n)(static bool add_genfscon)',
                 r'\1#else\nstatic bool add_filename_trans(struct policydb *db, const char *s, const char *t,\n'
-                r' const char *cls, const char *d, const char *o) { (void)db;(void)s;(void)t;(void)cls;(void)d;(void)o; return true; }\n#endif\n\n\2',
+                r' const char *cls, const char *d, const char *o)\n'
+                r'{ (void)db;(void)s;(void)t;(void)cls;(void)d;(void)o; return true; }\n#endif\n\n\2',
                 c, count=1)
 
     write(p, c, o)
+
+# ----- path_mount / path_umount stubs -----
+for rel, name in [
+    ("infra/su_mount_ns.c", "path_mount"),
+    ("feature/kernel_umount.c", "path_umount"),
+]:
+    p = os.path.join(root, rel)
+    if not os.path.isfile(p):
+        continue
+    c, o = read(p), None
+    o = c
+    c = ensure_ver(c)
+    marker = f"KSU_{name.upper()}_STUB_419"
+    if marker not in c and name in c:
+        last = 0
+        for m in re.finditer(r'#include\s+[<"].*?[>"]\s*\n', c):
+            last = m.end()
+        stub = f'''
+#ifndef {marker}
+#define {marker} 1
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 2, 0)
+/* path_mount / path_umount absents ou non exportés en 4.19 */
+#include <linux/errno.h>
+static inline int ksu_compat_path_mount(const char *dev_name, struct path *path,
+		const char *type, unsigned long flags, void *data)
+{{ (void)dev_name; (void)path; (void)type; (void)flags; (void)data; return -EOPNOTSUPP; }}
+static inline int ksu_compat_path_umount(struct path *path, int flags)
+{{ (void)path; (void)flags; return -EOPNOTSUPP; }}
+#define path_mount ksu_compat_path_mount
+#define path_umount ksu_compat_path_umount
+#endif
+#endif
+'''
+        c = c[:last] + stub + c[last:]
+        write(p, c, o)
+
+# ----- seccomp_filter_release -----
+p = os.path.join(root, "policy/app_profile.c")
+if os.path.isfile(p):
+    c, o = read(p), None
+    o = c
+    c = ensure_ver(c)
+    if "KSU_SECCOMP_RELEASE_STUB" not in c and "seccomp_filter_release" in c:
+        last = 0
+        for m in re.finditer(r'#include\s+[<"].*?[>"]\s*\n', c):
+            last = m.end()
+        c = c[:last] + '''
+#ifndef KSU_SECCOMP_RELEASE_STUB
+#define KSU_SECCOMP_RELEASE_STUB 1
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
+#include <linux/sched.h>
+static inline void ksu_seccomp_filter_release(struct task_struct *tsk)
+{ (void)tsk; }
+#define seccomp_filter_release ksu_seccomp_filter_release
+#endif
+#endif
+''' + c[last:]
+        write(p, c, o)
 
 # ----- file_wrapper -----
 p = os.path.join(root, "infra/file_wrapper.c")
@@ -605,22 +559,15 @@ if os.path.isfile(p):
     o = c
     c = ensure_ver(c)
     if "KSU_IOPOLL_WRAPPED_519" not in c and "ksu_wrapper_iopoll" in c:
-        c2 = re.sub(
-            r'^(\s*p->ops\.iopoll\s*=)',
-            r'#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n\1',
-            c, count=1, flags=re.M)
+        c2 = re.sub(r'^(\s*p->ops\.iopoll\s*=)',
+                    r'#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n\1', c, count=1, flags=re.M)
         c2 = re.sub(r'(p->ops\.iopoll\s*=[^;]+;)', r'\1\n#endif', c2, count=1)
         m = re.search(
             r'(#if\s+LINUX_VERSION_CODE\s*>=\s*KERNEL_VERSION\(\s*6\s*,\s*1\s*,\s*0\s*\)\s*\n'
-            r'static int ksu_wrapper_iopoll[\s\S]*?'
-            r'#else\s*\nstatic int ksu_wrapper_iopoll[\s\S]*?\n\}\s*\n#endif)',
+            r'static int ksu_wrapper_iopoll[\s\S]*?#else\s*\nstatic int ksu_wrapper_iopoll[\s\S]*?\n\}\s*\n#endif)',
             c2)
         if m:
-            block = m.group(1)
-            c2 = c2[:m.start()] + (
-                '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n'
-                '#define KSU_IOPOLL_WRAPPED_519 1\n' + block + '\n#endif\n'
-            ) + c2[m.end():]
+            c2 = c2[:m.start()] + '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n#define KSU_IOPOLL_WRAPPED_519 1\n' + m.group(1) + '\n#endif\n' + c2[m.end():]
         c = c2
     if "KSU_REMAP_WRAPPED_420" not in c and "ksu_wrapper_remap_file_range" in c:
         if 'REMAP_FILE_DEDUP' in c and '#ifndef REMAP_FILE_DEDUP' not in c:
@@ -630,19 +577,13 @@ if os.path.isfile(p):
             c = c[:last] + '\n#ifndef REMAP_FILE_DEDUP\n#define REMAP_FILE_DEDUP 0\n#endif\n' + c[last:]
         m = re.search(r'(static loff_t ksu_wrapper_remap_file_range\s*\([\s\S]*?\n\}\s*\n)', c)
         if m:
-            block = m.group(1)
-            c = c[:m.start()] + (
-                '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n'
-                '#define KSU_REMAP_WRAPPED_420 1\n' + block + '#endif\n'
-            ) + c[m.end():]
-        c = re.sub(
-            r'^(\s*p->ops\.remap_file_range\s*=)',
-            r'#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n\1',
-            c, count=1, flags=re.M)
+            c = c[:m.start()] + '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n#define KSU_REMAP_WRAPPED_420 1\n' + m.group(1) + '#endif\n' + c[m.end():]
+        c = re.sub(r'^(\s*p->ops\.remap_file_range\s*=)',
+                   r'#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n\1', c, count=1, flags=re.M)
         c = re.sub(r'(p->ops\.remap_file_range\s*=[^;]+;)', r'\1\n#endif', c, count=1)
     write(p, c, o)
 
-# ----- pkg_observer proto 4.19 -----
+# ----- pkg_observer -----
 p = os.path.join(root, "manager/pkg_observer.c")
 if os.path.isfile(p):
     c, o = read(p), None
@@ -652,8 +593,7 @@ if os.path.isfile(p):
         c = re.sub(
             r'static int ksu_handle_inode_event\s*\([^;{]*\)\s*\{[\s\S]*?\n\}'
             r'\s*static const struct fsnotify_ops ksu_ops\s*=\s*\{[\s\S]*?\};',
-            '',
-            c, count=1)
+            '', c, count=1)
         insert = '''
 #define KSU_FSNOTIFY_DUAL_PATH 1
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0)
@@ -661,41 +601,30 @@ static int ksu_handle_inode_event(struct fsnotify_mark *mark, u32 mask,
 				  struct inode *inode, struct inode *dir,
 				  const struct qstr *file_name, u32 cookie)
 {
-	if (!file_name)
-		return 0;
-	if (mask & FS_ISDIR)
-		return 0;
+	if (!file_name) return 0;
+	if (mask & FS_ISDIR) return 0;
 	if (file_name->len == 13 && !memcmp(file_name->name, "packages.list", 13)) {
 		pr_info("packages.list detected: %d\\n", mask);
 		ksu_defer_track_throne();
 	}
 	return 0;
 }
-
-static const struct fsnotify_ops ksu_ops = {
-	.handle_inode_event = ksu_handle_inode_event,
-};
+static const struct fsnotify_ops ksu_ops = { .handle_inode_event = ksu_handle_inode_event };
 #else
 static int ksu_handle_event(struct fsnotify_group *group, struct inode *inode,
 			    u32 mask, const void *data, int data_type,
 			    const unsigned char *file_name, u32 cookie,
 			    struct fsnotify_iter_info *iter_info)
 {
-	if (!file_name)
-		return 0;
-	if (mask & FS_ISDIR)
-		return 0;
-	if (strlen((const char *)file_name) == 13 &&
-	    !memcmp(file_name, "packages.list", 13)) {
+	if (!file_name) return 0;
+	if (mask & FS_ISDIR) return 0;
+	if (strlen((const char *)file_name) == 13 && !memcmp(file_name, "packages.list", 13)) {
 		pr_info("packages.list detected: %d\\n", mask);
 		ksu_defer_track_throne();
 	}
 	return 0;
 }
-
-static const struct fsnotify_ops ksu_ops = {
-	.handle_event = ksu_handle_event,
-};
+static const struct fsnotify_ops ksu_ops = { .handle_event = ksu_handle_event };
 #endif
 
 '''
@@ -710,7 +639,6 @@ static const struct fsnotify_ops ksu_ops = {
             c = c[:last] + "\n#ifndef TWA_RESUME\n#define TWA_RESUME 0\n#endif\n" + c[last:]
         write(p, c, o)
 
-# TWA_RESUME
 TWA = '\n#ifndef TWA_RESUME\n#define TWA_RESUME 0\n#endif\n'
 for rel in ['manager/dynamic_manager.c', 'policy/allowlist.c', 'supercall/supercall.c']:
     p = os.path.join(root, rel)
@@ -726,7 +654,6 @@ for rel in ['manager/dynamic_manager.c', 'policy/allowlist.c', 'supercall/superc
         c = c[:last] + TWA + c[last:]
         write(p, c, o)
 
-# SECCOMP
 p = os.path.join(root, 'infra/seccomp_cache.c')
 if os.path.isfile(p):
     c, o = read(p), None
@@ -743,7 +670,6 @@ if os.path.isfile(p):
         ) + c[last:]
         write(p, c, o)
 
-# filter_count
 p = os.path.join(root, 'policy/app_profile.c')
 if os.path.isfile(p):
     c, o = read(p), None
@@ -761,7 +687,6 @@ if os.path.isfile(p):
                                    '#include <linux/version.h>\n#define KSU_FILTER_COUNT_COMPAT 1', 1)
         write(p, c, o)
 
-# put_task_struct
 for rel in ['manager/dynamic_manager.c', 'policy/allowlist.c']:
     p = os.path.join(root, rel)
     if not os.path.isfile(p):
@@ -773,7 +698,6 @@ for rel in ['manager/dynamic_manager.c', 'policy/allowlist.c']:
         c = ensure_inc(c, '<linux/sched/task.h>')
         write(p, c, o)
 
-# tasklist_lock
 p = os.path.join(root, 'supercall/dispatch.c')
 if os.path.isfile(p):
     c, o = read(p), None
@@ -792,7 +716,6 @@ if os.path.isfile(p):
         ) + c[last:]
         write(p, c, o)
 
-# headers
 p = os.path.join(root, 'sulog/event.c')
 if os.path.isfile(p):
     c, o = read(p), None
