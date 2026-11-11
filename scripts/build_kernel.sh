@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # FinaSU (LyraVoid) — noyau 4.19 — ÉTAPE A (Tracepoint, sans SuSFS)
-# Complet corrigé : manager GDrive + file_wrapper + pkg_observer dual-path propre
+# Complet : manager GDrive + file_wrapper + pkg_observer (proto 4.19)
 # =============================================================================
 
 export GITHUB_WORKSPACE="${GITHUB_WORKSPACE:-$PWD}"
@@ -518,7 +518,7 @@ if os.path.isfile(p):
             c, count=1)
     write(p, c, o)
 
-# pkg_observer dual-path PROPRE
+# pkg_observer dual-path — proto 4.19 (group, inode, u32, const unsigned char *)
 p = os.path.join(root, "manager/pkg_observer.c")
 if os.path.isfile(p):
     c, o = read(p), None
@@ -554,16 +554,18 @@ static const struct fsnotify_ops ksu_ops = {
 	.handle_inode_event = ksu_handle_inode_event,
 };
 #else
-static int ksu_handle_event(struct fsnotify_group *group, u32 mask,
-			    const void *data, int data_type,
-			    struct inode *inode, const struct qstr *file_name,
-			    u32 cookie, struct fsnotify_iter_info *iter_info)
+/* Linux 4.19 : handle_event(group, inode, mask, data, data_type, file_name, cookie, iter) */
+static int ksu_handle_event(struct fsnotify_group *group, struct inode *inode,
+			    u32 mask, const void *data, int data_type,
+			    const unsigned char *file_name, u32 cookie,
+			    struct fsnotify_iter_info *iter_info)
 {
 	if (!file_name)
 		return 0;
 	if (mask & FS_ISDIR)
 		return 0;
-	if (file_name->len == 13 && !memcmp(file_name->name, "packages.list", 13)) {
+	if (strlen((const char *)file_name) == 13 &&
+	    !memcmp(file_name, "packages.list", 13)) {
 		pr_info("packages.list detected: %d\\n", mask);
 		ksu_defer_track_throne();
 	}
