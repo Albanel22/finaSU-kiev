@@ -254,7 +254,7 @@ grep -rl "anon_inode_getfile" "$KSU_DIR/" 2>/dev/null | while read -r f; do
 done || true
 
 # ==================== 4b. COMPATIBILITÉ 4.19 ====================
-echo "=== Correctifs ciblés 4.19 (6 fixes) ==="
+echo "=== Correctifs ciblés 4.19 (7 fixes) ==="
 python3 - "$GITHUB_WORKSPACE" <<'FIXEOF' 2>&1 | tee -a "$AUDIT"
 import os, sys
 
@@ -271,6 +271,19 @@ def write(p, c):
     with open(p, 'w', encoding='utf-8') as f:
         f.write(c)
 
+def ensure_inc_after_last(c, inc):
+    if inc in c:
+        return c
+    lines = c.split('\n')
+    last = -1
+    for i, ln in enumerate(lines):
+        if ln.lstrip().startswith('#include'):
+            last = i
+    if last >= 0:
+        lines.insert(last + 1, f'#include {inc}')
+        return '\n'.join(lines)
+    return f'#include {inc}\n' + c
+
 # --- FIX 1 : fs/stat.c — include susfs_def.h ---
 p = os.path.join(kernel_root, "fs/stat.c")
 if os.path.isfile(p):
@@ -283,8 +296,7 @@ if os.path.isfile(p):
             if eol == -1: eol = len(c)
             insert = '\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif // CONFIG_KSU_SUSFS_SUS_KSTAT'
             c = c[:eol] + insert + c[eol:]
-            write(p, c)
-            total += 1
+            write(p, c); total += 1
             print(f"  ✅ fs/stat.c: include susfs_def.h ajouté")
 
 # --- FIX 2 : MODULE_IMPORT_NS wrappé ---
@@ -296,9 +308,7 @@ if os.path.isdir(ksu_root):
             try: c = read(p)
             except Exception: continue
             if 'MODULE_IMPORT_NS' not in c: continue
-            lines = c.split('\n')
-            out = []
-            changed = False
+            lines = c.split('\n'); out = []; changed = False
             for ln in lines:
                 s = ln.strip()
                 if s.startswith('MODULE_IMPORT_NS(') and s.endswith(');'):
@@ -307,15 +317,13 @@ if os.path.isdir(ksu_root):
                         out.append('#ifdef MODULE_IMPORT_NS')
                         out.append(ln)
                         out.append('#endif')
-                        changed = True
-                        continue
+                        changed = True; continue
                 out.append(ln)
             if changed:
-                write(p, '\n'.join(out))
-                total += 1
+                write(p, '\n'.join(out)); total += 1
                 print(f"  ✅ {os.path.relpath(p, GW)}: MODULE_IMPORT_NS wrappé")
 
-# --- FIX 3 : file_wrapper.c — guards iopoll / remap_file_range ---
+# --- FIX 3 : file_wrapper.c ---
 p = os.path.join(ksu_root, "infra/file_wrapper.c")
 if os.path.isfile(p):
     c = read(p); original = c
@@ -359,7 +367,7 @@ if os.path.isfile(p):
         write(p, c); total += 1
         print(f"  ✅ infra/file_wrapper.c: guards 4.19 appliqués")
 
-# --- FIX 4 : seccomp_cache.c — SECCOMP_ARCH_NATIVE_NR ---
+# --- FIX 4 : seccomp_cache.c ---
 p = os.path.join(ksu_root, "infra/seccomp_cache.c")
 if os.path.isfile(p):
     c = read(p)
@@ -376,7 +384,7 @@ if os.path.isfile(p):
             write(p, '\n'.join(lines)); total += 1
             print(f"  ✅ infra/seccomp_cache.c: SECCOMP_ARCH_NATIVE_NR défini")
 
-# --- FIX 5 : su_mount_ns.c — guard uapi/linux/mount.h ---
+# --- FIX 5 : su_mount_ns.c ---
 p = os.path.join(ksu_root, "infra/su_mount_ns.c")
 if os.path.isfile(p):
     c = read(p)
@@ -389,9 +397,6 @@ if os.path.isfile(p):
         print(f"  ✅ infra/su_mount_ns.c: uapi/linux/mount.h guardé")
 
 # --- FIX 6 : pkg_observer.c — réécriture complète compatible 4.19 ---
-# On préserve à 100% la fonctionnalité manager (détection packages.list) :
-#   - TWA_RESUME = 0 sur 4.19 (task_work_add bool notify, sémantique identique)
-#   - handle_inode_event (5.9+) → handle_event (4.18-5.8) avec même filtrage
 p = os.path.join(ksu_root, "manager/pkg_observer.c")
 if os.path.isfile(p):
     c = read(p)
@@ -478,7 +483,6 @@ static int ksu_handle_inode_event(struct fsnotify_mark *mark, u32 mask, struct i
     return 0;
 }
 #else
-/* Signature 4.18–5.8 : file_name est un const unsigned char * null-terminé */
 static int ksu_handle_event_compat(struct fsnotify_group *group, struct inode *inode, u32 mask,
                                     const void *data, int data_type, const unsigned char *file_name,
                                     u32 cookie, struct fsnotify_iter_info *iter_info)
@@ -586,9 +590,48 @@ void __exit ksu_observer_exit(void)
     pr_info("observer exit done\n");
 }
 '''
-        write(p, new_c)
-        total += 1
+        write(p, new_c); total += 1
         print(f"  ✅ manager/pkg_observer.c: réécrit (handle_event compat + TWA_RESUME=0)")
+
+# --- FIX 7 : TWA_RESUME + put_task_struct (balayage global ksu_root) ---
+# - TWA_RESUME n'existe qu'en 5.0+ ; #define à 0 reproduit la sémantique
+#   de task_work_add(..., notify=false) = pas de réveil spécial, exécution
+#   au prochain retour user. Sur 5.0+, aucune modification (TWA_RESUME est
+#   déjà défini par <linux/task_work.h>).
+# - put_task_struct exige <linux/sched/task.h> sur 4.19 (l'implicit
+#   declaration de 5.x ne passe plus car le flag est plus strict ici).
+if os.path.isdir(ksu_root):
+    for dp, dn, fn in os.walk(ksu_root):
+        for f in fn:
+            if not f.endswith(('.c', '.h')): continue
+            p = os.path.join(dp, f)
+            try: c = read(p)
+            except Exception: continue
+            if not any(s in c for s in ('TWA_RESUME', 'put_task_struct')): continue
+            original = c
+
+            # 7a. TWA_RESUME = 0 si la macro est utilisée mais non définie
+            if 'TWA_RESUME' in c and '#ifndef TWA_RESUME' not in c:
+                twa_block = '\n#ifndef TWA_RESUME\n#define TWA_RESUME 0\n#endif\n'
+                c = ensure_inc_after_last(c, '<linux/version.h>')
+                lines = c.split('\n')
+                last_inc = -1
+                for i, ln in enumerate(lines):
+                    if ln.lstrip().startswith('#include'): last_inc = i
+                if last_inc >= 0:
+                    lines.insert(last_inc + 1, twa_block)
+                    c = '\n'.join(lines)
+                else:
+                    c = twa_block + c
+
+            # 7b. put_task_struct exige sched/task.h (sched.h en amont)
+            if 'put_task_struct' in c:
+                c = ensure_inc_after_last(c, '<linux/sched.h>')
+                c = ensure_inc_after_last(c, '<linux/sched/task.h>')
+
+            if c != original:
+                write(p, c); total += 1
+                print(f"  ✅ {os.path.relpath(p, GW)}: TWA_RESUME + sched/task.h")
 
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
