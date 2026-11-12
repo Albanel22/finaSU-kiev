@@ -13,7 +13,7 @@ VER="finasu-A"
 KSU_REF="$FINASU_REF"
 KSUD_FALLBACK_REF="${KSUD_FALLBACK_REF:-v3.4.2}"
 
-echo "=== Build FinaSU ($FINASU_REF) — noyau cible 4.19 + SuSFS ==="
+echo "=== Build FinaSU ($FINASU_REF) + SuSFS + MANUAL_HOOK — noyau 4.19 ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -188,6 +188,24 @@ fi
 KSU_DIR="drivers/kernelsu"
 KSU_REPO_ROOT="$GITHUB_WORKSPACE/kernel_sources/FinaSU"
 echo "✅ FinaSU intégré"
+
+# ==================== 2b. VÉRIFICATION : les hooks manuels existent dans FinaSU ? ====================
+echo "=== Vérification des hooks manuels dans FinaSU ==="
+{
+    echo ""
+    echo "=== HOOKS MANUELS : présence des fonctions ksu_handle_* ==="
+    for fn in ksu_handle_execveat ksu_handle_faccessat ksu_handle_sys_read ksu_handle_stat ksu_handle_sys_reboot; do
+        count=$(grep -rl "$fn" "$KSU_DIR/" --include="*.c" --include="*.h" 2>/dev/null | wc -l)
+        if [ "$count" -gt 0 ]; then
+            echo "  ✅ $fn : présent ($count fichiers)"
+        else
+            echo "  ❌ $fn : ABSENT → les patchs kernel causeront undefined symbol"
+        fi
+    done
+    echo ""
+    echo "=== HOOKS MANUELS : fichiers qui définissent les ksu_handle_* ==="
+    grep -rn "^int ksu_handle_\|^__attribute__((hot)) int ksu_handle_\|^long ksu_handle_" "$KSU_DIR/" --include="*.c" 2>/dev/null | head -20 || true
+} 2>&1 | tee -a "$AUDIT"
 
 # ==================== 3. SIGNATURE MANAGER ====================
 MGR_APK="$GITHUB_WORKSPACE/patches/manager.apk"
@@ -786,10 +804,10 @@ out_free:
 RULESEOF
 echo "  ✅ rules.c dual-path réinstallé"
 
-# ==================== 4b. COMPATIBILITÉ 4.19 (14 fixes) ====================
-echo "=== Correctifs ciblés 4.19 (14 fixes) ==="
+# ==================== 4b. COMPATIBILITÉ 4.19 ====================
+echo "=== Correctifs ciblés 4.19 ==="
 python3 - "$GITHUB_WORKSPACE" <<'FIXEOF' 2>&1 | tee -a "$AUDIT"
-import os, sys, re
+import os, sys, re, base64
 
 GW = sys.argv[1]
 kernel_root = os.path.join(GW, "kernel_sources")
@@ -1503,51 +1521,260 @@ static inline struct pid *ksu_task_session_419(struct task_struct *task)
         write(p, c); total += 1
         print(f"  ✅ supercall/dispatch.c: compat 4.19 (externs + wrappers)")
 
-# --- FIX 13 : selinux_hide.c — stub 4.19 ---
+# --- FIX 13 : selinux_hide.c porté (API statut + hook sel_handle_status_ops + policy) ---
 p = os.path.join(ksu_root, "feature/selinux_hide.c")
 if os.path.isfile(p):
     c = read(p)
-    if 'KSU_SELINUX_HIDE_4_19_STUB' not in c:
-        stub_prefix = (
-            '// SPDX-License-Identifier: GPL-2.0\n'
-            '// KSU_SELINUX_HIDE_4_19_STUB\n'
-            '// Sur 4.19, selinux_hide necessite la dual-policy API (struct selinux_policy,\n'
-            '// selinux_state.policy, selinux_state.status_lock/status_page) qui n\'existe pas.\n'
-            '// Avec CONFIG_KSU_SUSFS=y, SuSFS fournit les mecanismes equivalents :\n'
-            '// susfs_add_sus_path, susfs_set_uname, susfs_spoof_cmdline_or_bootconfig,\n'
-            '// susfs_set_avc_log_spoofing. Sur 5.10+ le code original est conserve.\n'
-            '#include <linux/version.h>\n'
-            '#include <linux/types.h>\n'
-            '#include <linux/errno.h>\n'
-            '#define KSU_SELINUX_HIDE_4_19_STUB 1\n'
-            '#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n'
-            'struct selinux_policy;\n'
-            'bool ksu_selinux_hide_enabled = false;\n'
-            'bool ksu_selinux_hide_running = false;\n'
-            'int ksu_selinux_hide_enable(void) { return -EOPNOTSUPP; }\n'
-            'int ksu_selinux_hide_disable(void) { return 0; }\n'
-            'void ksu_selinux_hide_unhook(void) { }\n'
-            'void initialize_fake_status(void) { }\n'
-            'void ksu_selinux_hide_handle_post_fs_data(void) { }\n'
-            'void ksu_selinux_hide_handle_second_stage(void) { }\n'
-            'void ksu_selinux_hide_drop_backup_if_unused(void) { }\n'
-            'void ksu_selinux_hide_handle_umount(void) { }\n'
-            'int ksu_selinux_hide_init(void) { return 0; }\n'
-            'void ksu_selinux_hide_exit(void) { }\n'
-            '#else\n')
-        lines = c.split('\n')
-        removed_ver_inc = False
-        out = []
-        for ln in lines:
-            if not removed_ver_inc and ln.strip() == '#include <linux/version.h>':
-                removed_ver_inc = True
-                continue
-            out.append(ln)
-        c = stub_prefix + '\n'.join(out) + '\n#endif /* KSU_SELINUX_HIDE_4_19_STUB */\n'
-        write(p, c); total += 1
-        print(f"  ✅ feature/selinux_hide.c: stub 4.19 (SuSFS remplace)")
+    if 'KSU_SELINUX_HIDE_4_19_STUB' not in c and 'ksu_fake_status_mutex' not in c:
+        new_sh = r'''// SPDX-License-Identifier: GPL-2.0
+// FinaSU v1.5.0 : selinux_hide porté pour le 4.19 Motorola.
+#include "selinux_hide.h"
+#include "infra/symbol_resolver.h"
+#include "hook/patch_memory.h"
+#include <linux/jump_label.h>
+#include <linux/version.h>
+#include <linux/cred.h>
+#include <linux/fs.h>
+#include <linux/init.h>
+#include <linux/mm.h>
+#include <linux/mutex.h>
+#include <linux/page-flags.h>
+#include <linux/printk.h>
+#include <linux/sched.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/uaccess.h>
+#include <security.h>
+#include "avc.h"
+#include "objsec.h"
+#include "klog.h"
+#include "ksu.h"
+#include "policy/feature.h"
 
-# --- FIX 14 : backport path_mount / path_umount (5.9+) dans fs/namespace.c ---
+static DEFINE_MUTEX(selinux_hide_mutex);
+static DEFINE_MUTEX(ksu_fake_status_mutex);
+bool ksu_selinux_hide_enabled __read_mostly;
+bool ksu_selinux_hide_running __read_mostly;
+
+static struct page *fake_status;
+
+typedef int (*sel_open_handle_status_fn)(struct inode *inode, struct file *filp);
+static sel_open_handle_status_fn orig_sel_open_handle_status;
+static sel_open_handle_status_fn *sel_open_handle_status_slot;
+
+static struct page *ksu_selinux_status_page(void)
+{
+    return selinux_kernel_status_page(&selinux_state);
+}
+
+ssize_t my_write_context(struct file *file, char *buf, size_t size)
+{
+    char *canon = NULL;
+    u32 sid, len;
+    int ret;
+
+    (void)file;
+    ret = security_context_to_sid(&selinux_state, buf, size, &sid, GFP_KERNEL);
+    if (ret)
+        return ret;
+    ret = security_sid_to_context(&selinux_state, sid, &canon, &len);
+    if (ret)
+        return ret;
+    if (len > SIMPLE_TRANSACTION_LIMIT) {
+        kfree(canon);
+        return -ERANGE;
+    }
+    memcpy(buf, canon, len);
+    kfree(canon);
+    return len;
+}
+
+ssize_t my_write_access(struct file *file, char *buf, size_t size)
+{
+    char *scon, *tcon;
+    u32 ssid, tsid, sconlen, tconlen;
+    u16 tclass;
+    struct av_decision avd;
+    int ret;
+
+    (void)file;
+    scon = kzalloc(size + 1, GFP_KERNEL);
+    tcon = kzalloc(size + 1, GFP_KERNEL);
+    if (!scon || !tcon) { kfree(tcon); kfree(scon); return -ENOMEM; }
+    if (sscanf(buf, "%s %s %hu", scon, tcon, &tclass) != 3) {
+        kfree(tcon); kfree(scon); return -EINVAL;
+    }
+    sconlen = strlen(scon);
+    tconlen = strlen(tcon);
+    ret = security_context_to_sid(&selinux_state, scon, sconlen, &ssid, GFP_KERNEL);
+    if (!ret)
+        ret = security_context_to_sid(&selinux_state, tcon, tconlen, &tsid, GFP_KERNEL);
+    if (ret) { kfree(tcon); kfree(scon); return ret; }
+    security_compute_av_user(&selinux_state, ssid, tsid, tclass, &avd);
+    ret = scnprintf(buf, SIMPLE_TRANSACTION_LIMIT, "%x %x %x %x %u %x",
+                    avd.allowed, 0xffffffff, avd.auditallow,
+                    avd.auditdeny, avd.seqno, avd.flags);
+    kfree(tcon);
+    kfree(scon);
+    return ret;
+}
+
+static int ksu_selinux_status_open(struct inode *inode, struct file *filp)
+{
+    struct page *status;
+
+    (void)inode;
+    if (ksu_selinux_hide_enabled && current_uid().val >= 10000) {
+        mutex_lock(&ksu_fake_status_mutex);
+        status = fake_status;
+        mutex_unlock(&ksu_fake_status_mutex);
+        if (status) {
+            filp->private_data = status;
+            return 0;
+        }
+    }
+    return orig_sel_open_handle_status(inode, filp);
+}
+
+static int ksu_hook_selinux_status_open(void)
+{
+    struct file_operations *ops;
+    sel_open_handle_status_fn new_fn;
+    int ret;
+
+    if (orig_sel_open_handle_status)
+        return 0;
+    ops = find_kernel_symbol_exact("sel_handle_status_ops");
+    if (!ops || !ops->open)
+        return -ENOENT;
+    sel_open_handle_status_slot = (sel_open_handle_status_fn *)&ops->open;
+    orig_sel_open_handle_status = *sel_open_handle_status_slot;
+    new_fn = ksu_selinux_status_open;
+    ret = ksu_patch_text(sel_open_handle_status_slot, &new_fn, sizeof(new_fn),
+                         KSU_PATCH_TEXT_FLUSH_DCACHE);
+    if (ret) {
+        orig_sel_open_handle_status = NULL;
+        sel_open_handle_status_slot = NULL;
+    }
+    return ret;
+}
+
+static void ksu_unhook_selinux_status_open(void)
+{
+    if (sel_open_handle_status_slot && orig_sel_open_handle_status) {
+        ksu_patch_text(sel_open_handle_status_slot, &orig_sel_open_handle_status,
+                       sizeof(orig_sel_open_handle_status), KSU_PATCH_TEXT_FLUSH_DCACHE);
+        orig_sel_open_handle_status = NULL;
+        sel_open_handle_status_slot = NULL;
+    }
+}
+
+static int ksu_initialize_fake_status(void)
+{
+    struct page *status_page;
+    struct selinux_kernel_status *status;
+    struct selinux_kernel_status *new_status;
+    struct page *new_page;
+
+    mutex_lock(&ksu_fake_status_mutex);
+    if (fake_status) { mutex_unlock(&ksu_fake_status_mutex); return 0; }
+    status_page = ksu_selinux_status_page();
+    if (!status_page) { mutex_unlock(&ksu_fake_status_mutex); return -ENODEV; }
+    status = page_address(status_page);
+    if (!status) { mutex_unlock(&ksu_fake_status_mutex); return -EFAULT; }
+    new_page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+    if (!new_page) { mutex_unlock(&ksu_fake_status_mutex); return -ENOMEM; }
+    new_status = page_address(new_page);
+    memcpy(new_status, status, sizeof(*status));
+    /* Présenter l'état stock : enforcing, aucun rechargement de policy. */
+    new_status->enforcing = 1;
+    new_status->policyload = 0;
+    new_status->sequence = 0;
+    fake_status = new_page;
+    mutex_unlock(&ksu_fake_status_mutex);
+    return 0;
+}
+
+static int selinux_hide_feature_get(u64 *value)
+{
+    *value = ksu_selinux_hide_enabled ? 1 : 0;
+    return 0;
+}
+
+static int selinux_hide_feature_set(u64 value)
+{
+    int ret = 0;
+    bool enable = value != 0;
+
+    mutex_lock(&selinux_hide_mutex);
+    if (enable == ksu_selinux_hide_enabled) { mutex_unlock(&selinux_hide_mutex); return 0; }
+    if (enable) {
+        ret = ksu_initialize_fake_status();
+        if (!ret) ret = ksu_hook_selinux_status_open();
+        if (!ret) {
+            ksu_selinux_hide_enabled = true;
+            ksu_selinux_hide_running = true;
+        }
+    } else {
+        ksu_selinux_hide_enabled = false;
+        ksu_selinux_hide_running = false;
+        ksu_unhook_selinux_status_open();
+    }
+    mutex_unlock(&selinux_hide_mutex);
+    return ret;
+}
+
+static const struct ksu_feature_handler selinux_hide_handler = {
+    .feature_id = KSU_FEATURE_SELINUX_HIDE,
+    .name = "selinux_hide",
+    .get_handler = selinux_hide_feature_get,
+    .set_handler = selinux_hide_feature_set,
+};
+
+void ksu_selinux_hide_handle_second_stage(void)
+{
+    if (ksu_selinux_hide_enabled)
+        ksu_initialize_fake_status();
+}
+
+void ksu_selinux_hide_handle_post_fs_data(void)
+{
+    if (ksu_selinux_hide_enabled)
+        ksu_initialize_fake_status();
+}
+
+void __init ksu_selinux_hide_init(void)
+{
+    if (ksu_register_feature_handler(&selinux_hide_handler))
+        pr_err("Failed to register selinux_hide feature handler\n");
+}
+
+void __exit ksu_selinux_hide_exit(void)
+{
+    mutex_lock(&selinux_hide_mutex);
+    ksu_selinux_hide_enabled = false;
+    ksu_selinux_hide_running = false;
+    ksu_unhook_selinux_status_open();
+    mutex_unlock(&selinux_hide_mutex);
+    ksu_unregister_feature_handler(KSU_FEATURE_SELINUX_HIDE);
+
+    mutex_lock(&ksu_fake_status_mutex);
+    if (fake_status)
+        __free_page(fake_status);
+    fake_status = NULL;
+    mutex_unlock(&ksu_fake_status_mutex);
+}
+
+void ksu_selinux_hide_drop_backup_if_unused(void)
+{
+    /* 4.19 n'a pas de dual-policy : le policydb est modifié sur place
+     * par rules.c, donc pas de backup_sepolicy à libérer ici. */
+}
+'''
+        write(p, new_sh); total += 1
+        print(f"  ✅ feature/selinux_hide.c: portage 4.19 (statut SELinux + sel_handle_status_ops)")
+
+# --- FIX 14 : path_mount/path_umount backport ---
 p = os.path.join(kernel_root, "fs/namespace.c")
 if os.path.isfile(p):
     c = read(p)
@@ -1557,13 +1784,8 @@ if os.path.isfile(p):
 #ifdef CONFIG_KSU
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
 /* KSU_PATH_MOUNT_BACKPORT : path_mount/path_umount (5.9+) backportees pour 4.19.
- * Adapte de Al Viro (upstream 9f6c61f96f2d "do_mounts: groundwork for unrolling
- * the mount loop" et a31c2476c174 "init: move the mount() and umount() calls").
- *
- * Attention : do_mount() en 4.19 prend un (const char __user *dir_name) et non un
- * struct path *, contrairement a la version 5.9+. On convertit le path en chaine
- * avec d_path() et on utilise set_fs(KERNEL_DS) pour que le pointeur kernel soit
- * accepte par l'API __user. */
+ * do_mount() en 4.19 prend un (const char __user *dir_name) et non un struct path *,
+ * contrairement a 5.9+. On convertit via d_path() et set_fs(KERNEL_DS). */
 int path_mount(const char *dev_name, struct path *path,
                const char *type_page, unsigned long flags, void *data_page)
 {
@@ -1600,17 +1822,13 @@ int path_umount(struct path *path, int flags)
 
     if (path->dentry != path->mnt->mnt_root)
         return -EINVAL;
-
     if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
         return -EINVAL;
-
     retval = -EINVAL;
     if (!check_mnt(mnt))
         return retval;
-
     if (!may_umount(path->mnt))
         return retval;
-
     return do_umount(mnt, flags);
 }
 EXPORT_SYMBOL(path_umount);
@@ -1620,6 +1838,91 @@ EXPORT_SYMBOL(path_umount);
         c = c.rstrip() + '\n' + backport
         write(p, c); total += 1
         print(f"  ✅ fs/namespace.c: backport path_mount/path_umount")
+
+# --- FIX 15 : MANUAL_HOOK patchs kernel 4.19 (fs/exec.c, fs/open.c, fs/read_write.c, fs/stat.c, kernel/reboot.c) ---
+print("  → FIX 15 : patchs kernel MANUAL_HOOK")
+
+# fs/exec.c — ksu_handle_execveat
+p = os.path.join(kernel_root, "fs/exec.c")
+if os.path.isfile(p):
+    c = read(p)
+    if 'ksu_handle_execveat' not in c:
+        extern = "#ifdef CONFIG_KSU\n__attribute__((hot))\nextern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n#endif\n\n"
+        m = re.search(r'(int\s+do_execve\s*\()', c)
+        if m:
+            c = c[:m.start()] + extern + c[m.start():]
+            call = "#ifdef CONFIG_KSU\n\tksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);\n#endif\n\t"
+            m2 = re.search(r'(\treturn\s+do_execveat_common\(AT_FDCWD,\s*filename,\s*argv,\s*envp,\s*0\);)', c)
+            if m2:
+                c = c[:m2.start()] + call + c[m2.start():]
+                write(p, c); total += 1
+                print(f"  ✅ fs/exec.c: ksu_handle_execveat injecté")
+
+# fs/open.c — ksu_handle_faccessat
+p = os.path.join(kernel_root, "fs/open.c")
+if os.path.isfile(p):
+    c = read(p)
+    if 'ksu_handle_faccessat' not in c:
+        extern = "#ifdef CONFIG_KSU\n__attribute__((hot))\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n#endif\n\n"
+        m = re.search(r'(long\s+do_faccessat\s*\()', c)
+        if m:
+            c = c[:m.start()] + extern + c[m.start():]
+            call = "#ifdef CONFIG_KSU\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif\n\n\t"
+            m2 = re.search(r'(\tif\s*\(mode\s*&\s*~S_IRWXO\))', c)
+            if m2:
+                c = c[:m2.start()] + call + c[m2.start():]
+                write(p, c); total += 1
+                print(f"  ✅ fs/open.c: ksu_handle_faccessat injecté")
+
+# fs/read_write.c — ksu_handle_sys_read (avec cast)
+p = os.path.join(kernel_root, "fs/read_write.c")
+if os.path.isfile(p):
+    c = read(p)
+    if 'ksu_handle_sys_read' not in c:
+        extern = "#ifdef CONFIG_KSU\nextern bool ksu_vfs_read_hook __read_mostly;\nextern __attribute__((cold)) int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);\n#endif\n\n"
+        m = re.search(r'(SYSCALL_DEFINE3\s*\(\s*read\s*,)', c)
+        if m:
+            c = c[:m.start()] + extern + c[m.start():]
+            start_pos = c.find('SYSCALL_DEFINE3(read,')
+            ret_pos = c.find('ssize_t ret = -EBADF;', start_pos)
+            if ret_pos != -1:
+                call = "\n\n#ifdef CONFIG_KSU\n\tif (unlikely(ksu_vfs_read_hook))\n\t\tksu_handle_sys_read(fd, (char __user **)&buf, &count);\n#endif"
+                insert_pos = ret_pos + len('ssize_t ret = -EBADF;')
+                c = c[:insert_pos] + call + c[insert_pos:]
+                write(p, c); total += 1
+                print(f"  ✅ fs/read_write.c: ksu_handle_sys_read injecté")
+
+# fs/stat.c — ksu_handle_stat (attention : ce fichier a déjà des patchs SuSFS)
+p = os.path.join(kernel_root, "fs/stat.c")
+if os.path.isfile(p):
+    c = read(p)
+    if 'ksu_handle_stat' not in c:
+        extern = "#ifdef CONFIG_KSU\n__attribute__((hot))\nextern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n#endif\n\n"
+        m = re.search(r'(SYSCALL_DEFINE4\s*\(\s*newfstatat)', c)
+        if m:
+            c = c[:m.start()] + extern + c[m.start():]
+            call = "#ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flag);\n#endif\n\t"
+            m2 = re.search(r'(\terror\s*=\s*vfs_fstatat\(dfd,\s*filename,\s*&stat,\s*flag\);)', c)
+            if m2:
+                c = c[:m2.start()] + call + c[m2.start():]
+                write(p, c); total += 1
+                print(f"  ✅ fs/stat.c: ksu_handle_stat injecté (cohabite avec SuSFS)")
+
+# kernel/reboot.c — ksu_handle_sys_reboot
+p = os.path.join(kernel_root, "kernel/reboot.c")
+if os.path.isfile(p):
+    c = read(p)
+    if 'ksu_handle_sys_reboot' not in c:
+        extern = "#ifdef CONFIG_KSU\nextern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n#endif\n\n"
+        m = re.search(r'(SYSCALL_DEFINE4\s*\(\s*reboot)', c)
+        if m:
+            c = c[:m.start()] + extern + c[m.start():]
+            call = "#ifdef CONFIG_KSU\n\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n#endif\n\t"
+            m2 = re.search(r'(/\*\s*We only trust the superuser with rebooting the system\.\s*\*/)', c)
+            if m2:
+                c = c[:m2.start()] + call + c[m2.start():]
+                write(p, c); total += 1
+                print(f"  ✅ kernel/reboot.c: ksu_handle_sys_reboot injecté")
 
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
@@ -1645,7 +1948,10 @@ mkdir -p out
 make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 vendor/lito-perf_defconfig
 cat >> out/.config <<'EOF'
 CONFIG_KSU=y
-CONFIG_KSU_HOOK_TRACEPOINT=y
+CONFIG_KSU_MANUAL_HOOK=y
+# CONFIG_KSU_HOOK_TRACEPOINT is not set
+# CONFIG_KSU_WITH_KPROBES is not set
+# CONFIG_KSU_TAMPER_SYSCALL_TABLE is not set
 # CONFIG_KSU_HOOK_SUSFS_INLINE is not set
 CONFIG_KSU_SUSFS=y
 CONFIG_KSU_SUSFS_SUS_PATH=y
@@ -1681,12 +1987,38 @@ grep "^CONFIG_KSU_SUSFS" out/.config | tee -a "$AUDIT"
 echo "=== FIN VÉRIFICATION CONFIG ===" | tee -a "$AUDIT"
 
 grep -q "^CONFIG_KSU=y" out/.config || { echo "❌ CONFIG_KSU off"; exit 1; }
+grep -q "^CONFIG_KSU_MANUAL_HOOK=y" out/.config || { echo "❌ CONFIG_KSU_MANUAL_HOOK off"; exit 1; }
 grep -q "^CONFIG_KSU_SUSFS=y" out/.config || { echo "❌ CONFIG_KSU_SUSFS off"; exit 1; }
 grep -q "^CONFIG_KSU_SUSFS_SUS_KSTAT=y" out/.config || { echo "❌ CONFIG_KSU_SUSFS_SUS_KSTAT off"; exit 1; }
+grep -q "^CONFIG_SECCOMP=y" out/.config || { echo "❌ CONFIG_SECCOMP off"; exit 1; }
+grep -q "^CONFIG_SECCOMP_FILTER=y" out/.config || { echo "❌ CONFIG_SECCOMP_FILTER off"; exit 1; }
 
 # ==================== 6. MOTOROLA ====================
-sed -i 's/if (!check_version(/if (0 \&\& !check_version(/g' kernel/module.c
-printf "\n#include <linux/notifier.h>\n#include <linux/module.h>\nstatic BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);\nint panel_register_notifier(struct notifier_block *nb){return blocking_notifier_chain_register(&motorola_panel_notifier_list,nb);}\nEXPORT_SYMBOL(panel_register_notifier);\nint panel_unregister_notifier(struct notifier_block *nb){return blocking_notifier_chain_unregister(&motorola_panel_notifier_list,nb);}\nEXPORT_SYMBOL(panel_unregister_notifier);\nvoid touch_set_state(int s){return;}\nEXPORT_SYMBOL(touch_set_state);\n" >> techpack/display/msm/msm_drv.c
+cat >> techpack/display/msm/msm_drv.c <<'EOF'
+
+#include <linux/notifier.h>
+#include <linux/module.h>
+
+static BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);
+
+int panel_register_notifier(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_register(&motorola_panel_notifier_list, nb);
+}
+EXPORT_SYMBOL(panel_register_notifier);
+
+int panel_unregister_notifier(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_unregister(&motorola_panel_notifier_list, nb);
+}
+EXPORT_SYMBOL(panel_unregister_notifier);
+
+void touch_set_state(int state)
+{
+	(void)state;
+}
+EXPORT_SYMBOL(touch_set_state);
+EOF
 
 # ==================== 7. COMPILATION ====================
 echo "=== Compilation ==="
