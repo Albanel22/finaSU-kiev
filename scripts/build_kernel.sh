@@ -786,8 +786,8 @@ out_free:
 RULESEOF
 echo "  ✅ rules.c dual-path réinstallé"
 
-# ==================== 4b. COMPATIBILITÉ 4.19 (12 fixes) ====================
-echo "=== Correctifs ciblés 4.19 (12 fixes) ==="
+# ==================== 4b. COMPATIBILITÉ 4.19 (14 fixes) ====================
+echo "=== Correctifs ciblés 4.19 (14 fixes) ==="
 python3 - "$GITHUB_WORKSPACE" <<'FIXEOF' 2>&1 | tee -a "$AUDIT"
 import os, sys, re
 
@@ -1417,7 +1417,7 @@ static bool add_filename_trans(struct policydb *db, const char *s, const char *t
         write(p, c); total += 1
         print(f"  ✅ selinux/sepolicy.c: FIX 9 complet")
 
-# --- FIX 10 v2 : minmax.h → kernel.h ---
+# --- FIX 10 : minmax.h → kernel.h ---
 if os.path.isdir(ksu_root):
     for dp, dn, fn in os.walk(ksu_root):
         for f in fn:
@@ -1455,7 +1455,7 @@ if os.path.isdir(ksu_root):
                 write(p, c); total += 1
                 print(f"  ✅ {os.path.relpath(p, GW)}: {', '.join(needed)}")
 
-# --- FIX 12 : dispatch.c compat (task_pgrp/task_session/tasklist_lock/init_task) ---
+# --- FIX 12 : dispatch.c compat ---
 p = os.path.join(ksu_root, "supercall/dispatch.c")
 if os.path.isfile(p):
     c = read(p); original = c
@@ -1474,7 +1474,7 @@ extern rwlock_t tasklist_lock;
 #undef task_pgrp
 #endif
 #ifdef task_session
-#undef taKSfðð_session
+#undef task_session
 #endif
 static inline struct pid *ksu_task_pgrp_419(struct task_struct *task)
 {
@@ -1503,7 +1503,7 @@ static inline struct pid *ksu_task_session_419(struct task_struct *task)
         write(p, c); total += 1
         print(f"  ✅ supercall/dispatch.c: compat 4.19 (externs + wrappers)")
 
-		# --- FIX 13 : selinux_hide.c — stub 4.19 (SuSFS fournit le hide equivalent) ---
+# --- FIX 13 : selinux_hide.c — stub 4.19 ---
 p = os.path.join(ksu_root, "feature/selinux_hide.c")
 if os.path.isfile(p):
     c = read(p)
@@ -1547,51 +1547,7 @@ if os.path.isfile(p):
         write(p, c); total += 1
         print(f"  ✅ feature/selinux_hide.c: stub 4.19 (SuSFS remplace)")
 
-		# --- FIX 13 : selinux_hide.c — stub 4.19 (SuSFS fournit le hide equivalent) ---
-p = os.path.join(ksu_root, "feature/selinux_hide.c")
-if os.path.isfile(p):
-    c = read(p)
-    if 'KSU_SELINUX_HIDE_4_19_STUB' not in c:
-        stub_prefix = (
-            '// SPDX-License-Identifier: GPL-2.0\n'
-            '// KSU_SELINUX_HIDE_4_19_STUB\n'
-            '// Sur 4.19, selinux_hide necessite la dual-policy API (struct selinux_policy,\n'
-            '// selinux_state.policy, selinux_state.status_lock/status_page) qui n\'existe pas.\n'
-            '// Avec CONFIG_KSU_SUSFS=y, SuSFS fournit les mecanismes equivalents :\n'
-            '// susfs_add_sus_path, susfs_set_uname, susfs_spoof_cmdline_or_bootconfig,\n'
-            '// susfs_set_avc_log_spoofing. Sur 5.10+ le code original est conserve.\n'
-            '#include <linux/version.h>\n'
-            '#include <linux/types.h>\n'
-            '#include <linux/errno.h>\n'
-            '#define KSU_SELINUX_HIDE_4_19_STUB 1\n'
-            '#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n'
-            'struct selinux_policy;\n'
-            'bool ksu_selinux_hide_enabled = false;\n'
-            'bool ksu_selinux_hide_running = false;\n'
-            'int ksu_selinux_hide_enable(void) { return -EOPNOTSUPP; }\n'
-            'int ksu_selinux_hide_disable(void) { return 0; }\n'
-            'void ksu_selinux_hide_unhook(void) { }\n'
-            'void initialize_fake_status(void) { }\n'
-            'void ksu_selinux_hide_handle_post_fs_data(void) { }\n'
-            'void ksu_selinux_hide_handle_second_stage(void) { }\n'
-            'void ksu_selinux_hide_drop_backup_if_unused(void) { }\n'
-            'void ksu_selinux_hide_handle_umount(void) { }\n'
-            'int ksu_selinux_hide_init(void) { return 0; }\n'
-            'void ksu_selinux_hide_exit(void) { }\n'
-            '#else\n')
-        lines = c.split('\n')
-        removed_ver_inc = False
-        out = []
-        for ln in lines:
-            if not removed_ver_inc and ln.strip() == '#include <linux/version.h>':
-                removed_ver_inc = True
-                continue
-            out.append(ln)
-        c = stub_prefix + '\n'.join(out) + '\n#endif /* KSU_SELINUX_HIDE_4_19_STUB */\n'
-        write(p, c); total += 1
-        print(f"  ✅ feature/selinux_hide.c: stub 4.19 (SuSFS remplace)")
-
-	# --- FIX 14 : backport path_mount / path_umount (5.9+) dans fs/namespace.c ---
+# --- FIX 14 : backport path_mount / path_umount (5.9+) dans fs/namespace.c ---
 p = os.path.join(kernel_root, "fs/namespace.c")
 if os.path.isfile(p):
     c = read(p)
@@ -1603,12 +1559,37 @@ if os.path.isfile(p):
 /* KSU_PATH_MOUNT_BACKPORT : path_mount/path_umount (5.9+) backportees pour 4.19.
  * Adapte de Al Viro (upstream 9f6c61f96f2d "do_mounts: groundwork for unrolling
  * the mount loop" et a31c2476c174 "init: move the mount() and umount() calls").
- * Aucun stub : do_mount est publique en 4.19, et path_umount reprend exactement
- * les checks de ksys_umount (root / check_mnt / may_umount / do_umount). */
+ *
+ * Attention : do_mount() en 4.19 prend un (const char __user *dir_name) et non un
+ * struct path *, contrairement a la version 5.9+. On convertit le path en chaine
+ * avec d_path() et on utilise set_fs(KERNEL_DS) pour que le pointeur kernel soit
+ * accepte par l'API __user. */
 int path_mount(const char *dev_name, struct path *path,
                const char *type_page, unsigned long flags, void *data_page)
 {
-    return (int)do_mount(dev_name, path, type_page, flags, data_page);
+    char *tmp = NULL;
+    char *p = NULL;
+    mm_segment_t old_fs;
+    int ret;
+
+    tmp = (char *)__get_free_page(GFP_KERNEL);
+    if (!tmp)
+        return -ENOMEM;
+
+    p = d_path(path, tmp, PAGE_SIZE);
+    if (IS_ERR(p)) {
+        ret = PTR_ERR(p);
+        free_page((unsigned long)tmp);
+        return ret;
+    }
+
+    old_fs = get_fs();
+    set_fs(KERNEL_DS);
+    ret = (int)do_mount(dev_name, (const char __user *)p, type_page, flags, data_page);
+    set_fs(old_fs);
+
+    free_page((unsigned long)tmp);
+    return ret;
 }
 EXPORT_SYMBOL(path_mount);
 
@@ -1648,7 +1629,7 @@ export ARCH=arm64 SUBARCH=arm64
 export CROSS_COMPILE=aarch64-linux-gnu-
 export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 CLANG_MAJOR=$(clang --version | sed -n 's/.*clang version \([0-9]*\).*/\1/p' | head -1)
-CC_ARGS=""é
+CC_ARGS=""
 if [ "${FORCE_CLANG_WRAP:-1}" = "1" ] || [ "${CLANG_MAJOR:-99}" -lt 16 ]; then
     cat > "$GITHUB_WORKSPACE/clang-wrap" <<'W'
 #!/bin/bash
