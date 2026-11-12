@@ -1591,6 +1591,55 @@ if os.path.isfile(p):
         write(p, c); total += 1
         print(f"  ✅ feature/selinux_hide.c: stub 4.19 (SuSFS remplace)")
 
+	# --- FIX 14 : backport path_mount / path_umount (5.9+) dans fs/namespace.c ---
+p = os.path.join(kernel_root, "fs/namespace.c")
+if os.path.isfile(p):
+    c = read(p)
+    if 'KSU_PATH_MOUNT_BACKPORT' not in c:
+        backport = '''
+
+#ifdef CONFIG_KSU
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
+/* KSU_PATH_MOUNT_BACKPORT : path_mount/path_umount (5.9+) backportees pour 4.19.
+ * Adapte de Al Viro (upstream 9f6c61f96f2d "do_mounts: groundwork for unrolling
+ * the mount loop" et a31c2476c174 "init: move the mount() and umount() calls").
+ * Aucun stub : do_mount est publique en 4.19, et path_umount reprend exactement
+ * les checks de ksys_umount (root / check_mnt / may_umount / do_umount). */
+int path_mount(const char *dev_name, struct path *path,
+               const char *type_page, unsigned long flags, void *data_page)
+{
+    return (int)do_mount(dev_name, path, type_page, flags, data_page);
+}
+EXPORT_SYMBOL(path_mount);
+
+int path_umount(struct path *path, int flags)
+{
+    struct mount *mnt = real_mount(path->mnt);
+    int retval;
+
+    if (path->dentry != path->mnt->mnt_root)
+        return -EINVAL;
+
+    if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
+        return -EINVAL;
+
+    retval = -EINVAL;
+    if (!check_mnt(mnt))
+        return retval;
+
+    if (!may_umount(path->mnt))
+        return retval;
+
+    return do_umount(mnt, flags);
+}
+EXPORT_SYMBOL(path_umount);
+#endif
+#endif
+'''
+        c = c.rstrip() + '\n' + backport
+        write(p, c); total += 1
+        print(f"  ✅ fs/namespace.c: backport path_mount/path_umount")
+
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
 
