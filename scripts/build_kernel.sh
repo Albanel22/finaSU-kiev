@@ -254,7 +254,7 @@ grep -rl "anon_inode_getfile" "$KSU_DIR/" 2>/dev/null | while read -r f; do
 done || true
 
 # ==================== 4a. rules.c dual-path ====================
-echo "=== Réécriture rules.c dual-path (4.19: selinux_state.ss->policydb) ==="
+echo "=== Réécriture rules.c dual-path ==="
 cat > "$KSU_DIR/selinux/rules.c" << 'RULESEOF'
 #include "linux/rcupdate.h"
 #include "security.h"
@@ -1673,6 +1673,13 @@ CONFIG_COMPAT=y
 CONFIG_COMPAT_32BIT_TIME=y
 EOF
 make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig 2>&1 | tail -3
+
+# --- Vérification explicite de la config KSU finale ---
+echo "=== VÉRIFICATION CONFIG KSU ===" | tee -a "$AUDIT"
+grep "^CONFIG_KSU" out/.config | tee -a "$AUDIT"
+grep "^CONFIG_KSU_SUSFS" out/.config | tee -a "$AUDIT"
+echo "=== FIN VÉRIFICATION CONFIG ===" | tee -a "$AUDIT"
+
 grep -q "^CONFIG_KSU=y" out/.config || { echo "❌ CONFIG_KSU off"; exit 1; }
 grep -q "^CONFIG_KSU_SUSFS=y" out/.config || { echo "❌ CONFIG_KSU_SUSFS off"; exit 1; }
 grep -q "^CONFIG_KSU_SUSFS_SUS_KSTAT=y" out/.config || { echo "❌ CONFIG_KSU_SUSFS_SUS_KSTAT off"; exit 1; }
