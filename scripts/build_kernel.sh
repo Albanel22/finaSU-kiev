@@ -254,7 +254,7 @@ grep -rl "anon_inode_getfile" "$KSU_DIR/" 2>/dev/null | while read -r f; do
 done || true
 
 # ==================== 4a. rules.c dual-path ====================
-echo "=== Réécriture rules.c dual-path (handle_sepolicy préservé sur 4.19) ==="
+echo "=== Réécriture rules.c dual-path (4.19: selinux_state.ss->policydb) ==="
 cat > "$KSU_DIR/selinux/rules.c" << 'RULESEOF'
 #include "linux/rcupdate.h"
 #include "security.h"
@@ -426,9 +426,9 @@ static int apply_one_sepolicy_cmd(struct policydb *db, const struct sepol_data *
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 
+/* 4.19: policydb et policy_rwlock sont embarqués dans struct selinux_ss,
+ * accessible via selinux_state.ss. Pas de globals policydb / policy_rwlock. */
 struct selinux_avc;
-extern struct policydb policydb;
-extern rwlock_t policy_rwlock;
 extern int avc_ss_reset(struct selinux_avc *avc, u32 seqno);
 
 static void reset_avc_cache_419(void)
@@ -444,64 +444,64 @@ void apply_kernelsu_rules(void)
     if (!getenforce())
         pr_info("SELinux permissive or disabled, apply rules! (old kernel path)\n");
 
-    write_lock(&policy_rwlock);
+    write_lock(&selinux_state.ss->policy_rwlock);
 
-    ksu_type(&policydb, KERNEL_SU_DOMAIN, "domain");
-    ksu_permissive(&policydb, KERNEL_SU_DOMAIN);
-    ksu_typeattribute(&policydb, KERNEL_SU_DOMAIN, "mlstrustedsubject");
-    ksu_typeattribute(&policydb, KERNEL_SU_DOMAIN, "netdomain");
-    ksu_typeattribute(&policydb, KERNEL_SU_DOMAIN, "bluetoothdomain");
+    ksu_type(&selinux_state.ss->policydb, KERNEL_SU_DOMAIN, "domain");
+    ksu_permissive(&selinux_state.ss->policydb, KERNEL_SU_DOMAIN);
+    ksu_typeattribute(&selinux_state.ss->policydb, KERNEL_SU_DOMAIN, "mlstrustedsubject");
+    ksu_typeattribute(&selinux_state.ss->policydb, KERNEL_SU_DOMAIN, "netdomain");
+    ksu_typeattribute(&selinux_state.ss->policydb, KERNEL_SU_DOMAIN, "bluetoothdomain");
 
-    ksu_type(&policydb, KERNEL_SU_FILE, "file_type");
-    ksu_typeattribute(&policydb, KERNEL_SU_FILE, "mlstrustedobject");
-    ksu_allow(&policydb, "domain", KERNEL_SU_FILE, ALL, ALL);
-    ksu_allow(&policydb, KERNEL_SU_DOMAIN, ALL, ALL, ALL);
+    ksu_type(&selinux_state.ss->policydb, KERNEL_SU_FILE, "file_type");
+    ksu_typeattribute(&selinux_state.ss->policydb, KERNEL_SU_FILE, "mlstrustedobject");
+    ksu_allow(&selinux_state.ss->policydb, "domain", KERNEL_SU_FILE, ALL, ALL);
+    ksu_allow(&selinux_state.ss->policydb, KERNEL_SU_DOMAIN, ALL, ALL, ALL);
 
-    if (policydb.policyvers >= POLICYDB_VERSION_XPERMS_IOCTL) {
-        ksu_allowxperm(&policydb, KERNEL_SU_DOMAIN, ALL, "blk_file", ALL);
-        ksu_allowxperm(&policydb, KERNEL_SU_DOMAIN, ALL, "fifo_file", ALL);
-        ksu_allowxperm(&policydb, KERNEL_SU_DOMAIN, ALL, "chr_file", ALL);
-        ksu_allowxperm(&policydb, KERNEL_SU_DOMAIN, ALL, "file", ALL);
+    if (selinux_state.ss->policydb.policyvers >= POLICYDB_VERSION_XPERMS_IOCTL) {
+        ksu_allowxperm(&selinux_state.ss->policydb, KERNEL_SU_DOMAIN, ALL, "blk_file", ALL);
+        ksu_allowxperm(&selinux_state.ss->policydb, KERNEL_SU_DOMAIN, ALL, "fifo_file", ALL);
+        ksu_allowxperm(&selinux_state.ss->policydb, KERNEL_SU_DOMAIN, ALL, "chr_file", ALL);
+        ksu_allowxperm(&selinux_state.ss->policydb, KERNEL_SU_DOMAIN, ALL, "file", ALL);
     }
 
-    ksu_allow(&policydb, "init", KERNEL_SU_DOMAIN, ALL, ALL);
-    ksu_allow(&policydb, "servicemanager", KERNEL_SU_DOMAIN, "dir", "search");
-    ksu_allow(&policydb, "servicemanager", KERNEL_SU_DOMAIN, "dir", "read");
-    ksu_allow(&policydb, "servicemanager", KERNEL_SU_DOMAIN, "file", "open");
-    ksu_allow(&policydb, "servicemanager", KERNEL_SU_DOMAIN, "file", "read");
-    ksu_allow(&policydb, "servicemanager", KERNEL_SU_DOMAIN, "process", "getattr");
-    ksu_allow(&policydb, "domain", KERNEL_SU_DOMAIN, "process", "sigchld");
-    ksu_allow(&policydb, "logd", KERNEL_SU_DOMAIN, "dir", "search");
-    ksu_allow(&policydb, "logd", KERNEL_SU_DOMAIN, "file", "read");
-    ksu_allow(&policydb, "logd", KERNEL_SU_DOMAIN, "file", "open");
-    ksu_allow(&policydb, "logd", KERNEL_SU_DOMAIN, "file", "getattr");
-    ksu_allow(&policydb, "domain", KERNEL_SU_DOMAIN, "fd", "use");
-    ksu_allow(&policydb, "domain", KERNEL_SU_DOMAIN, "fifo_file", "write");
-    ksu_allow(&policydb, "domain", KERNEL_SU_DOMAIN, "fifo_file", "read");
-    ksu_allow(&policydb, "domain", KERNEL_SU_DOMAIN, "fifo_file", "open");
-    ksu_allow(&policydb, "domain", KERNEL_SU_DOMAIN, "fifo_file", "getattr");
-    ksu_allow(&policydb, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "read");
-    ksu_allow(&policydb, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "write");
-    ksu_allow(&policydb, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "connectto");
-    ksu_allow(&policydb, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "getopt");
-    ksu_allow(&policydb, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "getattr");
-    ksu_allow(&policydb, "domain", KERNEL_SU_DOMAIN, "memfd_file", "execute");
-    ksu_allow(&policydb, "domain", KERNEL_SU_DOMAIN, "memfd_file", "getattr");
-    ksu_allow(&policydb, "domain", KERNEL_SU_DOMAIN, "memfd_file", "map");
-    ksu_allow(&policydb, "domain", KERNEL_SU_DOMAIN, "memfd_file", "read");
-    ksu_allow(&policydb, "domain", KERNEL_SU_DOMAIN, "memfd_file", "write");
-    ksu_allow(&policydb, "hwservicemanager", KERNEL_SU_DOMAIN, "dir", "search");
-    ksu_allow(&policydb, "hwservicemanager", KERNEL_SU_DOMAIN, "file", "read");
-    ksu_allow(&policydb, "hwservicemanager", KERNEL_SU_DOMAIN, "file", "open");
-    ksu_allow(&policydb, "hwservicemanager", KERNEL_SU_DOMAIN, "process", "getattr");
-    ksu_allow(&policydb, "domain", KERNEL_SU_DOMAIN, "binder", ALL);
-    ksu_allow(&policydb, "system_server", KERNEL_SU_DOMAIN, "process", "getpgid");
-    ksu_allow(&policydb, "system_server", KERNEL_SU_DOMAIN, "process", "sigkill");
+    ksu_allow(&selinux_state.ss->policydb, "init", KERNEL_SU_DOMAIN, ALL, ALL);
+    ksu_allow(&selinux_state.ss->policydb, "servicemanager", KERNEL_SU_DOMAIN, "dir", "search");
+    ksu_allow(&selinux_state.ss->policydb, "servicemanager", KERNEL_SU_DOMAIN, "dir", "read");
+    ksu_allow(&selinux_state.ss->policydb, "servicemanager", KERNEL_SU_DOMAIN, "file", "open");
+    ksu_allow(&selinux_state.ss->policydb, "servicemanager", KERNEL_SU_DOMAIN, "file", "read");
+    ksu_allow(&selinux_state.ss->policydb, "servicemanager", KERNEL_SU_DOMAIN, "process", "getattr");
+    ksu_allow(&selinux_state.ss->policydb, "domain", KERNEL_SU_DOMAIN, "process", "sigchld");
+    ksu_allow(&selinux_state.ss->policydb, "logd", KERNEL_SU_DOMAIN, "dir", "search");
+    ksu_allow(&selinux_state.ss->policydb, "logd", KERNEL_SU_DOMAIN, "file", "read");
+    ksu_allow(&selinux_state.ss->policydb, "logd", KERNEL_SU_DOMAIN, "file", "open");
+    ksu_allow(&selinux_state.ss->policydb, "logd", KERNEL_SU_DOMAIN, "file", "getattr");
+    ksu_allow(&selinux_state.ss->policydb, "domain", KERNEL_SU_DOMAIN, "fd", "use");
+    ksu_allow(&selinux_state.ss->policydb, "domain", KERNEL_SU_DOMAIN, "fifo_file", "write");
+    ksu_allow(&selinux_state.ss->policydb, "domain", KERNEL_SU_DOMAIN, "fifo_file", "read");
+    ksu_allow(&selinux_state.ss->policydb, "domain", KERNEL_SU_DOMAIN, "fifo_file", "open");
+    ksu_allow(&selinux_state.ss->policydb, "domain", KERNEL_SU_DOMAIN, "fifo_file", "getattr");
+    ksu_allow(&selinux_state.ss->policydb, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "read");
+    ksu_allow(&selinux_state.ss->policydb, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "write");
+    ksu_allow(&selinux_state.ss->policydb, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "connectto");
+    ksu_allow(&selinux_state.ss->policydb, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "getopt");
+    ksu_allow(&selinux_state.ss->policydb, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "getattr");
+    ksu_allow(&selinux_state.ss->policydb, "domain", KERNEL_SU_DOMAIN, "memfd_file", "execute");
+    ksu_allow(&selinux_state.ss->policydb, "domain", KERNEL_SU_DOMAIN, "memfd_file", "getattr");
+    ksu_allow(&selinux_state.ss->policydb, "domain", KERNEL_SU_DOMAIN, "memfd_file", "map");
+    ksu_allow(&selinux_state.ss->policydb, "domain", KERNEL_SU_DOMAIN, "memfd_file", "read");
+    ksu_allow(&selinux_state.ss->policydb, "domain", KERNEL_SU_DOMAIN, "memfd_file", "write");
+    ksu_allow(&selinux_state.ss->policydb, "hwservicemanager", KERNEL_SU_DOMAIN, "dir", "search");
+    ksu_allow(&selinux_state.ss->policydb, "hwservicemanager", KERNEL_SU_DOMAIN, "file", "read");
+    ksu_allow(&selinux_state.ss->policydb, "hwservicemanager", KERNEL_SU_DOMAIN, "file", "open");
+    ksu_allow(&selinux_state.ss->policydb, "hwservicemanager", KERNEL_SU_DOMAIN, "process", "getattr");
+    ksu_allow(&selinux_state.ss->policydb, "domain", KERNEL_SU_DOMAIN, "binder", ALL);
+    ksu_allow(&selinux_state.ss->policydb, "system_server", KERNEL_SU_DOMAIN, "process", "getpgid");
+    ksu_allow(&selinux_state.ss->policydb, "system_server", KERNEL_SU_DOMAIN, "process", "sigkill");
 #ifdef CONFIG_KSU_SUSFS
-    ksu_allow(&policydb, "zygote", "labeledfs", "filesystem", "unmount");
+    ksu_allow(&selinux_state.ss->policydb, "zygote", "labeledfs", "filesystem", "unmount");
 #endif
 
-    write_unlock(&policy_rwlock);
+    write_unlock(&selinux_state.ss->policy_rwlock);
 
     reset_avc_cache_419();
 #ifdef CONFIG_KSU_SUSFS
@@ -528,7 +528,7 @@ int handle_sepolicy(void __user *user_data, u64 data_len)
     if (!getenforce())
         pr_info("SELinux permissive or disabled when handle policy!\n");
 
-    write_lock(&policy_rwlock);
+    write_lock(&selinux_state.ss->policy_rwlock);
     cursor.cur = payload;
     cursor.end = payload + (size_t)data_len;
     ret = 0;
@@ -548,12 +548,12 @@ int handle_sepolicy(void __user *user_data, u64 data_len)
             if (ret < 0) break;
         }
         if (ret < 0) break;
-        ret = apply_one_sepolicy_cmd(&policydb, &header, args);
+        ret = apply_one_sepolicy_cmd(&selinux_state.ss->policydb, &header, args);
         if (ret < 0) pr_err("sepol: cmd #%u failed cmd=%u subcmd=%u\n", cmd_index, header.cmd, header.subcmd);
         else success_cmd_count++;
         cmd_index++;
     }
-    write_unlock(&policy_rwlock);
+    write_unlock(&selinux_state.ss->policy_rwlock);
     reset_avc_cache_419();
 #ifdef CONFIG_KSU_SUSFS
     susfs_set_batch_sid();
@@ -786,10 +786,10 @@ out_free:
 
 #endif /* LINUX_VERSION_CODE >= 5.10.0 */
 RULESEOF
-echo "  ✅ rules.c dual-path réinstallé"
+echo "  ✅ rules.c dual-path réinstallé (selinux_state.ss->policydb sur 4.19)"
 
-# ==================== 4b. COMPATIBILITÉ 4.19 (9 fixes) ====================
-echo "=== Correctifs ciblés 4.19 (9 fixes) ==="
+# ==================== 4b. COMPATIBILITÉ 4.19 (10 fixes) ====================
+echo "=== Correctifs ciblés 4.19 (10 fixes) ==="
 python3 - "$GITHUB_WORKSPACE" <<'FIXEOF' 2>&1 | tee -a "$AUDIT"
 import os, sys, re
 
@@ -921,7 +921,7 @@ if os.path.isfile(p):
         write(p, c); total += 1
         print(f"  ✅ infra/su_mount_ns.c: uapi/linux/mount.h")
 
-# --- FIX 6 : pkg_observer.c — réécriture complète ---
+# --- FIX 6 : pkg_observer.c ---
 p = os.path.join(ksu_root, "manager/pkg_observer.c")
 if os.path.isfile(p):
     c = read(p)
@@ -1119,7 +1119,7 @@ if os.path.isdir(ksu_root):
                 write(p, c); total += 1
                 print(f"  ✅ {os.path.relpath(p, GW)}: TWA_RESUME + sched/task.h")
 
-# --- FIX 8 : app_profile.c seccomp_filter_release ---
+# --- FIX 8 : app_profile.c ---
 p = os.path.join(ksu_root, "policy/app_profile.c")
 if os.path.isfile(p):
     c = read(p); original = c
@@ -1181,7 +1181,7 @@ if os.path.isfile(p):
         1
     )
 
-    # 9d. add_filename_trans — backport API 4.19 (hashtab filename_trans)
+    # 9d. add_filename_trans backport
     old_open = '''static bool add_filename_trans(struct policydb *db, const char *s, const char *t, const char *c, const char *d,
                                const char *o)
 {
@@ -1208,9 +1208,7 @@ out:
 /* API 4.19 : struct filename_trans = {stype, ttype, tclass, name}
  *             struct filename_trans_datum = {otype}
  *             db->filename_trans = hashtab*
- *             db->filename_trans_ttypes = ebitmap des ttypes
- * La refonte 5.9 (filename_trans_key, filename_trans_datum.stypes/next,
- * policydb_filenametr_search) n'existe pas sur 4.19. */
+ *             db->filename_trans_ttypes = ebitmap des ttypes */
 static bool add_filename_trans(struct policydb *db, const char *s, const char *t, const char *c, const char *d,
                                const char *o)
 {
@@ -1231,7 +1229,6 @@ static bool add_filename_trans(struct policydb *db, const char *s, const char *t
     def = symtab_search(&db->p_types, d);
     if (!def) { pr_warn("default type %s does not exist\\n", d); return false; }
 
-    /* 1. Chercher une entrée existante */
     key.stype = src->value;
     key.ttype = tgt->value;
     key.tclass = cls->value;
@@ -1239,12 +1236,10 @@ static bool add_filename_trans(struct policydb *db, const char *s, const char *t
 
     datum = hashtab_search(db->filename_trans, &key);
     if (datum) {
-        /* Entrée existante : mise à jour de l'otype */
         datum->otype = def->value;
         return true;
     }
 
-    /* 2. Aucune entrée : insérer */
     new_key = kzalloc(sizeof(*new_key), GFP_KERNEL);
     if (!new_key) return false;
     new_key->stype = src->value;
@@ -1272,7 +1267,7 @@ static bool add_filename_trans(struct policydb *db, const char *s, const char *t
     if old_close in c and '#else\n/* API 4.19 : struct filename_trans = {stype, ttype, tclass, name}' not in c:
         c = c.replace(old_close, new_close, 1)
 
-    # 9e. add_type — walker pour remplacer le corps par version dual-path
+    # 9e. add_type walker
     m = re.search(r'^static bool add_type\(struct policydb \*db, const char \*type_name, bool attr\)\n\{', c, re.MULTILINE)
     if m and 'KSU_ADD_TYPE_FLEX_ARRAY' not in c:
         start = m.start()
@@ -1381,9 +1376,54 @@ static bool add_filename_trans(struct policydb *db, const char *s, const char *t
     if old in c and new not in c:
         c = c.replace(old, new, 1)
 
+    # 9g. ksu_dup_sepolicy / ksu_destroy_sepolicy — guards 4.19
+    old = ('void ksu_destroy_sepolicy(struct selinux_policy *pol)\n'
+           '{\n'
+           '    policydb_destroy(&pol->policydb);\n'
+           '    kfree(pol);\n'
+           '}\n'
+           '\n'
+           'struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)\n'
+           '{')
+    new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n'
+           'void ksu_destroy_sepolicy(struct selinux_policy *pol)\n'
+           '{\n'
+           '    policydb_destroy(&pol->policydb);\n'
+           '    kfree(pol);\n'
+           '}\n'
+           '\n'
+           'struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)\n'
+           '{')
+    if old in c and new not in c:
+        c = c.replace(old, new, 1)
+
+    old_close = ('out_free_data:\n'
+                 '    kvfree(data);\n'
+                 '\n'
+                 '    return ERR_PTR(ret);\n'
+                 '}\n')
+    new_close = ("out_free_data:\n"
+                 "    kvfree(data);\n"
+                 "\n"
+                 "    return ERR_PTR(ret);\n"
+                 "}\n"
+                 "#else\n"
+                 "/* 4.19: struct selinux_policy n'existe pas. Le policydb est\n"
+                 " * modifie en place sous write_lock(&selinux_state.ss->policy_rwlock)\n"
+                 " * dans rules.c. Ces fonctions ne sont jamais appelees sur 4.19. */\n"
+                 "void ksu_destroy_sepolicy(struct selinux_policy *pol) { (void)pol; }\n"
+                 "struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)\n"
+                 "{\n"
+                 "    (void)old_pol;\n"
+                 "    return ERR_PTR(-EOPNOTSUPP);\n"
+                 "}\n"
+                 "#endif\n")
+    if old_close in c and '#else\n/* 4.19: struct selinux_policy n' not in c:
+        c = c.replace(old_close, new_close, 1)
+
     if c != original:
         write(p, c); total += 1
-        print(f"  ✅ selinux/sepolicy.c: flex_array + filename_trans backport 4.19")
+        print(f"  ✅ selinux/sepolicy.c: FIX 9 complet")
 
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
@@ -1442,8 +1482,31 @@ grep -q "^CONFIG_KSU_SUSFS=y" out/.config || { echo "❌ CONFIG_KSU_SUSFS off"; 
 grep -q "^CONFIG_KSU_SUSFS_SUS_KSTAT=y" out/.config || { echo "❌ CONFIG_KSU_SUSFS_SUS_KSTAT off"; exit 1; }
 
 # ==================== 6. MOTOROLA ====================
-sed -i 's/if (!check_version(/if (0 \&\& !check_version(/g' kernel/module.c
-printf "\n#include <linux/notifier.h>\n#include <linux/module.h>\nstatic BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);\nint panel_register_notifier(struct notifier_block *nb){return blocking_notifier_chain_register(&motorola_panel_notifier_list,nb);}\nEXPORT_SYMBOL(panel_register_notifier);\nint panel_unregister_notifier(struct notifier_block *nb){return blocking_notifier_chain_unregister(&motorola_panel_notifier_list,nb);}\nEXPORT_SYMBOL(panel_unregister_notifier);\nvoid touch_set_state(int s){return;}\nEXPORT_SYMBOL(touch_set_state);\n" >> techpack/display/msm/msm_drv.c
+cat >> techpack/display/msm/msm_drv.c <<'EOF'
+
+#include <linux/notifier.h>
+#include <linux/module.h>
+
+static BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);
+
+int panel_register_notifier(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_register(&motorola_panel_notifier_list, nb);
+}
+EXPORT_SYMBOL(panel_register_notifier);
+
+int panel_unregister_notifier(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_unregister(&motorola_panel_notifier_list, nb);
+}
+EXPORT_SYMBOL(panel_unregister_notifier);
+
+void touch_set_state(int state)
+{
+	(void)state;
+}
+EXPORT_SYMBOL(touch_set_state);
+EOF
 
 # ==================== 7. COMPILATION ====================
 echo "=== Compilation ==="
