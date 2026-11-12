@@ -189,22 +189,32 @@ KSU_DIR="drivers/kernelsu"
 KSU_REPO_ROOT="$GITHUB_WORKSPACE/kernel_sources/FinaSU"
 echo "✅ FinaSU intégré"
 
-# ==================== 2b. VÉRIFICATION : les hooks manuels existent dans FinaSU ? ====================
-echo "=== Vérification des hooks manuels dans FinaSU ==="
+# ==================== 2b. SONDE : que contient FinaSU ? ====================
 {
     echo ""
-    echo "=== HOOKS MANUELS : présence des fonctions ksu_handle_* ==="
-    for fn in ksu_handle_execveat ksu_handle_faccessat ksu_handle_sys_read ksu_handle_stat ksu_handle_sys_reboot; do
-        count=$(grep -rl "$fn" "$KSU_DIR/" --include="*.c" --include="*.h" 2>/dev/null | wc -l)
-        if [ "$count" -gt 0 ]; then
-            echo "  ✅ $fn : présent ($count fichiers)"
+    echo "=== SONDE 1 : options Kconfig de FinaSU ==="
+    found_kconf=0
+    while IFS= read -r kf; do
+        [ -n "$kf" ] || continue
+        found_kconf=1
+        echo "--- $kf"
+        grep -E "^config[[:space:]]+KSU" "$kf" 2>/dev/null || echo "  (aucun config KSU_*)"
+    done < <(find drivers/kernelsu -name "Kconfig*" -type f 2>/dev/null)
+    [ "$found_kconf" -eq 0 ] && echo "  Aucun Kconfig* trouvé dans drivers/kernelsu"
+
+    echo ""
+    echo "=== SONDE 2 : fonctions ksu_handle_* présentes dans le driver ==="
+    for fn in ksu_handle_execveat ksu_handle_faccessat ksu_handle_sys_read ksu_handle_stat ksu_handle_sys_reboot ksu_handle_setresuid ksu_handle_vfs_read; do
+        if grep -rq "$fn" drivers/kernelsu/ --include='*.c' --include='*.h' 2>/dev/null; then
+            echo "  ✅ $fn"
         else
-            echo "  ❌ $fn : ABSENT → les patchs kernel causeront undefined symbol"
+            echo "  ❌ $fn ABSENT"
         fi
     done
+
     echo ""
-    echo "=== HOOKS MANUELS : fichiers qui définissent les ksu_handle_* ==="
-    grep -rn "^int ksu_handle_\|^__attribute__((hot)) int ksu_handle_\|^long ksu_handle_" "$KSU_DIR/" --include="*.c" 2>/dev/null | head -20 || true
+    echo "=== SONDE 3 : symboles de hook backend-ready ==="
+    grep -rn "ksu_hook_backend_ready\|hook_backend_ready" drivers/kernelsu/ --include='*.c' --include='*.h' 2>/dev/null | head -10 || echo "  introuvable"
 } 2>&1 | tee -a "$AUDIT"
 
 # ==================== 3. SIGNATURE MANAGER ====================
@@ -1839,6 +1849,11 @@ EXPORT_SYMBOL(path_umount);
         write(p, c); total += 1
         print(f"  ✅ fs/namespace.c: backport path_mount/path_umount")
 
+		if os.environ.get('HOOK_MODE', '') != 'manual':
+    print(f"  ⏭️ FIX 15 IGNORÉ : hook mode = {os.environ.get('HOOK_MODE', 'inconnu')} (MANUAL_HOOK absent)")
+else:
+    print(f"  → FIX 15 appliqué (hook mode = manual)")
+
 # --- FIX 15 : MANUAL_HOOK patchs kernel 4.19 (fs/exec.c, fs/open.c, fs/read_write.c, fs/stat.c, kernel/reboot.c) ---
 print("  → FIX 15 : patchs kernel MANUAL_HOOK")
 
@@ -1987,7 +2002,27 @@ grep "^CONFIG_KSU_SUSFS" out/.config | tee -a "$AUDIT"
 echo "=== FIN VÉRIFICATION CONFIG ===" | tee -a "$AUDIT"
 
 grep -q "^CONFIG_KSU=y" out/.config || { echo "❌ CONFIG_KSU off"; exit 1; }
-grep -q "^CONFIG_KSU_MANUAL_HOOK=y" out/.config || { echo "❌ CONFIG_KSU_MANUAL_HOOK off"; exit 1; }
+
+# Détection du mode de hook effectivement actif après olddefconfig
+HOOK_MODE=""
+for mode_var in KSU_MANUAL_HOOK KSU_HOOK_MANUAL KSU_HOOK_TRACEPOINT KSU_TRACEPOINT_HOOK KSU_WITH_KPROBES; do
+    if grep -q "^CONFIG_${mode_var}=y" out/.config; then
+        echo "  ✅ ${mode_var}=y" | tee -a "$AUDIT"
+        case "$mode_var" in
+            KSU_MANUAL_HOOK|KSU_HOOK_MANUAL) HOOK_MODE="manual" ;;
+            KSU_HOOK_TRACEPOINT|KSU_TRACEPOINT_HOOK) [ -z "$HOOK_MODE" ] && HOOK_MODE="tracepoint" ;;
+            KSU_WITH_KPROBES) [ -z "$HOOK_MODE" ] && HOOK_MODE="kprobes" ;;
+        esac
+    fi
+done
+if [ -z "$HOOK_MODE" ]; then
+    echo "❌ Aucun mode de hook KSU détecté dans out/.config" | tee -a "$AUDIT"
+    grep -E "^CONFIG_KSU" out/.config | tee -a "$AUDIT" || true
+    exit 1
+fi
+echo "  → Hook mode retenu : $HOOK_MODE" | tee -a "$AUDIT"
+export HOOK_MODE
+
 grep -q "^CONFIG_KSU_SUSFS=y" out/.config || { echo "❌ CONFIG_KSU_SUSFS off"; exit 1; }
 grep -q "^CONFIG_KSU_SUSFS_SUS_KSTAT=y" out/.config || { echo "❌ CONFIG_KSU_SUSFS_SUS_KSTAT off"; exit 1; }
 grep -q "^CONFIG_SECCOMP=y" out/.config || { echo "❌ CONFIG_SECCOMP off"; exit 1; }
