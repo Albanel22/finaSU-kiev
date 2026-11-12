@@ -1425,6 +1425,29 @@ static bool add_filename_trans(struct policydb *db, const char *s, const char *t
         write(p, c); total += 1
         print(f"  ✅ selinux/sepolicy.c: FIX 9 complet")
 
+	# --- FIX 10 : minmax.h — absent avant 5.10 ---
+if os.path.isdir(ksu_root):
+    for dp, dn, fn in os.walk(ksu_root):
+        for f in fn:
+            if not f.endswith(('.c', '.h')): continue
+            p = os.path.join(dp, f)
+            try: c = read(p)
+            except Exception: continue
+            if '#include <linux/minmax.h>' not in c: continue
+            if 'KSU_MINMAX_COMPAT' in c: continue
+            c = ensure_inc_after_last(c, '<linux/version.h>')
+            c = c.replace(
+                '#include <linux/minmax.h>',
+                '#define KSU_MINMAX_COMPAT 1\n'
+                '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n'
+                '#include <linux/minmax.h>\n'
+                '#else\n'
+                '#include <linux/kernel.h>\n'
+                '#endif',
+                1)
+            write(p, c); total += 1
+            print(f"  ✅ {os.path.relpath(p, GW)}: minmax.h guardé")
+
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
 
