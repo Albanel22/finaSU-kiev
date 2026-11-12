@@ -786,8 +786,8 @@ out_free:
 RULESEOF
 echo "  ✅ rules.c dual-path réinstallé"
 
-# ==================== 4b. COMPATIBILITÉ 4.19 (11 fixes) ====================
-echo "=== Correctifs ciblés 4.19 (11 fixes) ==="
+# ==================== 4b. COMPATIBILITÉ 4.19 (12 fixes) ====================
+echo "=== Correctifs ciblés 4.19 (12 fixes) ==="
 python3 - "$GITHUB_WORKSPACE" <<'FIXEOF' 2>&1 | tee -a "$AUDIT"
 import os, sys, re
 
@@ -1417,7 +1417,7 @@ static bool add_filename_trans(struct policydb *db, const char *s, const char *t
         write(p, c); total += 1
         print(f"  ✅ selinux/sepolicy.c: FIX 9 complet")
 
-# --- FIX 10 v2 : minmax.h → kernel.h (universel, pas de guard) ---
+# --- FIX 10 v2 : minmax.h → kernel.h ---
 if os.path.isdir(ksu_root):
     for dp, dn, fn in os.walk(ksu_root):
         for f in fn:
@@ -1434,6 +1434,74 @@ if os.path.isdir(ksu_root):
                 1)
             write(p, c); total += 1
             print(f"  ✅ {os.path.relpath(p, GW)}: minmax.h → kernel.h")
+
+# --- FIX 11 : tasklist_lock / init_task / task_pgrp / task_session headers ---
+if os.path.isdir(ksu_root):
+    for dp, dn, fn in os.walk(ksu_root):
+        for f in fn:
+            if not f.endswith(('.c', '.h')): continue
+            p = os.path.join(dp, f)
+            try: c = read(p)
+            except Exception: continue
+            needed = []
+            if 'tasklist_lock' in c: needed.append('<linux/sched.h>')
+            if 'task_pgrp' in c or 'task_session' in c: needed.append('<linux/sched/signal.h>')
+            if 'init_task' in c: needed.append('<linux/sched/task.h>')
+            if not needed: continue
+            original = c
+            for inc in needed:
+                c = ensure_inc_after_last(c, inc)
+            if c != original:
+                write(p, c); total += 1
+                print(f"  ✅ {os.path.relpath(p, GW)}: {', '.join(needed)}")
+
+# --- FIX 12 : dispatch.c compat (task_pgrp/task_session/tasklist_lock/init_task) ---
+p = os.path.join(ksu_root, "supercall/dispatch.c")
+if os.path.isfile(p):
+    c = read(p); original = c
+
+    for inc in ['<linux/sched.h>', '<linux/sched/task.h>', '<linux/pid.h>', '<linux/spinlock.h>']:
+        c = ensure_inc_after_last(c, inc)
+
+    compat_block = '''
+/* KSU_DISPATCH_419_COMPAT : fallback si task_pgrp/task_session/tasklist_lock
+ * ne sont pas exposes par les headers de ce fork 4.19. */
+#ifndef KSU_DISPATCH_419_COMPAT
+#define KSU_DISPATCH_419_COMPAT 1
+extern struct task_struct init_task;
+extern rwlock_t tasklist_lock;
+#ifdef task_pgrp
+#undef task_pgrp
+#endif
+#ifdef task_session
+#undef task_session
+#endif
+static inline struct pid *ksu_task_pgrp_419(struct task_struct *task)
+{
+    return task->signal->pids[PIDTYPE_PGID];
+}
+static inline struct pid *ksu_task_session_419(struct task_struct *task)
+{
+    return task->signal->pids[PIDTYPE_SID];
+}
+#define task_pgrp(task)    ksu_task_pgrp_419(task)
+#define task_session(task) ksu_task_session_419(task)
+#endif
+'''
+
+    if 'KSU_DISPATCH_419_COMPAT' not in c:
+        lines = c.split('\n')
+        last_inc = -1
+        for i, ln in enumerate(lines):
+            if ln.lstrip().startswith('#include'):
+                last_inc = i
+        if last_inc >= 0:
+            lines.insert(last_inc + 1, compat_block)
+            c = '\n'.join(lines)
+        else:
+            c = compat_block + '\n' + c
+        write(p, c); total += 1
+        print(f"  ✅ supercall/dispatch.c: compat 4.19 (externs + wrappers)")
 
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
