@@ -426,8 +426,6 @@ static int apply_one_sepolicy_cmd(struct policydb *db, const struct sepol_data *
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 
-/* 4.19: policydb et policy_rwlock sont embarqués dans struct selinux_ss,
- * accessible via selinux_state.ss. Pas de globals policydb / policy_rwlock. */
 struct selinux_avc;
 extern int avc_ss_reset(struct selinux_avc *avc, u32 seqno);
 
@@ -786,10 +784,10 @@ out_free:
 
 #endif /* LINUX_VERSION_CODE >= 5.10.0 */
 RULESEOF
-echo "  ✅ rules.c dual-path réinstallé (selinux_state.ss->policydb sur 4.19)"
+echo "  ✅ rules.c dual-path réinstallé"
 
-# ==================== 4b. COMPATIBILITÉ 4.19 (10 fixes) ====================
-echo "=== Correctifs ciblés 4.19 (10 fixes) ==="
+# ==================== 4b. COMPATIBILITÉ 4.19 (11 fixes) ====================
+echo "=== Correctifs ciblés 4.19 (11 fixes) ==="
 python3 - "$GITHUB_WORKSPACE" <<'FIXEOF' 2>&1 | tee -a "$AUDIT"
 import os, sys, re
 
@@ -1148,7 +1146,6 @@ if os.path.isfile(p):
 
     c = ensure_inc_after_last(c, '<linux/flex_array.h>')
 
-    # 9b. helpers avtab htable
     if 'ksu_avtab_htable_get' not in c and '#define KSU_SUPPORT_ADD_TYPE' in c:
         c = c.replace(
             '#define KSU_SUPPORT_ADD_TYPE\n',
@@ -1164,7 +1161,6 @@ if os.path.isfile(p):
             1
         )
 
-    # 9c. remove_avtab_node
     c = c.replace(
         'for (n = db->te_avtab.htable[i]; n; prev = n, n = n->next) {',
         'for (n = ksu_avtab_htable_get(db->te_avtab, i); n; prev = n, n = n->next) {',
@@ -1181,7 +1177,6 @@ if os.path.isfile(p):
         1
     )
 
-    # 9d. add_filename_trans backport
     old_open = '''static bool add_filename_trans(struct policydb *db, const char *s, const char *t, const char *c, const char *d,
                                const char *o)
 {
@@ -1267,7 +1262,6 @@ static bool add_filename_trans(struct policydb *db, const char *s, const char *t
     if old_close in c and '#else\n/* API 4.19 : struct filename_trans = {stype, ttype, tclass, name}' not in c:
         c = c.replace(old_close, new_close, 1)
 
-    # 9e. add_type walker
     m = re.search(r'^static bool add_type\(struct policydb \*db, const char \*type_name, bool attr\)\n\{', c, re.MULTILINE)
     if m and 'KSU_ADD_TYPE_FLEX_ARRAY' not in c:
         start = m.start()
@@ -1366,7 +1360,6 @@ static bool add_filename_trans(struct policydb *db, const char *s, const char *t
                         '}')
             c = c[:start] + new_func + c[end+1:]
 
-    # 9f. add_typeattribute_raw
     old = '    struct ebitmap *sattr = &db->type_attr_map_array[type->value - 1];'
     new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n'
            '    struct ebitmap *sattr = &db->type_attr_map_array[type->value - 1];\n'
@@ -1376,7 +1369,6 @@ static bool add_filename_trans(struct policydb *db, const char *s, const char *t
     if old in c and new not in c:
         c = c.replace(old, new, 1)
 
-    # 9g. ksu_dup_sepolicy / ksu_destroy_sepolicy — guards 4.19
     old = ('void ksu_destroy_sepolicy(struct selinux_policy *pol)\n'
            '{\n'
            '    policydb_destroy(&pol->policydb);\n'
@@ -1425,7 +1417,7 @@ static bool add_filename_trans(struct policydb *db, const char *s, const char *t
         write(p, c); total += 1
         print(f"  ✅ selinux/sepolicy.c: FIX 9 complet")
 
-	# --- FIX 10 : minmax.h — absent avant 5.10 ---
+# --- FIX 10 v2 : minmax.h → kernel.h (universel, pas de guard) ---
 if os.path.isdir(ksu_root):
     for dp, dn, fn in os.walk(ksu_root):
         for f in fn:
@@ -1435,18 +1427,13 @@ if os.path.isdir(ksu_root):
             except Exception: continue
             if '#include <linux/minmax.h>' not in c: continue
             if 'KSU_MINMAX_COMPAT' in c: continue
-            c = ensure_inc_after_last(c, '<linux/version.h>')
             c = c.replace(
                 '#include <linux/minmax.h>',
-                '#define KSU_MINMAX_COMPAT 1\n'
-                '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n'
-                '#include <linux/minmax.h>\n'
-                '#else\n'
-                '#include <linux/kernel.h>\n'
-                '#endif',
+                '/* KSU_MINMAX_COMPAT: kernel.h fournit min_t/max_t sur tous les kernels */\n'
+                '#include <linux/kernel.h>',
                 1)
             write(p, c); total += 1
-            print(f"  ✅ {os.path.relpath(p, GW)}: minmax.h guardé")
+            print(f"  ✅ {os.path.relpath(p, GW)}: minmax.h → kernel.h")
 
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
