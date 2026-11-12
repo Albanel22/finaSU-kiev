@@ -1474,7 +1474,7 @@ extern rwlock_t tasklist_lock;
 #undef task_pgrp
 #endif
 #ifdef task_session
-#undef task_session
+#undef taKSfðð_session
 #endif
 static inline struct pid *ksu_task_pgrp_419(struct task_struct *task)
 {
@@ -1503,6 +1503,94 @@ static inline struct pid *ksu_task_session_419(struct task_struct *task)
         write(p, c); total += 1
         print(f"  ✅ supercall/dispatch.c: compat 4.19 (externs + wrappers)")
 
+		# --- FIX 13 : selinux_hide.c — stub 4.19 (SuSFS fournit le hide equivalent) ---
+p = os.path.join(ksu_root, "feature/selinux_hide.c")
+if os.path.isfile(p):
+    c = read(p)
+    if 'KSU_SELINUX_HIDE_4_19_STUB' not in c:
+        stub_prefix = (
+            '// SPDX-License-Identifier: GPL-2.0\n'
+            '// KSU_SELINUX_HIDE_4_19_STUB\n'
+            '// Sur 4.19, selinux_hide necessite la dual-policy API (struct selinux_policy,\n'
+            '// selinux_state.policy, selinux_state.status_lock/status_page) qui n\'existe pas.\n'
+            '// Avec CONFIG_KSU_SUSFS=y, SuSFS fournit les mecanismes equivalents :\n'
+            '// susfs_add_sus_path, susfs_set_uname, susfs_spoof_cmdline_or_bootconfig,\n'
+            '// susfs_set_avc_log_spoofing. Sur 5.10+ le code original est conserve.\n'
+            '#include <linux/version.h>\n'
+            '#include <linux/types.h>\n'
+            '#include <linux/errno.h>\n'
+            '#define KSU_SELINUX_HIDE_4_19_STUB 1\n'
+            '#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n'
+            'struct selinux_policy;\n'
+            'bool ksu_selinux_hide_enabled = false;\n'
+            'bool ksu_selinux_hide_running = false;\n'
+            'int ksu_selinux_hide_enable(void) { return -EOPNOTSUPP; }\n'
+            'int ksu_selinux_hide_disable(void) { return 0; }\n'
+            'void ksu_selinux_hide_unhook(void) { }\n'
+            'void initialize_fake_status(void) { }\n'
+            'void ksu_selinux_hide_handle_post_fs_data(void) { }\n'
+            'void ksu_selinux_hide_handle_second_stage(void) { }\n'
+            'void ksu_selinux_hide_drop_backup_if_unused(void) { }\n'
+            'void ksu_selinux_hide_handle_umount(void) { }\n'
+            'int ksu_selinux_hide_init(void) { return 0; }\n'
+            'void ksu_selinux_hide_exit(void) { }\n'
+            '#else\n')
+        lines = c.split('\n')
+        removed_ver_inc = False
+        out = []
+        for ln in lines:
+            if not removed_ver_inc and ln.strip() == '#include <linux/version.h>':
+                removed_ver_inc = True
+                continue
+            out.append(ln)
+        c = stub_prefix + '\n'.join(out) + '\n#endif /* KSU_SELINUX_HIDE_4_19_STUB */\n'
+        write(p, c); total += 1
+        print(f"  ✅ feature/selinux_hide.c: stub 4.19 (SuSFS remplace)")
+
+		# --- FIX 13 : selinux_hide.c — stub 4.19 (SuSFS fournit le hide equivalent) ---
+p = os.path.join(ksu_root, "feature/selinux_hide.c")
+if os.path.isfile(p):
+    c = read(p)
+    if 'KSU_SELINUX_HIDE_4_19_STUB' not in c:
+        stub_prefix = (
+            '// SPDX-License-Identifier: GPL-2.0\n'
+            '// KSU_SELINUX_HIDE_4_19_STUB\n'
+            '// Sur 4.19, selinux_hide necessite la dual-policy API (struct selinux_policy,\n'
+            '// selinux_state.policy, selinux_state.status_lock/status_page) qui n\'existe pas.\n'
+            '// Avec CONFIG_KSU_SUSFS=y, SuSFS fournit les mecanismes equivalents :\n'
+            '// susfs_add_sus_path, susfs_set_uname, susfs_spoof_cmdline_or_bootconfig,\n'
+            '// susfs_set_avc_log_spoofing. Sur 5.10+ le code original est conserve.\n'
+            '#include <linux/version.h>\n'
+            '#include <linux/types.h>\n'
+            '#include <linux/errno.h>\n'
+            '#define KSU_SELINUX_HIDE_4_19_STUB 1\n'
+            '#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n'
+            'struct selinux_policy;\n'
+            'bool ksu_selinux_hide_enabled = false;\n'
+            'bool ksu_selinux_hide_running = false;\n'
+            'int ksu_selinux_hide_enable(void) { return -EOPNOTSUPP; }\n'
+            'int ksu_selinux_hide_disable(void) { return 0; }\n'
+            'void ksu_selinux_hide_unhook(void) { }\n'
+            'void initialize_fake_status(void) { }\n'
+            'void ksu_selinux_hide_handle_post_fs_data(void) { }\n'
+            'void ksu_selinux_hide_handle_second_stage(void) { }\n'
+            'void ksu_selinux_hide_drop_backup_if_unused(void) { }\n'
+            'void ksu_selinux_hide_handle_umount(void) { }\n'
+            'int ksu_selinux_hide_init(void) { return 0; }\n'
+            'void ksu_selinux_hide_exit(void) { }\n'
+            '#else\n')
+        lines = c.split('\n')
+        removed_ver_inc = False
+        out = []
+        for ln in lines:
+            if not removed_ver_inc and ln.strip() == '#include <linux/version.h>':
+                removed_ver_inc = True
+                continue
+            out.append(ln)
+        c = stub_prefix + '\n'.join(out) + '\n#endif /* KSU_SELINUX_HIDE_4_19_STUB */\n'
+        write(p, c); total += 1
+        print(f"  ✅ feature/selinux_hide.c: stub 4.19 (SuSFS remplace)")
+
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
 
@@ -1511,7 +1599,7 @@ export ARCH=arm64 SUBARCH=arm64
 export CROSS_COMPILE=aarch64-linux-gnu-
 export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 CLANG_MAJOR=$(clang --version | sed -n 's/.*clang version \([0-9]*\).*/\1/p' | head -1)
-CC_ARGS=""
+CC_ARGS=""é
 if [ "${FORCE_CLANG_WRAP:-1}" = "1" ] || [ "${CLANG_MAJOR:-99}" -lt 16 ]; then
     cat > "$GITHUB_WORKSPACE/clang-wrap" <<'W'
 #!/bin/bash
