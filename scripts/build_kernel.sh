@@ -1874,6 +1874,45 @@ if os.path.isfile(p):
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
 
+# ==================== 4c. FIX RUNTIME : ksu_hook_backend_ready ====================
+echo "=== Patch runtime : ksu_hook_backend_ready ne meurt plus sur échec sucompat ===" | tee -a "$AUDIT"
+python3 - "$GITHUB_WORKSPACE" <<'READYEOF' 2>&1 | tee -a "$AUDIT"
+import sys, os, re
+p = os.path.join(sys.argv[1], "kernel_sources/FinaSU/kernel/extension/susfs.c")
+if not os.path.isfile(p):
+    print(f"  ❌ introuvable: {p}"); sys.exit(1)
+c = open(p, encoding='utf-8', errors='replace').read()
+if 'FIX: échec ponctuel' in c:
+    print("  ⚠️ déjà patché, skip"); sys.exit(0)
+bad = ('        pr_err("sucompat: install session fd failed: %d\\n", ret);\n'
+       '        ksu_hook_backend_ready = false;\n')
+good = ('        pr_err("sucompat: install session fd failed: %d\\n", ret);\n'
+        '        /* FIX: échec ponctuel de ksu_install_su_fd() ne doit PAS\n'
+        '         * désactiver le backend supercall pour tout le boot. */\n')
+if bad in c:
+    c2 = c.replace(bad, good, 1)
+elif (m := re.search(
+        r'(\n[ \t]*pr_err\("sucompat: install session fd failed[^\n]*\n)'
+        r'[ \t]*ksu_hook_backend_ready = false;\n', c)):
+    c2 = c[:m.start()] + m.group(1) + \
+         '        /* FIX: échec ponctuel de ksu_install_su_fd() ne doit PAS\n' \
+         '         * désactiver le backend supercall pour tout le boot. */\n' + \
+         c[m.end():]
+else:
+    print("  ❌ motif 'sucompat: install session fd failed' + ksu_hook_backend_ready = false introuvable")
+    print("  → inspecte kernel_sources/FinaSU/kernel/extension/susfs.c")
+    sys.exit(1)
+open(p, 'w', encoding='utf-8').write(c2)
+# post-check
+c = open(p, encoding='utf-8', errors='replace').read()
+i = c.find('sucompat: install session fd failed')
+ctx = c[i:i+400]
+if 'ksu_hook_backend_ready = false' in ctx and 'FIX:' not in ctx:
+    print("  ❌ post-check KO : la ligne ksu_hook_backend_ready = false est encore là"); sys.exit(1)
+print("  ✅ extension/susfs.c: ksu_hook_backend_ready n'est plus mis à false sur échec sucompat")
+READYEOF
+
+
 # ==================== 5. CONFIG ====================
 export ARCH=arm64 SUBARCH=arm64
 export CROSS_COMPILE=aarch64-linux-gnu-
@@ -1923,6 +1962,31 @@ CONFIG_COMPAT=y
 CONFIG_COMPAT_32BIT_TIME=y
 EOF
 make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig 2>&1 | tail -3
+
+# §3 — Force OFF dynamic manager (sinon le manager peut ne pas résoudre le kernel)
+if grep -q '^CONFIG_KSU_DYNAMIC_MANAGER=y' out/.config; then
+    sed -i 's/^CONFIG_KSU_DYNAMIC_MANAGER=y/# CONFIG_KSU_DYNAMIC_MANAGER is not set/' out/.config
+    echo "  ✅ CONFIG_KSU_DYNAMIC_MANAGER forcé OFF (post-olddefconfig)" | tee -a "$AUDIT"
+else
+    echo "  ✅ CONFIG_KSU_DYNAMIC_MANAGER déjà désactivé" | tee -a "$AUDIT"
+fi
+
+# §2 — Sonde : prérequis du tracepoint backend
+echo "=== PROBE : prérequis tracepoint backend ===" | tee -a "$AUDIT"
+for sym in FTRACE_SYSCALLS HAVE_SYSCALL_TRACEPOINTS FTRACE KPROBES KRETPROBES KALLSYMS KALLSYMS_ALL; do
+    v=$(grep -E "^CONFIG_${sym}=" out/.config || true)
+    [ -z "$v" ] && v="# CONFIG_${sym} absent"
+    echo "  $v" | tee -a "$AUDIT"
+done
+miss=0
+for sym in FTRACE_SYSCALLS HAVE_SYSCALL_TRACEPOINTS; do
+    grep -q "^CONFIG_${sym}=y" out/.config || {
+        echo "  ⚠️ CONFIG_${sym} manquant → le tracepoint backend échouera probablement"
+        miss=1
+    }
+done
+[ "$miss" -eq 1 ] && echo "  ⚠️ Vérifie dmesg au boot : 'tracepoint backend initialization failed: -XX'"
+echo "=== FIN PROBE ===" | tee -a "$AUDIT"
 
 echo "=== VÉRIFICATION CONFIG KSU ===" | tee -a "$AUDIT"
 grep "^CONFIG_KSU" out/.config | tee -a "$AUDIT"
