@@ -256,6 +256,20 @@ grep -rl "anon_inode_getfile" "$KSU_DIR/" 2>/dev/null | while read -r f; do
     sed -i 's/O_RDWR | O_CLOEXEC/O_RDWR/g; s/O_RDWR|O_CLOEXEC/O_RDWR/g; s/, O_CLOEXEC)/)/g' "$f"
 done || true
 
+# ==================== EXPORT SOLIDE DES SYMBOLES SELINUX ====================
+for f in "security/selinux/ss/status.c" "security/selinux/selinuxfs.c"; do
+    if [ -f "$f" ]; then
+        # Supprime le 'static' et s'assure qu'elles sont exportées ou globales
+        sed -i -E 's/^static[[:space:]]+(struct page[[:space:]]*\*[[:space:]]*selinux_status_page)/\1/' "$f" || true
+        sed -i -E 's/^static[[:space:]]+(DEFINE_MUTEX\(selinux_status_lock\))/\1/' "$f" || true
+    fi
+done
+
+# Si elles ne sont toujours pas trouvées ou définies comme extern dans status.c, on force une définition de secours propre
+if ! grep -rq "selinux_status_lock" security/selinux/; then
+    printf "\nstruct mutex selinux_status_lock;\nstruct page *selinux_status_page = NULL;\n" >> security/selinux/ss/status.c
+fi
+
 # ==================== 4a. rules.c dual-path ====================
 echo "=== Réécriture rules.c dual-path (4.19: selinux_state.ss->policydb) ==="
 cat > "$KSU_DIR/selinux/rules.c" << 'RULESEOF'
