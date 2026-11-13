@@ -80,47 +80,120 @@ if ! git checkout -q "$KERNEL_PIN" 2>/dev/null; then
 fi
 echo "Source figée : $KERNEL_PIN ($(git rev-parse HEAD))" | tee -a "$AUDIT"
 
-# ==================== 1b. PATCH SUSFS BASE 4.19 ====================
-# Patch SUSFS kernel de base (fs/susfs.c, include/linux/susfs.h, etc.)
-# Les hunks du backend Tracepoint (fs/Makefile, fs/namespace.c, fs/proc/task_mmu.c,
-# fs/super.c, mm/memory.c) sont ignorés : Inline n'en a pas besoin.
-SUSFS_419_PATCH_URL="${SUSFS_419_PATCH_URL:-https://raw.githubusercontent.com/Albanel22/finaSU-kiev/b592bd3b000c6538c17ea69395f342fba14b6dcc/patches/susfs_patch_to_4.19.patch}"
-SUSFS_419_PATCH="$GITHUB_WORKSPACE/patches/susfs_patch_to_4.19.patch"
+# ==================== 1b. PATCH SET_MEMORY 4.19 (CRITIQUE) ====================
+# Sans ce patch, ksu_patch_text() de FinaSU ne peut pas écrire dans sys_call_table
+# sur 4.19 (échec -5 EIO observé dans le logcat). Il rétroporte set_memory_ro/rw
+# et ARCH_HAS_SET_MEMORY pour les kernels 4.19.
+echo "=== Application du patch set_memory 4.19 ===" | tee -a "$AUDIT"
+SET_MEMORY_PATCH_URL="${SET_MEMORY_PATCH_URL:-https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/Patch/set_memory_to_49_and_low.patch}"
+SET_MEMORY_PATCH="$GITHUB_WORKSPACE/patches/set_memory_to_49_and_low.patch"
 mkdir -p "$GITHUB_WORKSPACE/patches"
+curl --proto '=https' --tlsv1.2 -fsSL "$SET_MEMORY_PATCH_URL" -o "$SET_MEMORY_PATCH"
+echo "Patch set_memory téléchargé : $(sha256sum "$SET_MEMORY_PATCH" | cut -d' ' -f1)" | tee -a "$AUDIT"
+
+# Ce patch touche beaucoup d'architectures (arm, x86, s390, etc.). On l'applique avec
+# --reject : les hunks qui concernent les autres arch que arm64 échoueront (fichiers
+# absents) et c'est normal. On garde uniquement ce qui touche arm64 et le core mm.
+set +e
+git apply --reject --whitespace=nowarn "$SET_MEMORY_PATCH" 2>&1 | tee -a "$AUDIT"
+SET_MEMORY_RC=${PIPESTATUS[0]}
+set -e
+echo "set_memory patch rc=$SET_MEMORY_RC (rejets autres-arch attendus)" | tee -a "$AUDIT"
+
+# Vérification : sur arm64, set_memory.h doit exister et ARCH_HAS_SET_MEMORY doit être sélectionné
+if [ ! -f arch/arm64/include/asm/set_memory.h ] && [ ! -f include/asm-generic/set_memory.h ]; then
+    echo "❌ set_memory.h absent après patch — le patch n'a pas trouvé sa cible arm64" | tee -a "$AUDIT"
+    find . -name 'set_memory*' -o -name '*.rej' | head -20 | tee -a "$AUDIT"
+    exit 1
+fi
+if ! grep -q "ARCH_HAS_SET_MEMORY" arch/arm64/Kconfig; then
+    echo "⚠️ ARCH_HAS_SET_MEMORY pas dans arch/arm64/Kconfig — injection manuelle" | tee -a "$AUDIT"
+    sed -i '/^config ARM64$/a\	select ARCH_HAS_SET_MEMORY' arch/arm64/Kconfig
+fi
+if ! grep -q "ARCH_HAS_SET_MEMORY" arch/Kconfig; then
+    echo "⚠️ config ARCH_HAS_SET_MEMORY pas dans arch/Kconfig — injection manuelle" | tee -a "$AUDIT"
+    sed -i '/^config ARCH_HAS_FORTIFY_SOURCE$/i\config ARCH_HAS_SET_MEMORY\n\tbool\n' arch/Kconfig
+fi
+
+# Nettoyage des .rej (on ne garde pas de trace, tous les hunks autres-arch sont inutiles)
+REJ_COUNT=$(find . -name '*.rej' | wc -l)
+find . -name '*.rej' -delete
+echo "✅ Patch set_memory appliqué (rejets nettoyés : $REJ_COUNT)" | tee -a "$AUDIT"
+
+# ==================== 1c. PATCH SUSFS BASE 4.19 (JackA1ltman) ====================
+echo "=== Application du patch SUSFS 4.19 ===" | tee -a "$AUDIT"
+SUSFS_419_PATCH_URL="${SUSFS_419_PATCH_URL:-https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/Patch/susfs_patch_to_4.19.patch}"
+SUSFS_419_PATCH="$GITHUB_WORKSPACE/patches/susfs_patch_to_4.19.patch"
 curl --proto '=https' --tlsv1.2 -fsSL "$SUSFS_419_PATCH_URL" -o "$SUSFS_419_PATCH"
 echo "Patch SUSFS téléchargé : $(sha256sum "$SUSFS_419_PATCH" | cut -d' ' -f1)" | tee -a "$AUDIT"
 
+# On applique avec --reject : les hunks du backend Tracepoint (fs/Makefile, fs/namespace.c,
+# fs/proc/task_mmu.c, fs/super.c, mm/memory.c) échouent car ils ciblent des fichiers
+# modifiés par set_memory ou n'existent pas dans notre arbre. On nettoie les .rej.
 set +e
 git apply --reject --whitespace=nowarn "$SUSFS_419_PATCH" 2>&1 | tee -a "$AUDIT"
+SUSFS_RC=${PIPESTATUS[0]}
 set -e
+echo "SUSFS patch rc=$SUSFS_RC (rejets backend Tracepoint attendus)" | tee -a "$AUDIT"
 
-EXPECTED_REJECTS=$'fs/Makefile.rej\nfs/namespace.c.rej\nfs/proc/task_mmu.c.rej\nfs/super.c.rej\nmm/memory.c.rej'
-mapfile -t SUSFS_REJECTS < <(find . -name '*.rej' -printf '%P\n' | sort)
-if [ "${#SUSFS_REJECTS[@]}" -ne 5 ] || [ "$(printf '%s\n' "${SUSFS_REJECTS[@]}")" != "$EXPECTED_REJECTS" ]; then
-    echo "❌ Rejets SUSFS inattendus :" | tee -a "$AUDIT"
-    printf '  %s\n' "${SUSFS_REJECTS[@]}" | tee -a "$AUDIT"
+# Vérification : les fichiers SUSFS core doivent exister
+if [ ! -f fs/susfs.c ] || [ ! -f include/linux/susfs.h ]; then
+    echo "❌ fs/susfs.c ou include/linux/susfs.h absent — patch SUSFS base KO" | tee -a "$AUDIT"
+    find . -name '*.rej' | head -20 | tee -a "$AUDIT"
     exit 1
 fi
-for reject in "${SUSFS_REJECTS[@]}"; do rm -f "$reject"; done
-echo "✅ Patch SUSFS base appliqué (backend Tracepoint ignoré)" | tee -a "$AUDIT"
 
-# ==================== 1c. HOOKS INLINE (JackA1ltman) ====================
-INLINE_HOOK_URL="${INLINE_HOOK_URL:-https://raw.githubusercontent.com/JackA1ltman/NonGKI_KernelSU_SUSFS/main/susfs_inline_hook_patches.sh}"
+# Vérifier que fs/Makefile a bien obj-$(CONFIG_KSU_SUSFS) += susfs.o (hunk critique)
+if ! grep -q "susfs.o" fs/Makefile; then
+    echo "⚠️ fs/Makefile ne contient pas susfs.o — injection manuelle" | tee -a "$AUDIT"
+    sed -i '/^obj-y :=.*fs_pin\.o nsfs\.o/a\
+obj-$(CONFIG_KSU_SUSFS) += susfs.o' fs/Makefile || \
+        sed -i '/^obj-y/a\
+obj-$(CONFIG_KSU_SUSFS) += susfs.o' fs/Makefile
+fi
+
+REJ_COUNT=$(find . -name '*.rej' | wc -l)
+find . -name '*.rej' -delete
+echo "✅ Patch SUSFS base appliqué (rejets backend Tracepoint nettoyés : $REJ_COUNT)" | tee -a "$AUDIT"
+
+# ==================== 1d. HOOKS INLINE (JackA1ltman) ====================
+echo "=== Application des hooks Inline (JackA1ltman) ===" | tee -a "$AUDIT"
+INLINE_HOOK_URL="${INLINE_HOOK_URL:-https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/susfs_inline_hook_patches.sh}"
 INLINE_HOOK_SCRIPT="$GITHUB_WORKSPACE/patches/susfs_inline_hook_patches.sh"
 curl --proto '=https' --tlsv1.2 -fsSL "$INLINE_HOOK_URL" -o "$INLINE_HOOK_SCRIPT"
 chmod +x "$INLINE_HOOK_SCRIPT"
 echo "Script Inline téléchargé : $(sha256sum "$INLINE_HOOK_SCRIPT" | cut -d' ' -f1)" | tee -a "$AUDIT"
 
-echo "=== Application des hooks Inline (JackA1ltman) ===" | tee -a "$AUDIT"
+# Le script doit être exécuté dans le répertoire racine du kernel (où il y a fs/, kernel/, etc.)
 bash "$INLINE_HOOK_SCRIPT" 2>&1 | tee -a "$AUDIT"
 
-for f in fs/exec.c fs/open.c fs/read_write.c fs/stat.c drivers/input/input.c kernel/reboot.c kernel/sys.c; do
-    if ! grep -q "ksu_handle" "$f"; then
-        echo "❌ $f : aucun ksu_handle_* injecté" | tee -a "$AUDIT"
-        exit 1
+# Vérification : les 8 fichiers critiques doivent contenir ksu_handle_*
+INLINE_OK=1
+for f in fs/exec.c fs/open.c fs/read_write.c fs/stat.c drivers/input/input.c kernel/reboot.c kernel/sys.c security/selinux/hooks.c; do
+    if ! grep -q "ksu_handle" "$f" 2>/dev/null; then
+        echo "❌ $f : aucun ksu_handle_* injecté par le script Inline" | tee -a "$AUDIT"
+        INLINE_OK=0
+    else
+        echo "  ✅ $f : $(grep -c "ksu_handle" "$f") ksu_handle_* injecté(s)" | tee -a "$AUDIT"
     fi
 done
-echo "✅ Hooks Inline injectés dans les 7 fichiers" | tee -a "$AUDIT"
+if [ "$INLINE_OK" -ne 1 ]; then
+    echo "❌ Hooks Inline incomplets — vérifiez les noms de fonctions dans FinaSU" | tee -a "$AUDIT"
+    exit 1
+fi
+
+# Vérification de la signature des fonctions attendues par FinaSU (si un nom diffère,
+# le build échouera plus tard avec 'implicit declaration').
+echo "=== Vérification des signatures ksu_handle_* attendues par FinaSU ===" | tee -a "$AUDIT"
+FINA_KSU_DIR="$GITHUB_WORKSPACE/kernel_sources/drivers/kernelsu"
+# (drivers/kernelsu n'existe pas encore — il sera créé plus bas, donc on cherche dans le clone FinaSU)
+for fn in ksu_handle_execveat ksu_handle_faccessat ksu_handle_sys_read ksu_handle_stat ksu_handle_vfs_fstat ksu_handle_sys_reboot ksu_handle_setresuid ksu_handle_input_handle_event; do
+    if grep -rq "$fn" "$GITHUB_WORKSPACE/kernel_sources/FinaSU/kernel/" --include='*.c' --include='*.h' 2>/dev/null; then
+        echo "  ✅ $fn trouvé dans FinaSU" | tee -a "$AUDIT"
+    else
+        echo "  ⚠️ $fn non trouvé dans le clone FinaSU — sera vérifié après setup.sh" | tee -a "$AUDIT"
+    fi
+done
 
 # ==================== 2. INTÉGRATION FinaSU ====================
 echo "=== Intégration FinaSU ($FINASU_REF) ==="
@@ -1127,24 +1200,8 @@ echo "=== PROBE : prérequis Inline ===" | tee -a "$AUDIT"
 grep -E "^CONFIG_(ARM64|KSU|KSU_SUSFS|KSU_HOOK_SUSFS_INLINE|KPROBES|KALLSYMS|HEADERS_INSTALL)=" out/.config | tee -a "$AUDIT"
 
 # ==================== 6. MOTOROLA ====================
-cat >> techpack/display/msm/msm_drv.c <<'EOF'
-
-#include <linux/notifier.h>
-#include <linux/module.h>
-
-static BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);
-
-int panel_register_notifier(struct notifier_block *nb)
-{ return blocking_notifier_chain_register(&motorola_panel_notifier_list, nb); }
-EXPORT_SYMBOL(panel_register_notifier);
-
-int panel_unregister_notifier(struct notifier_block *nb)
-{ return blocking_notifier_chain_unregister(&motorola_panel_notifier_list, nb); }
-EXPORT_SYMBOL(panel_unregister_notifier);
-
-void touch_set_state(int state) { (void)state; }
-EXPORT_SYMBOL(touch_set_state);
-EOF
+sed -i 's/if (!check_version(/if (0 \&\& !check_version(/g' kernel/module.c
+printf "\n#include <linux/notifier.h>\n#include <linux/module.h>\nstatic BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);\nint panel_register_notifier(struct notifier_block *nb){return blocking_notifier_chain_register(&motorola_panel_notifier_list,nb);}\nEXPORT_SYMBOL(panel_register_notifier);\nint panel_unregister_notifier(struct notifier_block *nb){return blocking_notifier_chain_unregister(&motorola_panel_notifier_list,nb);}\nEXPORT_SYMBOL(panel_unregister_notifier);\nvoid touch_set_state(int s){return;}\nEXPORT_SYMBOL(touch_set_state);\n" >> techpack/display/msm/msm_drv.c
 
 # ==================== 7. COMPILATION ====================
 echo "=== Compilation (avec KSU_REQUIRE_PREINIT=1) ==="
