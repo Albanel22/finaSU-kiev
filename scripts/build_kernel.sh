@@ -1451,6 +1451,115 @@ if os.path.isdir(ksu_root):
                 write(p, c); total += 1
                 print(f"  ✅ {os.path.relpath(p, GW)}: sched/signal.h + sched/task.h")
 
+# --- FIX 12 : selinux_hide.c dual-path 4.19 ---
+p = os.path.join(ksu_root, "feature", "selinux_hide.c")
+if os.path.isfile(p):
+    c = read(p); original = c
+
+    # 12a. Bloc compat : verrou/page de statut 4.19 + definition backup_sepolicy
+    compat = (
+        "/* ============ Compat 4.19 (dual-path) ============ */\n"
+        "#include <linux/version.h>\n"
+        "#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n"
+        "/* 4.19 : pas de struct selinux_policy utilisable, pas de selinux_state.policy ;\n"
+        " * status_lock/status_page sont les globales de ss/status.c dont le script retire\n"
+        " * le 'static'. backup_sepolicy n'est jamais alloue sur 4.19 (ksu_dup_sepolicy\n"
+        " * est un stub), sa definition est donc fournie ici pour l'edition de liens. */\n"
+        "#define KSU_SELINUX_HIDE_BACKUP 0\n"
+        "struct selinux_policy *backup_sepolicy;\n"
+        "#define symtab_search(s, name) hashtab_search(&(s)->table, name)\n"
+        "extern struct mutex selinux_status_lock;\n"
+        "extern struct page *selinux_status_page;\n"
+        "#define ksu_status_lock()   mutex_lock(&selinux_status_lock)\n"
+        "#define ksu_status_unlock() mutex_unlock(&selinux_status_lock)\n"
+        "#define ksu_status_page     (selinux_status_page)\n"
+        "#else\n"
+        "#define KSU_SELINUX_HIDE_BACKUP 1\n"
+        "#define ksu_status_lock()   mutex_lock(&selinux_state.status_lock)\n"
+        "#define ksu_status_unlock() mutex_unlock(&selinux_state.status_lock)\n"
+        "#define ksu_status_page     (selinux_state.status_page)\n"
+        "#endif\n\n"
+    )
+    if 'KSU_SELINUX_HIDE_BACKUP' not in c:
+        c = c.replace('static DEFINE_MUTEX(selinux_hide_mutex);',
+                      compat + 'static DEFINE_MUTEX(selinux_hide_mutex);', 1)
+
+    # 12b. Redirection des acces status_lock / status_page
+    c = c.replace('mutex_lock(&selinux_state.status_lock);', 'ksu_status_lock();')
+    c = c.replace('mutex_unlock(&selinux_state.status_lock);', 'ksu_status_unlock();')
+    c = c.replace('selinux_state.status_page', 'ksu_status_page')
+
+    # 12c. drop_backup_if_unused : dereferencement de selinux_policy impossible sur 4.19
+    old_drop = ("void ksu_selinux_hide_drop_backup_if_unused()\n"
+                "{\n"
+                "    mutex_lock(&selinux_hide_mutex);")
+    new_drop = ("void ksu_selinux_hide_drop_backup_if_unused()\n"
+                "{\n"
+                "#if KSU_SELINUX_HIDE_BACKUP\n"
+                "    mutex_lock(&selinux_hide_mutex);")
+    if old_drop in c and new_drop not in c:
+        c = c.replace(old_drop, new_drop, 1)
+    old_tail = ("    mutex_unlock(&selinux_hide_mutex);\n"
+                "}\n"
+                "\n"
+                "/*\n"
+                " * Caveat:  Mutates scontext.")
+    new_tail = ("    mutex_unlock(&selinux_hide_mutex);\n"
+                "#endif // KSU_SELINUX_HIDE_BACKUP\n"
+                "}\n"
+                "\n"
+                "#if KSU_SELINUX_HIDE_BACKUP\n"
+                "/*\n"
+                " * Caveat:  Mutates scontext.")
+    if old_tail in c and new_tail not in c:
+        c = c.replace(old_tail, new_tail, 1)
+
+    # 12d. Stubs 4.19 en fin de fichier (toute la machinerie with_policy est 5.10+)
+    stubs = (
+        "\n"
+        "#else /* LINUX_VERSION_CODE < 5.10 : pas de backup sepolicy sur 4.19 */\n"
+        "\n"
+        "static int security_context_to_sid_with_policy(struct selinux_policy *policy, const char *scontext, u32 scontext_len,\n"
+        "                                               u32 *sid, u32 def_sid, gfp_t gfp_flags, u32 *orig_sid_p, int *orig_rc_p)\n"
+        "{\n"
+        "    if (orig_sid_p)\n"
+        "        *orig_sid_p = SECSID_NULL;\n"
+        "    if (orig_rc_p)\n"
+        "        *orig_rc_p = -EOPNOTSUPP;\n"
+        "    return -EOPNOTSUPP;\n"
+        "}\n"
+        "\n"
+        "static int security_sid_to_context_with_policy(struct selinux_policy *policy, u32 sid, char **scontext,\n"
+        "                                               u32 *scontext_len)\n"
+        "{\n"
+        "    if (scontext)\n"
+        "        *scontext = NULL;\n"
+        "    *scontext_len = 0;\n"
+        "    return -EOPNOTSUPP;\n"
+        "}\n"
+        "\n"
+        "static void security_compute_av_user_with_policy(struct selinux_policy *policy, u32 ssid, u32 tsid, u16 tclass,\n"
+        "                                                 struct av_decision *avd)\n"
+        "{\n"
+        "    avd->allowed = 0;\n"
+        "    avd->auditallow = 0;\n"
+        "    avd->auditdeny = 0xffffffff;\n"
+        "    avd->seqno = 0;\n"
+        "    avd->flags = 0;\n"
+        "}\n"
+        "\n"
+        "#endif /* KSU_SELINUX_HIDE_BACKUP */\n"
+    )
+    if 'KSU_SELINUX_HIDE_BACKUP' in c and 'ksu_status_lock();' in c and \
+       old_tail.replace('    mutex_unlock(&selinux_hide_mutex);', '#endif // KSU_SELINUX_HIDE_BACKUP') not in c and \
+       not c.rstrip().endswith('#endif /* KSU_SELINUX_HIDE_BACKUP */'):
+        c = c.rstrip('\n') + '\n' + stubs
+
+    if c != original:
+        write(p, c); total += 1
+        print(f"  ✅ feature/selinux_hide.c: dual-path 4.19 (19 erreurs)")
+
+
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
 
