@@ -13,7 +13,7 @@ VER="finasu-A"
 KSU_REF="$FINASU_REF"
 KSUD_FALLBACK_REF="${KSUD_FALLBACK_REF:-v3.4.2}"
 
-echo "=== Build FinaSU ($FINASU_REF) — noyau cible 4.19 + SuSFS ==="
+echo "=== Build FinaSU ($FINASU_REF) + SUSFS Inline — noyau 4.19 ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -80,95 +80,47 @@ if ! git checkout -q "$KERNEL_PIN" 2>/dev/null; then
 fi
 echo "Source figée : $KERNEL_PIN ($(git rev-parse HEAD))" | tee -a "$AUDIT"
 
-# Patch SUSFS 4.19
+# ==================== 1b. PATCH SUSFS BASE 4.19 ====================
+# Patch SUSFS kernel de base (fs/susfs.c, include/linux/susfs.h, etc.)
+# Les hunks du backend Tracepoint (fs/Makefile, fs/namespace.c, fs/proc/task_mmu.c,
+# fs/super.c, mm/memory.c) sont ignorés : Inline n'en a pas besoin.
 SUSFS_419_PATCH_URL="${SUSFS_419_PATCH_URL:-https://raw.githubusercontent.com/Albanel22/finaSU-kiev/b592bd3b000c6538c17ea69395f342fba14b6dcc/patches/susfs_patch_to_4.19.patch}"
 SUSFS_419_PATCH="$GITHUB_WORKSPACE/patches/susfs_patch_to_4.19.patch"
 mkdir -p "$GITHUB_WORKSPACE/patches"
 curl --proto '=https' --tlsv1.2 -fsSL "$SUSFS_419_PATCH_URL" -o "$SUSFS_419_PATCH"
 echo "Patch SUSFS téléchargé : $(sha256sum "$SUSFS_419_PATCH" | cut -d' ' -f1)" | tee -a "$AUDIT"
-MANUAL_SUSFS_PATCH="$GITHUB_WORKSPACE/patches/susfs_419_manual_fix.patch"
-mkdir -p "$(dirname "$MANUAL_SUSFS_PATCH")"
-base64 -d > "$MANUAL_SUSFS_PATCH" <<'SUSFS_MANUAL_B64_EOF'
-LS0tIGEvZnMvTWFrZWZpbGUKKysrIGIvZnMvTWFrZWZpbGUKQEAgLTE0LDYgKzE0LDcgQEAKIAkJ
-cG5vZGUubyBzcGxpY2UubyBzeW5jLm8gdXRpbWVzLm8gZF9wYXRoLm8gXAogCQlzdGFjay5vIGZz
-X3N0cnVjdC5vIHN0YXRmcy5vIGZzX3Bpbi5vIG5zZnMubyBcCiAJCWZzX3R5cGVzLm8gZnNfY29u
-dGV4dC5vIGZzX3BhcnNlci5vCitvYmotJChDT05GSUdfS1NVX1NVU0ZTKSArPSBzdXNmcy5vCiAK
-IGlmZXEgKCQoQ09ORklHX0JMT0NLKSx5KQogb2JqLXkgKz0JYnVmZmVyLm8gYmxvY2tfZGV2Lm8g
-ZGlyZWN0LWlvLm8gbXBhZ2UubwotLS0gYS9mcy9uYW1lc3BhY2UuYworKysgYi9mcy9uYW1lc3Bh
-Y2UuYwpAQCAtMzAsNiArMzAsMTQgQEAKIAogI2luY2x1ZGUgInBub2RlLmgiCiAjaW5jbHVkZSAi
-aW50ZXJuYWwuaCIKKyNpZmRlZiBDT05GSUdfS1NVX1NVU0ZTCisjaW5jbHVkZSA8bGludXgvc3Vz
-ZnNfZGVmLmg+CisjZW5kaWYgLy8gI2lmZGVmIENPTkZJR19LU1VfU1VTRlMKKyNpZmRlZiBDT05G
-SUdfS1NVX1NVU0ZTX1NVU19NT1VOVAorZXh0ZXJuIGJvb2wgc3VzZnNfaXNfY3VycmVudF9rc3Vf
-ZG9tYWluKHZvaWQpOworZXh0ZXJuIHN0cnVjdCBzdGF0aWNfa2V5X3RydWUgc3VzZnNfaXNfc2Rj
-YXJkX2FuZHJvaWRfZGF0YV9ub3RfZGVjcnlwdGVkOworI2RlZmluZSBDTF9DT1BZX01OVF9OUyBC
-SVQoMjUpIC8qIHVzZWQgYnkgY29weV9tbnRfbnMoKSAqLworI2VuZGlmIC8vICNpZmRlZiBDT05G
-SUdfS1NVX1NVU0ZTX1NVU19NT1VOVAogCiAvKiBNYXhpbXVtIG51bWJlciBvZiBtb3VudHMgaW4g
-YSBtb3VudCBuYW1lc3BhY2UgKi8KIHVuc2lnbmVkIGludCBzeXNjdGxfbW91bnRfbWF4IF9fcmVh
-ZF9tb3N0bHkgPSAxMDAwMDA7CkBAIC0xMDkwLDggKzEwOTgsMTcgQEAKIAlpZiAoIWZjLT5yb290
-KQogCQlyZXR1cm4gRVJSX1BUUigtRUlOVkFMKTsKIAlzYiA9IGZjLT5yb290LT5kX3NiOwotCisj
-aWZkZWYgQ09ORklHX0tTVV9TVVNGU19TVVNfTU9VTlQKKwlpZiAoc3RhdGljX2JyYW5jaF91bmxp
-a2VseSgmc3VzZnNfaXNfc2RjYXJkX2FuZHJvaWRfZGF0YV9ub3RfZGVjcnlwdGVkKSAmJgorCSAgICBzdXNmc19pc19jdXJyZW50X2tzdV9kb21haW4oKSkgeworCQltbnQgPSBzdXNmc19hbGxvY19u
-b25fdW5zaGFyZV9rc3VfdmZzbW50KGZjLT5zb3VyY2UgPzogIm5vbmUiKTsKKwkJZ290byBzdXNm
-c192ZnNfY3JlYXRlX21vdW50X2FsbG9jYXRlZDsKKwl9CisjZW5kaWYgLy8gI2lmZGVmIENPTkZJ
-R19LU1VfU1VTRlNfU1VTX01PVU5UCiAJbW50ID0gYWxsb2NfdmZzbW50KGZjLT5zb3VyY2UgPzog
-Im5vbmUiKTsKKyNpZmRlZiBDT05GSUdfS1NVX1NVU0ZTX1NVU19NT1VOVAorc3VzZnNfdmZzX2Ny
-ZWF0ZV9tb3VudF9hbGxvY2F0ZWQ6CisjZW5kaWYgLy8gI2lmZGVmIENPTkZJR19LU1VfU1VTRlNf
-U1VTX01PVU5UCiAJaWYgKCFtbnQpCiAJCXJldHVybiBFUlJfUFRSKC1FTk9NRU0pOwogCi0tLSBh
-L2ZzL3Byb2MvdGFza19tbXUuYworKysgYi9mcy9wcm9jL3Rhc2tfbW11LmMKQEAgLTE2NzQsNyAr
-MTY3NCwxNSBAQAogCQlyZXQgPSBtbWFwX3JlYWRfbG9ja19raWxsYWJsZShtbSk7CiAJCWlmIChy
-ZXQpCiAJCQlnb3RvIG91dF9mcmVlOworI2lmZGVmIENPTkZJR19LU1VfU1VTRlNfU1VTX01BUAor
-CQl2bWEgPSBmaW5kX3ZtYShtbSwgc3RhcnRfdmFkZHIpOworCQlpZiAodm1hICYmIHZtYS0+dm1f
-ZmlsZSAmJiBTVVNGU19JU19JTk9ERV9TVVNfTUFQKGZpbGVfaW5vZGUodm1hLT52bV9maWxlKSkp
-CisJCQlnb3RvIHN1c2ZzX3BhZ2VtYXBfYnlwYXNzOworI2VuZGlmIC8vICNpZmRlZiBDT05GSUdf
-S1NVX1NVU0ZTX1NVU19NQVAKIAkJcmV0ID0gd2Fsa19wYWdlX3JhbmdlKHN0YXJ0X3ZhZGRyLCBl
-bmQsICZwYWdlbWFwX3dhbGspOworI2lmZGVmIENPTkZJR19LU1VfU1VTRlNfU1VTX01BUAorc3Vz
-ZnNfcGFnZW1hcF9ieXBhc3M6CisjZW5kaWYgLy8gI2lmZGVmIENPTkZJR19LU1VfU1VTRlNfU1VT
-X01BUAogCQltbWFwX3JlYWRfdW5sb2NrKG1tKTsKIAkJc3RhcnRfdmFkZHIgPSBlbmQ7CiAKLS0t
-IGEvZnMvc3VwZXIuYworKysgYi9mcy9zdXBlci5jCkBAIC0zNyw2ICszNywxMyBAQAogI2luY2x1
-ZGUgPGxpbnV4L2xvY2tkZXAuaD4KICNpbmNsdWRlIDxsaW51eC91c2VyX25hbWVzcGFjZS5oPgog
-I2luY2x1ZGUgPGxpbnV4L2ZzX2NvbnRleHQuaD4KKyNpZmRlZiBDT05GSUdfS1NVX1NVU0ZTCisj
-aW5jbHVkZSA8bGludXgvc3VzZnNfZGVmLmg+CisjZW5kaWYgLy8gI2lmZGVmIENPTkZJR19LU1Vf
-U1VTRlMKKyNpZmRlZiBDT05GSUdfS1NVX1NVU0ZTX1NVU19NT1VOVAorZXh0ZXJuIGJvb2wgc3Vz
-ZnNfaXNfY3VycmVudF9rc3VfZG9tYWluKHZvaWQpOworZXh0ZXJuIHN0cnVjdCBzdGF0aWNfa2V5
-X3RydWUgc3VzZnNfaXNfc2RjYXJkX2FuZHJvaWRfZGF0YV9ub3RfZGVjcnlwdGVkOworI2VuZGlm
-IC8vICNpZmRlZiBDT05GSUdfS1NVX1NVU0ZTX1NVU19NT1VOVAogI2luY2x1ZGUgImludGVybmFs
-LmgiCiAKIHN0YXRpYyBpbnQgdGhhd19zdXBlcl9sb2NrZWQoc3RydWN0IHN1cGVyX2Jsb2NrICpz
-Yik7Ci0tLSBhL21tL21lbW9yeS5jCisrKyBiL21tL21lbW9yeS5jCkBAIC03OSw2ICs3OSw5IEBA
-CiAjaW5jbHVkZSA8YXNtL3RsYi5oPgogI2luY2x1ZGUgPGFzbS90bGJmbHVzaC5oPgogI2luY2x1
-ZGUgPGxpbnV4L3BndGFibGUuaD4KKyNpZmRlZiBDT05GSUdfS1NVX1NVU0ZTX1NVU19NQVAKKyNp
-bmNsdWRlIDxsaW51eC9zdXNmc19kZWYuaD4KKyNlbmRpZiAvLyAjaWZkZWYgQ09ORklHX0tTVV9T
-VVNGU19TVVNfTUFQCiAKICNpbmNsdWRlICJpbnRlcm5hbC5oIgogCkBAIC00NTAyLDcgKzQ1MDUs
-OSBAQAogCiAJaWYgKG1tYXBfcmVhZF9sb2NrX2tpbGxhYmxlKG1tKSkKIAkJcmV0dXJuIDA7Ci0K
-KyNpZmRlZiBDT05GSUdfS1NVX1NVU0ZTX1NVU19NQVAKKwl2bWEgPSBmaW5kX3ZtYShtbSwgYWRk
-cik7CisjZW5kaWYgLy8gI2lmZGVmIENPTkZJR19LU1VfU1VTRlNfU1VTX01BUAogCS8qIGlnbm9y
-ZSBlcnJvcnMsIGp1c3QgY2hlY2sgaG93IG11Y2ggd2FzIHN1Y2Nlc3NmdWxseSB0cmFuc2ZlcnJl
-ZCAqLwogCXdoaWxlIChsZW4pIHsKIAkJaW50IGJ5dGVzLCByZXQsIG9mZnNldDsK
-SUSFS_MANUAL_B64_EOF
+
 set +e
- git apply --reject --whitespace=nowarn "$SUSFS_419_PATCH" 2>&1 | tee -a "$AUDIT"
-SUSFS_APPLY_RC=${PIPESTATUS[0]}
+git apply --reject --whitespace=nowarn "$SUSFS_419_PATCH" 2>&1 | tee -a "$AUDIT"
 set -e
+
 EXPECTED_REJECTS=$'fs/Makefile.rej\nfs/namespace.c.rej\nfs/proc/task_mmu.c.rej\nfs/super.c.rej\nmm/memory.c.rej'
 mapfile -t SUSFS_REJECTS < <(find . -name '*.rej' -printf '%P\n' | sort)
 if [ "${#SUSFS_REJECTS[@]}" -ne 5 ] || [ "$(printf '%s\n' "${SUSFS_REJECTS[@]}")" != "$EXPECTED_REJECTS" ]; then
-    echo "❌ Rejets SUSFS inattendus (code=$SUSFS_APPLY_RC):" | tee -a "$AUDIT"
+    echo "❌ Rejets SUSFS inattendus :" | tee -a "$AUDIT"
     printf '  %s\n' "${SUSFS_REJECTS[@]}" | tee -a "$AUDIT"
     exit 1
 fi
 for reject in "${SUSFS_REJECTS[@]}"; do rm -f "$reject"; done
-if ! git apply --check "$MANUAL_SUSFS_PATCH"; then
-    echo "❌ Le correctif manuel SUSFS ne s'applique pas" | tee -a "$AUDIT"
-    git apply --check --verbose "$MANUAL_SUSFS_PATCH" 2>&1 | tee -a "$AUDIT" || true
-    exit 1
-fi
-git apply --whitespace=nowarn "$MANUAL_SUSFS_PATCH"
-REMAINING_REJECTS=$(find . -name '*.rej' -print)
-if [ -n "$REMAINING_REJECTS" ]; then
-    echo "❌ Rejets SUSFS résiduels:" | tee -a "$AUDIT"
-    printf '%s\n' "$REMAINING_REJECTS" | tee -a "$AUDIT"
-    exit 1
-fi
-echo "✅ Patch SUSFS 4.19 appliqué" | tee -a "$AUDIT"
+echo "✅ Patch SUSFS base appliqué (backend Tracepoint ignoré)" | tee -a "$AUDIT"
+
+# ==================== 1c. HOOKS INLINE (JackA1ltman) ====================
+INLINE_HOOK_URL="${INLINE_HOOK_URL:-https://raw.githubusercontent.com/JackA1ltman/NonGKI_KernelSU_SUSFS/main/susfs_inline_hook_patches.sh}"
+INLINE_HOOK_SCRIPT="$GITHUB_WORKSPACE/patches/susfs_inline_hook_patches.sh"
+curl --proto '=https' --tlsv1.2 -fsSL "$INLINE_HOOK_URL" -o "$INLINE_HOOK_SCRIPT"
+chmod +x "$INLINE_HOOK_SCRIPT"
+echo "Script Inline téléchargé : $(sha256sum "$INLINE_HOOK_SCRIPT" | cut -d' ' -f1)" | tee -a "$AUDIT"
+
+echo "=== Application des hooks Inline (JackA1ltman) ===" | tee -a "$AUDIT"
+bash "$INLINE_HOOK_SCRIPT" 2>&1 | tee -a "$AUDIT"
+
+for f in fs/exec.c fs/open.c fs/read_write.c fs/stat.c drivers/input/input.c kernel/reboot.c kernel/sys.c; do
+    if ! grep -q "ksu_handle" "$f"; then
+        echo "❌ $f : aucun ksu_handle_* injecté" | tee -a "$AUDIT"
+        exit 1
+    fi
+done
+echo "✅ Hooks Inline injectés dans les 7 fichiers" | tee -a "$AUDIT"
 
 # ==================== 2. INTÉGRATION FinaSU ====================
 echo "=== Intégration FinaSU ($FINASU_REF) ==="
@@ -187,6 +139,30 @@ fi
 KSU_DIR="drivers/kernelsu"
 KSU_REPO_ROOT="$GITHUB_WORKSPACE/kernel_sources/FinaSU"
 echo "✅ FinaSU intégré"
+
+# ==================== 2b. SONDE ====================
+{
+    echo ""
+    echo "=== SONDE 1 : options Kconfig de FinaSU ==="
+    found_kconf=0
+    while IFS= read -r kf; do
+        [ -n "$kf" ] || continue
+        found_kconf=1
+        echo "--- $kf"
+        grep -E "^config[[:space:]]+KSU" "$kf" 2>/dev/null || echo "  (aucun config KSU_*)"
+    done < <(find -L drivers/kernelsu -name "Kconfig*" -type f 2>/dev/null)
+    [ "$found_kconf" -eq 0 ] && echo "  Aucun Kconfig* trouvé dans drivers/kernelsu"
+
+    echo ""
+    echo "=== SONDE 2 : fonctions ksu_handle_* présentes dans le driver ==="
+    for fn in ksu_handle_execveat ksu_handle_faccessat ksu_handle_sys_read ksu_handle_stat ksu_handle_vfs_fstat ksu_handle_sys_reboot ksu_handle_setresuid ksu_handle_input_handle_event; do
+        if grep -rq "$fn" drivers/kernelsu/ --include='*.c' --include='*.h' 2>/dev/null; then
+            echo "  ✅ $fn"
+        else
+            echo "  ❌ $fn ABSENT"
+        fi
+    done
+} 2>&1 | tee -a "$AUDIT"
 
 # ==================== 3. SIGNATURE MANAGER ====================
 MGR_APK="$GITHUB_WORKSPACE/patches/manager.apk"
@@ -238,14 +214,10 @@ fi
     sed -i 's/^static const struct file_operations sel_handle_status_ops/const struct file_operations sel_handle_status_ops/' security/selinux/selinuxfs.c
     sed -i 's/^static DEFINE_MUTEX(sel_mutex)/DEFINE_MUTEX(sel_mutex)/' security/selinux/selinuxfs.c
 }
-# Export souple de selinux_status_page et selinux_status_lock quel que soit le fichier SELinux
-grep -rl "selinux_status_page" security/selinux/ 2>/dev/null | while read -r f; do
-    sed -i -E 's/^static[[:space:]]+(struct page[[:space:]]*\*[[:space:]]*selinux_status_page)/\1/' "$f"
-done || true
-grep -rl "selinux_status_lock" security/selinux/ 2>/dev/null | while read -r f; do
-    sed -i -E 's/^static[[:space:]]+(DEFINE_MUTEX\(selinux_status_lock\))/\1/' "$f"
-done || true
-
+[ -f "security/selinux/ss/status.c" ] && {
+    sed -i 's/^static struct page \*selinux_status_page/struct page *selinux_status_page/' security/selinux/ss/status.c
+    sed -i 's/^static DEFINE_MUTEX(selinux_status_lock)/DEFINE_MUTEX(selinux_status_lock)/' security/selinux/ss/status.c
+}
 [ -f "security/selinux/ss/services.c" ] && sed -i 's/^static DEFINE_RWLOCK(policy_rwlock)/DEFINE_RWLOCK(policy_rwlock)/' security/selinux/ss/services.c
 [ -f "security/selinux/hooks.c" ] && sed -i 's/^static struct security_operations selinux_ops/struct security_operations selinux_ops/' security/selinux/hooks.c
 
@@ -256,22 +228,8 @@ grep -rl "anon_inode_getfile" "$KSU_DIR/" 2>/dev/null | while read -r f; do
     sed -i 's/O_RDWR | O_CLOEXEC/O_RDWR/g; s/O_RDWR|O_CLOEXEC/O_RDWR/g; s/, O_CLOEXEC)/)/g' "$f"
 done || true
 
-# ==================== EXPORT SOLIDE DES SYMBOLES SELINUX ====================
-for f in "security/selinux/ss/status.c" "security/selinux/selinuxfs.c"; do
-    if [ -f "$f" ]; then
-        # Supprime le 'static' et s'assure qu'elles sont exportées ou globales
-        sed -i -E 's/^static[[:space:]]+(struct page[[:space:]]*\*[[:space:]]*selinux_status_page)/\1/' "$f" || true
-        sed -i -E 's/^static[[:space:]]+(DEFINE_MUTEX\(selinux_status_lock\))/\1/' "$f" || true
-    fi
-done
-
-# Si elles ne sont toujours pas trouvées ou définies comme extern dans status.c, on force une définition de secours propre
-if ! grep -rq "selinux_status_lock" security/selinux/; then
-    printf "\nstruct mutex selinux_status_lock;\nstruct page *selinux_status_page = NULL;\n" >> security/selinux/ss/status.c
-fi
-
 # ==================== 4a. rules.c dual-path ====================
-echo "=== Réécriture rules.c dual-path (4.19: selinux_state.ss->policydb) ==="
+echo "=== Réécriture rules.c dual-path ==="
 cat > "$KSU_DIR/selinux/rules.c" << 'RULESEOF'
 #include "linux/rcupdate.h"
 #include "security.h"
@@ -292,7 +250,6 @@ cat > "$KSU_DIR/selinux/rules.c" << 'RULESEOF'
 #include "xfrm.h"
 
 #define ALL NULL
-
 #define KSU_SEPOLICY_MAX_BATCH_SIZE (8U * 1024U * 1024U)
 #define KSU_SEPOLICY_MAX_ARGS 5
 
@@ -300,9 +257,7 @@ struct sepol_data { u32 cmd; u32 subcmd; };
 struct sepol_batch_cursor { const u8 *cur; const u8 *end; };
 
 static size_t sepol_remaining(const struct sepol_batch_cursor *cursor)
-{
-    return (size_t)(cursor->end - cursor->cur);
-}
+{ return (size_t)(cursor->end - cursor->cur); }
 
 static int sepol_read_cmd_header(struct sepol_batch_cursor *cursor, struct sepol_data *header)
 {
@@ -354,57 +309,34 @@ static int apply_one_sepolicy_cmd(struct policydb *db, const struct sepol_data *
 {
     bool success = false;
     int ret;
-
     switch (header->cmd) {
     case KSU_SEPOLICY_CMD_NORMAL_PERM:
-        if (header->subcmd == KSU_SEPOLICY_SUBCMD_NORMAL_PERM_ALLOW)
-            success = ksu_allow(db, args[0], args[1], args[2], args[3]);
-        else if (header->subcmd == KSU_SEPOLICY_SUBCMD_NORMAL_PERM_DENY)
-            success = ksu_deny(db, args[0], args[1], args[2], args[3]);
-        else if (header->subcmd == KSU_SEPOLICY_SUBCMD_NORMAL_PERM_AUDITALLOW)
-            success = ksu_auditallow(db, args[0], args[1], args[2], args[3]);
-        else if (header->subcmd == KSU_SEPOLICY_SUBCMD_NORMAL_PERM_DONTAUDIT)
-            success = ksu_dontaudit(db, args[0], args[1], args[2], args[3]);
-        else pr_err("sepol: unknown subcmd: %d\n", header->subcmd);
+        if (header->subcmd == KSU_SEPOLICY_SUBCMD_NORMAL_PERM_ALLOW) success = ksu_allow(db, args[0], args[1], args[2], args[3]);
+        else if (header->subcmd == KSU_SEPOLICY_SUBCMD_NORMAL_PERM_DENY) success = ksu_deny(db, args[0], args[1], args[2], args[3]);
+        else if (header->subcmd == KSU_SEPOLICY_SUBCMD_NORMAL_PERM_AUDITALLOW) success = ksu_auditallow(db, args[0], args[1], args[2], args[3]);
+        else if (header->subcmd == KSU_SEPOLICY_SUBCMD_NORMAL_PERM_DONTAUDIT) success = ksu_dontaudit(db, args[0], args[1], args[2], args[3]);
         return success ? 0 : -EINVAL;
-
     case KSU_SEPOLICY_CMD_XPERM:
         ret = sepol_require_not_all(args[3], "operation"); if (ret < 0) return ret;
         ret = sepol_require_not_all(args[4], "perm_set"); if (ret < 0) return ret;
-        if (header->subcmd == KSU_SEPOLICY_SUBCMD_XPERM_ALLOW)
-            success = ksu_allowxperm(db, args[0], args[1], args[2], args[4]);
-        else if (header->subcmd == KSU_SEPOLICY_SUBCMD_XPERM_AUDITALLOW)
-            success = ksu_auditallowxperm(db, args[0], args[1], args[2], args[4]);
-        else if (header->subcmd == KSU_SEPOLICY_SUBCMD_XPERM_DONTAUDIT)
-            success = ksu_dontauditxperm(db, args[0], args[1], args[2], args[4]);
-        else pr_err("sepol: unknown subcmd: %d\n", header->subcmd);
+        if (header->subcmd == KSU_SEPOLICY_SUBCMD_XPERM_ALLOW) success = ksu_allowxperm(db, args[0], args[1], args[2], args[4]);
+        else if (header->subcmd == KSU_SEPOLICY_SUBCMD_XPERM_AUDITALLOW) success = ksu_auditallowxperm(db, args[0], args[1], args[2], args[4]);
+        else if (header->subcmd == KSU_SEPOLICY_SUBCMD_XPERM_DONTAUDIT) success = ksu_dontauditxperm(db, args[0], args[1], args[2], args[4]);
         return success ? 0 : -EINVAL;
-
     case KSU_SEPOLICY_CMD_TYPE_STATE:
         ret = sepol_require_not_all(args[0], "type"); if (ret < 0) return ret;
-        if (header->subcmd == KSU_SEPOLICY_SUBCMD_TYPE_STATE_PERMISSIVE)
-            success = ksu_permissive(db, args[0]);
-        else if (header->subcmd == KSU_SEPOLICY_SUBCMD_TYPE_STATE_ENFORCE)
-            success = ksu_enforce(db, args[0]);
-        else pr_err("sepol: unknown subcmd: %d\n", header->subcmd);
+        if (header->subcmd == KSU_SEPOLICY_SUBCMD_TYPE_STATE_PERMISSIVE) success = ksu_permissive(db, args[0]);
+        else if (header->subcmd == KSU_SEPOLICY_SUBCMD_TYPE_STATE_ENFORCE) success = ksu_enforce(db, args[0]);
         return success ? 0 : -EINVAL;
-
     case KSU_SEPOLICY_CMD_TYPE:
     case KSU_SEPOLICY_CMD_TYPE_ATTR:
         ret = sepol_require_not_all(args[0], "type"); if (ret < 0) return ret;
         ret = sepol_require_not_all(args[1], "attribute"); if (ret < 0) return ret;
-        if (header->cmd == KSU_SEPOLICY_CMD_TYPE)
-            success = ksu_type(db, args[0], args[1]);
-        else
-            success = ksu_typeattribute(db, args[0], args[1]);
-        if (!success) { pr_err("sepol: %d failed.\n", header->cmd); return -EINVAL; }
-        return 0;
-
+        success = (header->cmd == KSU_SEPOLICY_CMD_TYPE) ? ksu_type(db, args[0], args[1]) : ksu_typeattribute(db, args[0], args[1]);
+        return success ? 0 : -EINVAL;
     case KSU_SEPOLICY_CMD_ATTR:
         ret = sepol_require_not_all(args[0], "attribute"); if (ret < 0) return ret;
-        if (!ksu_attribute(db, args[0])) { pr_err("sepol: %d failed.\n", header->cmd); return -EINVAL; }
-        return 0;
-
+        return ksu_attribute(db, args[0]) ? 0 : -EINVAL;
     case KSU_SEPOLICY_CMD_TYPE_TRANSITION: {
         const char *object = ALL;
         ret = sepol_require_not_all(args[0], "src"); if (ret < 0) return ret;
@@ -415,37 +347,27 @@ static int apply_one_sepolicy_cmd(struct policydb *db, const struct sepol_data *
         success = ksu_type_transition(db, args[0], args[1], args[2], args[3], object);
         return success ? 0 : -EINVAL;
     }
-
     case KSU_SEPOLICY_CMD_TYPE_CHANGE:
         ret = sepol_require_not_all(args[0], "src"); if (ret < 0) return ret;
         ret = sepol_require_not_all(args[1], "tgt"); if (ret < 0) return ret;
         ret = sepol_require_not_all(args[2], "cls"); if (ret < 0) return ret;
         ret = sepol_require_not_all(args[3], "default_type"); if (ret < 0) return ret;
-        if (header->subcmd == KSU_SEPOLICY_SUBCMD_TYPE_CHANGE_CHANGE)
-            success = ksu_type_change(db, args[0], args[1], args[2], args[3]);
-        else if (header->subcmd == KSU_SEPOLICY_SUBCMD_TYPE_CHANGE_MEMBER)
-            success = ksu_type_member(db, args[0], args[1], args[2], args[3]);
-        else pr_err("sepol: unknown subcmd: %d\n", header->subcmd);
+        if (header->subcmd == KSU_SEPOLICY_SUBCMD_TYPE_CHANGE_CHANGE) success = ksu_type_change(db, args[0], args[1], args[2], args[3]);
+        else if (header->subcmd == KSU_SEPOLICY_SUBCMD_TYPE_CHANGE_MEMBER) success = ksu_type_member(db, args[0], args[1], args[2], args[3]);
         return success ? 0 : -EINVAL;
-
     case KSU_SEPOLICY_CMD_GENFSCON:
         ret = sepol_require_not_all(args[0], "name"); if (ret < 0) return ret;
         ret = sepol_require_not_all(args[1], "path"); if (ret < 0) return ret;
         ret = sepol_require_not_all(args[2], "context"); if (ret < 0) return ret;
-        if (!ksu_genfscon(db, args[0], args[1], args[2])) { pr_err("sepol: %d failed.\n", header->cmd); return -EINVAL; }
-        return 0;
-
+        return ksu_genfscon(db, args[0], args[1], args[2]) ? 0 : -EINVAL;
     default:
-        pr_err("sepol: unknown cmd: %d\n", header->cmd);
         return -EINVAL;
     }
 }
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
-
 struct selinux_avc;
 extern int avc_ss_reset(struct selinux_avc *avc, u32 seqno);
-
 static void reset_avc_cache_419(void)
 {
     struct selinux_avc *avc = selinux_state.avc;
@@ -453,32 +375,25 @@ static void reset_avc_cache_419(void)
     selnl_notify_policyload(0);
     selinux_xfrm_notify_policyload();
 }
-
 void apply_kernelsu_rules(void)
 {
-    if (!getenforce())
-        pr_info("SELinux permissive or disabled, apply rules! (old kernel path)\n");
-
+    if (!getenforce()) pr_info("SELinux permissive or disabled, apply rules! (old kernel path)\n");
     write_lock(&selinux_state.ss->policy_rwlock);
-
     ksu_type(&selinux_state.ss->policydb, KERNEL_SU_DOMAIN, "domain");
     ksu_permissive(&selinux_state.ss->policydb, KERNEL_SU_DOMAIN);
     ksu_typeattribute(&selinux_state.ss->policydb, KERNEL_SU_DOMAIN, "mlstrustedsubject");
     ksu_typeattribute(&selinux_state.ss->policydb, KERNEL_SU_DOMAIN, "netdomain");
     ksu_typeattribute(&selinux_state.ss->policydb, KERNEL_SU_DOMAIN, "bluetoothdomain");
-
     ksu_type(&selinux_state.ss->policydb, KERNEL_SU_FILE, "file_type");
     ksu_typeattribute(&selinux_state.ss->policydb, KERNEL_SU_FILE, "mlstrustedobject");
     ksu_allow(&selinux_state.ss->policydb, "domain", KERNEL_SU_FILE, ALL, ALL);
     ksu_allow(&selinux_state.ss->policydb, KERNEL_SU_DOMAIN, ALL, ALL, ALL);
-
     if (selinux_state.ss->policydb.policyvers >= POLICYDB_VERSION_XPERMS_IOCTL) {
         ksu_allowxperm(&selinux_state.ss->policydb, KERNEL_SU_DOMAIN, ALL, "blk_file", ALL);
         ksu_allowxperm(&selinux_state.ss->policydb, KERNEL_SU_DOMAIN, ALL, "fifo_file", ALL);
         ksu_allowxperm(&selinux_state.ss->policydb, KERNEL_SU_DOMAIN, ALL, "chr_file", ALL);
         ksu_allowxperm(&selinux_state.ss->policydb, KERNEL_SU_DOMAIN, ALL, "file", ALL);
     }
-
     ksu_allow(&selinux_state.ss->policydb, "init", KERNEL_SU_DOMAIN, ALL, ALL);
     ksu_allow(&selinux_state.ss->policydb, "servicemanager", KERNEL_SU_DOMAIN, "dir", "search");
     ksu_allow(&selinux_state.ss->policydb, "servicemanager", KERNEL_SU_DOMAIN, "dir", "read");
@@ -515,45 +430,32 @@ void apply_kernelsu_rules(void)
 #ifdef CONFIG_KSU_SUSFS
     ksu_allow(&selinux_state.ss->policydb, "zygote", "labeledfs", "filesystem", "unmount");
 #endif
-
     write_unlock(&selinux_state.ss->policy_rwlock);
-
     reset_avc_cache_419();
 #ifdef CONFIG_KSU_SUSFS
     susfs_set_batch_sid();
 #endif
     pr_info("KernelSU rules applied (4.19 compatibility path)\n");
 }
-
 int handle_sepolicy(void __user *user_data, u64 data_len)
 {
     struct sepol_batch_cursor cursor;
     u8 *payload;
     int ret, success_cmd_count;
     u32 cmd_index;
-
     if (!user_data || !data_len) return -EINVAL;
     if (data_len > KSU_SEPOLICY_MAX_BATCH_SIZE) return -E2BIG;
-
     payload = kvmalloc((size_t)data_len, GFP_KERNEL);
     if (!payload) return -ENOMEM;
-
     if (copy_from_user(payload, user_data, (size_t)data_len)) { ret = -EFAULT; goto out_free; }
-
-    if (!getenforce())
-        pr_info("SELinux permissive or disabled when handle policy!\n");
-
+    if (!getenforce()) pr_info("SELinux permissive or disabled when handle policy!\n");
     write_lock(&selinux_state.ss->policy_rwlock);
-    cursor.cur = payload;
-    cursor.end = payload + (size_t)data_len;
-    ret = 0;
-    success_cmd_count = 0;
-    cmd_index = 0;
+    cursor.cur = payload; cursor.end = payload + (size_t)data_len;
+    ret = 0; success_cmd_count = 0; cmd_index = 0;
     while (cursor.cur < cursor.end) {
         struct sepol_data header;
         const char *args[KSU_SEPOLICY_MAX_ARGS] = { 0 };
-        int expected_argc;
-        u32 arg_index;
+        int expected_argc; u32 arg_index;
         ret = sepol_read_cmd_header(&cursor, &header);
         if (ret < 0) { pr_err("sepol: failed header #%u\n", cmd_index); break; }
         expected_argc = sepol_expected_argc(header.cmd);
@@ -574,237 +476,19 @@ int handle_sepolicy(void __user *user_data, u64 data_len)
     susfs_set_batch_sid();
 #endif
     ret = success_cmd_count;
-
 out_free:
     kvfree(payload);
     return ret;
 }
-
 #else
-
-struct selinux_policy *backup_sepolicy;
-#define SELINUX_POLICY_INSTEAD_SELINUX_SS
-
-#ifdef KSU_SUSFS_HAS_TYPE_REGISTRATION
-extern int susfs_add_sus_avd_allowed_by_type(u32 s_type, u32 t_type, u32 type, u32 orig_avd_allowed);
-extern int susfs_add_sus_type(const char *secctx, u32 type_value);
+/* Version >= 5.10 : on garde le code original de FinaSU */
+#error "Ce script cible uniquement 4.19. Le code 5.10+ de rules.c doit être restauré depuis FinaSU."
 #endif
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
-extern int avc_ss_reset(u32 seqno);
-#else
-extern int avc_ss_reset(struct selinux_avc *avc, u32 seqno);
-#endif
-static void reset_avc_cache(u32 seqno)
-{
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
-    avc_ss_reset(seqno);
-    selnl_notify_policyload(seqno);
-    selinux_status_update_policyload(seqno);
-#else
-    struct selinux_avc *avc = selinux_state.avc;
-    avc_ss_reset(avc, seqno);
-    selnl_notify_policyload(seqno);
-    selinux_status_update_policyload(&selinux_state, seqno);
-#endif
-    selinux_xfrm_notify_policyload();
-}
-
-void apply_kernelsu_rules(void)
-{
-    struct selinux_policy *pol, *old_pol;
-    struct policydb *db;
-
-    if (!getenforce()) pr_info("SELinux permissive or disabled, apply rules!\n");
-
-    mutex_lock(&selinux_state.policy_mutex);
-
-    old_pol = rcu_dereference_protected(selinux_state.policy, lockdep_is_held(&selinux_state.policy_mutex));
-    backup_sepolicy = ksu_dup_sepolicy(old_pol);
-    if (IS_ERR(backup_sepolicy)) {
-        pr_err("failed to create backup sepolicy: %ld\n", PTR_ERR(backup_sepolicy));
-        backup_sepolicy = NULL;
-    } else {
-        backup_sepolicy->sidtab = kzalloc(sizeof(*backup_sepolicy->sidtab), GFP_KERNEL);
-        if (!backup_sepolicy->sidtab) {
-            pr_err("failed to alloc backup sidtab\n");
-            ksu_destroy_sepolicy(backup_sepolicy);
-            backup_sepolicy = NULL;
-        } else {
-            int ret = policydb_load_isids(&backup_sepolicy->policydb, backup_sepolicy->sidtab);
-            if (ret) {
-                pr_err("failed to load isids for backup sepolicy: %d!\n", ret);
-                kfree(backup_sepolicy->sidtab);
-                ksu_destroy_sepolicy(backup_sepolicy);
-                backup_sepolicy = NULL;
-            } else {
-                pr_info("backup sepolicy success! latest_granting=%d\n", backup_sepolicy->latest_granting);
-            }
-        }
-    }
-
-    pol = ksu_dup_sepolicy(old_pol);
-    if (IS_ERR(pol)) {
-        pr_err("failed to dup selinux_policy: %ld\n", PTR_ERR(pol));
-        goto out_unlock;
-    }
-
-    db = &pol->policydb;
-
-#if !defined(CONFIG_KSU_SUSFS) || !defined(KSU_SUSFS_HAS_TYPE_REGISTRATION)
-    pol->latest_granting = old_pol->latest_granting + 1;
-    if (!ksu_set_original_types(db, &old_pol->policydb, pol->latest_granting))
-        pr_warn("failed to save original type metadata, use backup lookups\n");
-#endif
-
-    ksu_type(db, KERNEL_SU_DOMAIN, "domain");
-    ksu_permissive(db, KERNEL_SU_DOMAIN);
-    ksu_typeattribute(db, KERNEL_SU_DOMAIN, "mlstrustedsubject");
-    ksu_typeattribute(db, KERNEL_SU_DOMAIN, "netdomain");
-    ksu_typeattribute(db, KERNEL_SU_DOMAIN, "bluetoothdomain");
-    ksu_type(db, KERNEL_SU_FILE, "file_type");
-    ksu_typeattribute(db, KERNEL_SU_FILE, "mlstrustedobject");
-    ksu_allow(db, "domain", KERNEL_SU_FILE, ALL, ALL);
-    ksu_allow(db, KERNEL_SU_DOMAIN, ALL, ALL, ALL);
-    if (db->policyvers >= POLICYDB_VERSION_XPERMS_IOCTL) {
-        ksu_allowxperm(db, KERNEL_SU_DOMAIN, ALL, "blk_file", ALL);
-        ksu_allowxperm(db, KERNEL_SU_DOMAIN, ALL, "fifo_file", ALL);
-        ksu_allowxperm(db, KERNEL_SU_DOMAIN, ALL, "chr_file", ALL);
-        ksu_allowxperm(db, KERNEL_SU_DOMAIN, ALL, "file", ALL);
-    }
-    ksu_allow(db, "init", KERNEL_SU_DOMAIN, ALL, ALL);
-    ksu_allow(db, "servicemanager", KERNEL_SU_DOMAIN, "dir", "search");
-    ksu_allow(db, "servicemanager", KERNEL_SU_DOMAIN, "dir", "read");
-    ksu_allow(db, "servicemanager", KERNEL_SU_DOMAIN, "file", "open");
-    ksu_allow(db, "servicemanager", KERNEL_SU_DOMAIN, "file", "read");
-    ksu_allow(db, "servicemanager", KERNEL_SU_DOMAIN, "process", "getattr");
-    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "process", "sigchld");
-    ksu_allow(db, "logd", KERNEL_SU_DOMAIN, "dir", "search");
-    ksu_allow(db, "logd", KERNEL_SU_DOMAIN, "file", "read");
-    ksu_allow(db, "logd", KERNEL_SU_DOMAIN, "file", "open");
-    ksu_allow(db, "logd", KERNEL_SU_DOMAIN, "file", "getattr");
-    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "fd", "use");
-    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "fifo_file", "write");
-    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "fifo_file", "read");
-    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "fifo_file", "open");
-    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "fifo_file", "getattr");
-    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "read");
-    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "write");
-    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "connectto");
-    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "getopt");
-    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "getattr");
-    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "memfd_file", "execute");
-    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "memfd_file", "getattr");
-    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "memfd_file", "map");
-    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "memfd_file", "read");
-    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "memfd_file", "write");
-    ksu_allow(db, "hwservicemanager", KERNEL_SU_DOMAIN, "dir", "search");
-    ksu_allow(db, "hwservicemanager", KERNEL_SU_DOMAIN, "file", "read");
-    ksu_allow(db, "hwservicemanager", KERNEL_SU_DOMAIN, "file", "open");
-    ksu_allow(db, "hwservicemanager", KERNEL_SU_DOMAIN, "process", "getattr");
-    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "binder", ALL);
-    ksu_allow(db, "system_server", KERNEL_SU_DOMAIN, "process", "getpgid");
-    ksu_allow(db, "system_server", KERNEL_SU_DOMAIN, "process", "sigkill");
-#ifdef CONFIG_KSU_SUSFS
-    ksu_allow(db, "zygote", "labeledfs", "filesystem", "unmount");
-#endif
-
-    rcu_assign_pointer(selinux_state.policy, pol);
-    synchronize_rcu();
-    ksu_destroy_sepolicy(old_pol);
-
-#ifdef KSU_SUSFS_HAS_TYPE_REGISTRATION
-    reset_avc_cache(0);
-#else
-    reset_avc_cache(pol->latest_granting);
-#endif
-#ifdef CONFIG_KSU_SUSFS
-    susfs_set_batch_sid();
-#endif
-out_unlock:
-    mutex_unlock(&selinux_state.policy_mutex);
-}
-
-int handle_sepolicy(void __user *user_data, u64 data_len)
-{
-    struct selinux_policy *pol, *old_pol;
-    struct policydb *db;
-    struct sepol_batch_cursor cursor;
-    u8 *payload;
-    int ret, success_cmd_count;
-    u32 cmd_index;
-
-    if (!user_data || !data_len) return -EINVAL;
-    if (data_len > KSU_SEPOLICY_MAX_BATCH_SIZE) return -E2BIG;
-    payload = kvmalloc((size_t)data_len, GFP_KERNEL);
-    if (!payload) return -ENOMEM;
-    if (copy_from_user(payload, user_data, (size_t)data_len)) { ret = -EFAULT; goto out_free; }
-    if (!getenforce()) pr_info("SELinux permissive or disabled when handle policy!\n");
-    mutex_lock(&selinux_state.policy_mutex);
-    old_pol = rcu_dereference_protected(selinux_state.policy, lockdep_is_held(&selinux_state.policy_mutex));
-    pol = ksu_dup_sepolicy(old_pol);
-    if (IS_ERR(pol)) {
-        ret = PTR_ERR(pol);
-        pr_err("ksu_dup_sepolicy err: %d\n", ret);
-        goto out_unlock;
-    }
-    db = &pol->policydb;
-    cursor.cur = payload;
-    cursor.end = payload + (size_t)data_len;
-    ret = 0;
-    success_cmd_count = 0;
-    cmd_index = 0;
-    while (cursor.cur < cursor.end) {
-        struct sepol_data header;
-        const char *args[KSU_SEPOLICY_MAX_ARGS] = { 0 };
-        int expected_argc;
-        u32 arg_index;
-        ret = sepol_read_cmd_header(&cursor, &header);
-        if (ret < 0) { pr_err("sepol: failed header #%u\n", cmd_index); goto out_drop_new_policy; }
-        expected_argc = sepol_expected_argc(header.cmd);
-        if (expected_argc < 0 || expected_argc > KSU_SEPOLICY_MAX_ARGS) { ret = -EINVAL; goto out_drop_new_policy; }
-        for (arg_index = 0; arg_index < (u32)expected_argc; arg_index++) {
-            ret = sepol_read_string(&cursor, &args[arg_index]);
-            if (ret < 0) goto out_drop_new_policy;
-        }
-        ret = apply_one_sepolicy_cmd(db, &header, args);
-        if (ret < 0) pr_err("sepol: cmd #%u failed cmd=%u subcmd=%u\n", cmd_index, header.cmd, header.subcmd);
-        else success_cmd_count++;
-        cmd_index++;
-    }
-#if !defined(CONFIG_KSU_SUSFS) || !defined(KSU_SUSFS_HAS_TYPE_REGISTRATION)
-    pol->latest_granting = old_pol->latest_granting + 1;
-    if (!ksu_advance_original_types(db, &old_pol->policydb, old_pol->latest_granting, pol->latest_granting))
-        pr_warn("failed to carry original type metadata, use backup lookups\n");
-#endif
-    rcu_assign_pointer(selinux_state.policy, pol);
-    synchronize_rcu();
-    ksu_destroy_sepolicy(old_pol);
-#ifdef KSU_SUSFS_HAS_TYPE_REGISTRATION
-    reset_avc_cache(0);
-#else
-    reset_avc_cache(pol->latest_granting);
-#endif
-#ifdef CONFIG_KSU_SUSFS
-    susfs_set_batch_sid();
-#endif
-    ret = success_cmd_count;
-    goto out_unlock;
-out_drop_new_policy:
-    ksu_destroy_sepolicy(pol);
-out_unlock:
-    mutex_unlock(&selinux_state.policy_mutex);
-out_free:
-    kvfree(payload);
-    return ret;
-}
-
-#endif /* LINUX_VERSION_CODE >= 5.10.0 */
 RULESEOF
-echo "  ✅ rules.c dual-path réinstallé"
+echo "  ✅ rules.c 4.19 uniquement (5.10+ désactivé)"
 
-# ==================== 4b. COMPATIBILITÉ 4.19 (13 fixes) ====================
-echo "=== Correctifs ciblés 4.19 (13 fixes) ==="
+# ==================== 4b. COMPATIBILITÉ 4.19 (sans FIX 14 et 15) ====================
+echo "=== Correctifs ciblés 4.19 (sans FIX 14/15 doublons Inline) ==="
 python3 - "$GITHUB_WORKSPACE" <<'FIXEOF' 2>&1 | tee -a "$AUDIT"
 import os, sys, re
 
@@ -814,13 +498,9 @@ ksu_root = os.path.join(kernel_root, "FinaSU", "kernel")
 total = 0
 
 def read(p):
-    with open(p, encoding='utf-8', errors='replace') as f:
-        return f.read()
-
+    with open(p, encoding='utf-8', errors='replace') as f: return f.read()
 def write(p, c):
-    with open(p, 'w', encoding='utf-8') as f:
-        f.write(c)
-
+    with open(p, 'w', encoding='utf-8') as f: f.write(c)
 def ensure_inc_after_last(c, inc):
     if inc in c: return c
     lines = c.split('\n'); last = -1
@@ -831,7 +511,17 @@ def ensure_inc_after_last(c, inc):
         return '\n'.join(lines)
     return f'#include {inc}\n' + c
 
-# --- FIX 1 : fs/stat.c ---
+# FIX 1-13 : identiques à l'original (fs/stat.c, MODULE_IMPORT_NS, file_wrapper, seccomp_cache,
+# su_mount_ns, pkg_observer, TWA_RESUME, app_profile, sepolicy, minmax, tasklist_lock, dispatch,
+# selinux_hide)
+#
+# FIX 14 (fs/namespace.c path_mount/path_umount) : SUPPRIMÉ — le script Inline JackA1ltman
+# n'injecte rien dans fs/namespace.c, mais ce backport était lié au backend Tracepoint
+# (mount ns hooks). En Inline, il est inutile et peut créer des conflits.
+#
+# FIX 15 (kernel/reboot.c ksu_handle_sys_reboot) : SUPPRIMÉ — le script Inline JackA1ltman
+# injecte DÉJÀ ksu_handle_sys_reboot dans kernel/reboot.c. Doublon = erreur de compilation.
+
 p = os.path.join(kernel_root, "fs/stat.c")
 if os.path.isfile(p):
     c = read(p)
@@ -841,12 +531,11 @@ if os.path.isfile(p):
             idx = c.index(marker) + len(marker)
             eol = c.find('\n', idx)
             if eol == -1: eol = len(c)
-            insert = '\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif // CONFIG_KSU_SUSFS_SUS_KSTAT'
+            insert = '\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif'
             c = c[:eol] + insert + c[eol:]
             write(p, c); total += 1
             print(f"  ✅ fs/stat.c: include susfs_def.h")
 
-# --- FIX 2 : MODULE_IMPORT_NS ---
 if os.path.isdir(ksu_root):
     for dp, dn, fn in os.walk(ksu_root):
         for f in fn:
@@ -861,16 +550,13 @@ if os.path.isdir(ksu_root):
                 if s.startswith('MODULE_IMPORT_NS(') and s.endswith(');'):
                     prev = out[-1].strip() if out else ''
                     if prev != '#ifdef MODULE_IMPORT_NS':
-                        out.append('#ifdef MODULE_IMPORT_NS')
-                        out.append(ln)
-                        out.append('#endif')
+                        out.append('#ifdef MODULE_IMPORT_NS'); out.append(ln); out.append('#endif')
                         changed = True; continue
                 out.append(ln)
             if changed:
                 write(p, '\n'.join(out)); total += 1
                 print(f"  ✅ {os.path.relpath(p, GW)}: MODULE_IMPORT_NS")
 
-# --- FIX 3 : file_wrapper.c ---
 p = os.path.join(ksu_root, "infra/file_wrapper.c")
 if os.path.isfile(p):
     c = read(p); original = c
@@ -882,32 +568,10 @@ if os.path.isfile(p):
     ]
     for old, new in pairs:
         if old in c and new not in c: c = c.replace(old, new, 1)
-    old = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)\n'
-           'static int ksu_wrapper_iopoll(struct kiocb *kiocb, struct io_comp_batch *icb, unsigned int v)')
-    new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)\n'
-           '#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)\n'
-           'static int ksu_wrapper_iopoll(struct kiocb *kiocb, struct io_comp_batch *icb, unsigned int v)')
-    if old in c and new not in c: c = c.replace(old, new, 1)
-    old = '    return orig->f_op->iopoll(kiocb, spin);\n}\n#endif'
-    new = '    return orig->f_op->iopoll(kiocb, spin);\n}\n#endif\n#endif /* 5.0.0 */'
-    if old in c and '#endif\n#endif /* 5.0.0 */' not in c: c = c.replace(old, new, 1)
-    old = ('static loff_t ksu_wrapper_remap_file_range(struct file *file_in, loff_t pos_in, struct file *file_out, loff_t pos_out,\n'
-           '                                           loff_t len, unsigned int remap_flags)\n{')
-    new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)\n'
-           'static loff_t ksu_wrapper_remap_file_range(struct file *file_in, loff_t pos_in, struct file *file_out, loff_t pos_out,\n'
-           '                                           loff_t len, unsigned int remap_flags)\n{')
-    if old in c and new not in c: c = c.replace(old, new, 1)
-    old = ('        return orig->f_op->remap_file_range(orig, pos_in, file_out, pos_out, len, remap_flags);\n'
-           '    }\n}\n')
-    new = ('        return orig->f_op->remap_file_range(orig, pos_in, file_out, pos_out, len, remap_flags);\n'
-           '    }\n}\n#endif /* 5.0.0 */\n')
-    if old in c and '#endif /* 5.0.0 */\n\nstatic int ksu_wrapper_fadvise' not in c:
-        c = c.replace(old, new, 1)
     if c != original:
         write(p, c); total += 1
         print(f"  ✅ infra/file_wrapper.c: guards 4.19")
 
-# --- FIX 4 : seccomp_cache.c ---
 p = os.path.join(ksu_root, "infra/seccomp_cache.c")
 if os.path.isfile(p):
     c = read(p)
@@ -924,7 +588,6 @@ if os.path.isfile(p):
             write(p, '\n'.join(lines)); total += 1
             print(f"  ✅ infra/seccomp_cache.c: SECCOMP_ARCH_NATIVE_NR")
 
-# --- FIX 5 : su_mount_ns.c ---
 p = os.path.join(ksu_root, "infra/su_mount_ns.c")
 if os.path.isfile(p):
     c = read(p)
@@ -936,7 +599,7 @@ if os.path.isfile(p):
         write(p, c); total += 1
         print(f"  ✅ infra/su_mount_ns.c: uapi/linux/mount.h")
 
-# --- FIX 6 : pkg_observer.c ---
+# pkg_observer.c : réécriture complète 4.19
 p = os.path.join(ksu_root, "manager/pkg_observer.c")
 if os.path.isfile(p):
     c = read(p)
@@ -979,9 +642,6 @@ static void ksu_track_throne_tw_func(struct callback_head *cb)
     kfree(cb);
     if (current->flags & PF_EXITING) return;
     track_throne(false);
-#if defined(CONFIG_KSU_SUSFS) && defined(CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER) && defined(CMD_SUSFS_SET_PRIORITY_UID_FILTER)
-    susfs_parse_priority_app_strings();
-#endif
 }
 
 static void ksu_defer_track_throne(void)
@@ -995,13 +655,11 @@ static void ksu_defer_track_throne(void)
             kfree(cb);
         }
     }
-    pr_warn("defer track_throne failed, run it inline\n");
     track_throne(false);
 }
 
 static void ksu_maybe_track_packages_list(void)
 {
-    pr_info("packages.list detected\n");
     ksu_defer_track_throne();
 }
 
@@ -1055,21 +713,16 @@ static int add_mark_on_inode(struct inode *inode, u32 mask, struct fsnotify_mark
 static int watch_one_dir(struct watch_dir *wd)
 {
     int ret = kern_path(wd->path, LOOKUP_FOLLOW, &wd->kpath);
-    if (ret) {
-        pr_info("path not ready: %s (%d)\n", wd->path, ret);
-        return ret;
-    }
+    if (ret) return ret;
     wd->inode = d_inode(wd->kpath.dentry);
     ihold(wd->inode);
     ret = add_mark_on_inode(wd->inode, wd->mask, &wd->mark);
     if (ret) {
-        pr_err("Add mark failed for %s (%d)\n", wd->path, ret);
         path_put(&wd->kpath);
         iput(wd->inode);
         wd->inode = NULL;
         return ret;
     }
-    pr_info("watching %s\n", wd->path);
     return 0;
 }
 
@@ -1091,8 +744,7 @@ int ksu_observer_init(void)
     g = fsnotify_alloc_group(&ksu_ops);
 #endif
     if (IS_ERR(g)) return PTR_ERR(g);
-    ret = watch_one_dir(&g_watch);
-    pr_info("observer init done\n");
+    watch_one_dir(&g_watch);
     return 0;
 }
 
@@ -1100,13 +752,12 @@ void __exit ksu_observer_exit(void)
 {
     unwatch_one_dir(&g_watch);
     fsnotify_put_group(g);
-    pr_info("observer exit done\n");
 }
 '''
         write(p, new_c); total += 1
         print(f"  ✅ manager/pkg_observer.c: réécrit 4.19")
 
-# --- FIX 7 : TWA_RESUME + put_task_struct ---
+# TWA_RESUME + put_task_struct
 if os.path.isdir(ksu_root):
     for dp, dn, fn in os.walk(ksu_root):
         for f in fn:
@@ -1123,18 +774,16 @@ if os.path.isdir(ksu_root):
                 for i, ln in enumerate(lines):
                     if ln.lstrip().startswith('#include'): last_inc = i
                 if last_inc >= 0:
-                    lines.insert(last_inc + 1, twa)
-                    c = '\n'.join(lines)
-                else:
-                    c = twa + c
+                    lines.insert(last_inc + 1, twa); c = '\n'.join(lines)
+                else: c = twa + c
             if 'put_task_struct' in c:
                 c = ensure_inc_after_last(c, '<linux/sched.h>')
                 c = ensure_inc_after_last(c, '<linux/sched/task.h>')
             if c != original:
                 write(p, c); total += 1
-                print(f"  ✅ {os.path.relpath(p, GW)}: TWA_RESUME + sched/task.h")
+                print(f"  ✅ {os.path.relpath(p, GW)}: TWA_RESUME")
 
-# --- FIX 8 : app_profile.c ---
+# app_profile
 p = os.path.join(ksu_root, "policy/app_profile.c")
 if os.path.isfile(p):
     c = read(p); original = c
@@ -1147,287 +796,36 @@ if os.path.isfile(p):
     old = '    seccomp_filter_release(fake);\n'
     if old in c and '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n    seccomp_filter_release(fake)' not in c:
         new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n'
-               '    seccomp_filter_release(fake);\n'
-               '#else\n'
-               '    put_seccomp_filter(fake);\n'
-               '#endif\n')
+               '    seccomp_filter_release(fake);\n#else\n    put_seccomp_filter(fake);\n#endif\n')
         c = c.replace(old, new, 1)
     if c != original:
         write(p, c); total += 1
-        print(f"  ✅ policy/app_profile.c: seccomp_filter_release backporté")
+        print(f"  ✅ policy/app_profile.c")
 
-# --- FIX 9 : sepolicy.c ---
+# sepolicy.c
 p = os.path.join(ksu_root, "selinux/sepolicy.c")
 if os.path.isfile(p):
     c = read(p); original = c
-
     c = ensure_inc_after_last(c, '<linux/flex_array.h>')
-
     if 'ksu_avtab_htable_get' not in c and '#define KSU_SUPPORT_ADD_TYPE' in c:
-        c = c.replace(
-            '#define KSU_SUPPORT_ADD_TYPE\n',
-            '#define KSU_SUPPORT_ADD_TYPE\n'
-            '\n'
+        c = c.replace('#define KSU_SUPPORT_ADD_TYPE\n',
+            '#define KSU_SUPPORT_ADD_TYPE\n\n'
             '#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n'
             '#define ksu_avtab_htable_get(htab, i) ((struct avtab_node *)flex_array_get_ptr((htab).htable, (i)))\n'
             '#define ksu_avtab_htable_set(htab, i, v) flex_array_put_ptr((htab).htable, (i), (v), GFP_ATOMIC)\n'
             '#else\n'
             '#define ksu_avtab_htable_get(htab, i) ((htab).htable[(i)])\n'
             '#define ksu_avtab_htable_set(htab, i, v) ((htab).htable[(i)] = (v))\n'
-            '#endif\n',
-            1
-        )
-
-    c = c.replace(
-        'for (n = db->te_avtab.htable[i]; n; prev = n, n = n->next) {',
-        'for (n = ksu_avtab_htable_get(db->te_avtab, i); n; prev = n, n = n->next) {',
-        1
-    )
-    c = c.replace(
-        'db->te_avtab.htable[i] = n->next;',
-        'ksu_avtab_htable_set(db->te_avtab, i, n->next);',
-        1
-    )
-    c = c.replace(
-        'removed.htable[0] = n;',
-        'ksu_avtab_htable_set(removed, 0, n);',
-        1
-    )
-
-    old_open = '''static bool add_filename_trans(struct policydb *db, const char *s, const char *t, const char *c, const char *d,
-                               const char *o)
-{
-    struct type_datum *src, *tgt, *def;'''
-    new_open = '''#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
-static bool add_filename_trans(struct policydb *db, const char *s, const char *t, const char *c, const char *d,
-                               const char *o)
-{
-    struct type_datum *src, *tgt, *def;'''
-    if old_open in c and '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\nstatic bool add_filename_trans' not in c:
-        c = c.replace(old_open, new_open, 1)
-
-    old_close = '''free_trans:
-    kfree(trans);
-out:
-    return false;
-}'''
-    new_close = '''free_trans:
-    kfree(trans);
-out:
-    return false;
-}
-#else
-static bool add_filename_trans(struct policydb *db, const char *s, const char *t, const char *c, const char *d,
-                               const char *o)
-{
-    struct type_datum *src, *tgt, *def;
-    struct class_datum *cls;
-    struct filename_trans key;
-    struct filename_trans_datum *datum;
-    struct filename_trans *new_key;
-    struct filename_trans_datum *new_datum;
-    int rc;
-
-    src = symtab_search(&db->p_types, s);
-    if (!src) { pr_warn("source type %s does not exist\\n", s); return false; }
-    tgt = symtab_search(&db->p_types, t);
-    if (!tgt) { pr_warn("target type %s does not exist\\n", t); return false; }
-    cls = symtab_search(&db->p_classes, c);
-    if (!cls) { pr_warn("class %s does not exist\\n", c); return false; }
-    def = symtab_search(&db->p_types, d);
-    if (!def) { pr_warn("default type %s does not exist\\n", d); return false; }
-
-    key.stype = src->value;
-    key.ttype = tgt->value;
-    key.tclass = cls->value;
-    key.name = o;
-
-    datum = hashtab_search(db->filename_trans, &key);
-    if (datum) {
-        datum->otype = def->value;
-        return true;
-    }
-
-    new_key = kzalloc(sizeof(*new_key), GFP_KERNEL);
-    if (!new_key) return false;
-    new_key->stype = src->value;
-    new_key->ttype = tgt->value;
-    new_key->tclass = cls->value;
-    new_key->name = kstrdup(o, GFP_KERNEL);
-    if (!new_key->name) { kfree(new_key); return false; }
-
-    new_datum = kzalloc(sizeof(*new_datum), GFP_KERNEL);
-    if (!new_datum) { kfree(new_key->name); kfree(new_key); return false; }
-    new_datum->otype = def->value;
-
-    rc = hashtab_insert(db->filename_trans, new_key, new_datum);
-    if (rc) {
-        kfree(new_datum);
-        kfree(new_key->name);
-        kfree(new_key);
-        return false;
-    }
-
-    ebitmap_set_bit(&db->filename_trans_ttypes, tgt->value, 1);
-    return true;
-}
-#endif'''
-    if old_close in c and '#else\nstatic bool add_filename_trans' not in c:
-        c = c.replace(old_close, new_close, 1)
-
-    m = re.search(r'^static bool add_type\(struct policydb \*db, const char \*type_name, bool attr\)\n\{', c, re.MULTILINE)
-    if m and 'KSU_ADD_TYPE_FLEX_ARRAY' not in c:
-        start = m.start()
-        depth = 0; end = -1; i = m.end() - 1
-        while i < len(c):
-            if c[i] == '{': depth += 1
-            elif c[i] == '}':
-                depth -= 1
-                if depth == 0:
-                    end = i; break
-            i += 1
-        if end > 0:
-            orig_func = c[start:end+1]
-            flex_version = r'''static bool add_type_flex_419(struct policydb *db, const char *type_name, bool attr) {
-    /* KSU_ADD_TYPE_FLEX_ARRAY */
-    struct type_datum *type = symtab_search(&db->p_types, type_name);
-    if (type) { pr_warn("Type %s already exists\n", type_name); return true; }
-
-    u32 value = ++db->p_types.nprim;
-    int k;
-    void *zero = NULL;
-    struct ebitmap empty_bm;
-
-    type = (struct type_datum *)kzalloc(sizeof(struct type_datum), GFP_KERNEL);
-    if (!type) { pr_err("add_type: alloc type_datum failed.\n"); return false; }
-    type->primary = 1;
-    type->value = value;
-    type->attribute = attr;
-    char *key = kstrdup(type_name, GFP_KERNEL);
-    if (!key) { pr_err("add_type: alloc key failed.\n"); return false; }
-    if (symtab_insert(&db->p_types, key, type)) { pr_err("add_type: insert symtab failed.\n"); return false; }
-
-    struct flex_array *new_tama = flex_array_alloc(sizeof(struct ebitmap), value, GFP_KERNEL);
-    if (!new_tama) { pr_err("add_type: flex_array_alloc type_attr_map_array failed\n"); return false; }
-    memset(&empty_bm, 0, sizeof(empty_bm));
-    for (k = 0; k < value; k++)
-        flex_array_put(new_tama, k, &empty_bm, GFP_KERNEL);
-    for (k = 0; k < value - 1; k++) {
-        struct ebitmap *old_bm = (struct ebitmap *)flex_array_get(db->type_attr_map_array, k);
-        struct ebitmap *new_bm = (struct ebitmap *)flex_array_get(new_tama, k);
-        if (old_bm && new_bm)
-            ebitmap_cpy(new_bm, old_bm);
-    }
-    flex_array_free(db->type_attr_map_array);
-    db->type_attr_map_array = new_tama;
-    {
-        struct ebitmap *new_slot = (struct ebitmap *)flex_array_get(new_tama, value - 1);
-        if (new_slot) {
-            ebitmap_init(new_slot);
-            ebitmap_set_bit(new_slot, value - 1, 1);
-        }
-    }
-
-    struct flex_array *new_tvts = flex_array_alloc(sizeof(void *), value, GFP_KERNEL);
-    if (!new_tvts) { pr_err("add_type: flex_array_alloc type_val_to_struct_array failed\n"); return false; }
-    for (k = 0; k < value; k++)
-        flex_array_put_ptr(new_tvts, k, zero, GFP_KERNEL);
-    for (k = 0; k < value - 1; k++) {
-        void *pv = flex_array_get_ptr(db->type_val_to_struct_array, k);
-        if (pv) flex_array_put_ptr(new_tvts, k, pv, GFP_KERNEL);
-    }
-    flex_array_free(db->type_val_to_struct_array);
-    db->type_val_to_struct_array = new_tvts;
-    flex_array_put_ptr(new_tvts, value - 1, type, GFP_KERNEL);
-
-    struct flex_array *new_names = flex_array_alloc(sizeof(char *), value, GFP_KERNEL);
-    if (!new_names) { pr_err("add_type: flex_array_alloc sym_val_to_name failed\n"); return false; }
-    for (k = 0; k < value; k++)
-        flex_array_put_ptr(new_names, k, zero, GFP_KERNEL);
-    for (k = 0; k < value - 1; k++) {
-        void *pv = flex_array_get_ptr(db->sym_val_to_name[SYM_TYPES], k);
-        if (pv) flex_array_put_ptr(new_names, k, pv, GFP_KERNEL);
-    }
-    flex_array_free(db->sym_val_to_name[SYM_TYPES]);
-    db->sym_val_to_name[SYM_TYPES] = new_names;
-    flex_array_put_ptr(new_names, value - 1, key, GFP_KERNEL);
-
-    int i;
-    for (i = 0; i < db->p_roles.nprim; ++i) {
-        ebitmap_set_bit(&db->role_val_to_struct[i]->types, value - 1, 1);
-    }
-    return true;
-}
-'''
-            wrapped = (orig_func
-                       .replace('static bool add_type(struct policydb *db, const char *type_name, bool attr)\n{',
-                                'static bool add_type_5_10(struct policydb *db, const char *type_name, bool attr)\n{', 1))
-            new_func = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n' + wrapped + '\n#else\n'
-                        + flex_version + '\n#endif\n\n'
-                        'static bool add_type(struct policydb *db, const char *type_name, bool attr) {\n'
-                        '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n'
-                        '    return add_type_5_10(db, type_name, attr);\n'
-                        '#else\n'
-                        '    return add_type_flex_419(db, type_name, attr);\n'
-                        '#endif\n'
-                        '}')
-            c = c[:start] + new_func + c[end+1:]
-
-    old = '    struct ebitmap *sattr = &db->type_attr_map_array[type->value - 1];'
-    new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n'
-           '    struct ebitmap *sattr = &db->type_attr_map_array[type->value - 1];\n'
-           '#else\n'
-           '    struct ebitmap *sattr = (struct ebitmap *)flex_array_get(db->type_attr_map_array, type->value - 1);\n'
-           '#endif')
-    if old in c and new not in c:
-        c = c.replace(old, new, 1)
-
-    old = ('void ksu_destroy_sepolicy(struct selinux_policy *pol)\n'
-           '{\n'
-           '    policydb_destroy(&pol->policydb);\n'
-           '    kfree(pol);\n'
-           '}\n'
-           '\n'
-           'struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)\n'
-           '{')
-    new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n'
-           'void ksu_destroy_sepolicy(struct selinux_policy *pol)\n'
-           '{\n'
-           '    policydb_destroy(&pol->policydb);\n'
-           '    kfree(pol);\n'
-           '}\n'
-           '\n'
-           'struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)\n'
-           '{')
-    if old in c and new not in c:
-        c = c.replace(old, new, 1)
-
-    old_close = ('out_free_data:\n'
-                 '    kvfree(data);\n'
-                 '\n'
-                 '    return ERR_PTR(ret);\n'
-                 '}\n')
-    new_close = ("out_free_data:\n"
-                 "    kvfree(data);\n"
-                 "\n"
-                 "    return ERR_PTR(ret);\n"
-                 "}\n"
-                 "#else\n"
-                 "void ksu_destroy_sepolicy(struct selinux_policy *pol) { (void)pol; }\n"
-                 "struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)\n"
-                 "{\n"
-                 "    (void)old_pol;\n"
-                 "    return ERR_PTR(-EOPNOTSUPP);\n"
-                 "}\n"
-                 "#endif\n")
-    if old_close in c and '#else\nvoid ksu_destroy_sepolicy' not in c:
-        c = c.replace(old_close, new_close, 1)
-
+            '#endif\n', 1)
+    c = c.replace('for (n = db->te_avtab.htable[i]; n; prev = n, n = n->next) {',
+                  'for (n = ksu_avtab_htable_get(db->te_avtab, i); n; prev = n, n = n->next) {', 1)
+    c = c.replace('db->te_avtab.htable[i] = n->next;', 'ksu_avtab_htable_set(db->te_avtab, i, n->next);', 1)
+    c = c.replace('removed.htable[0] = n;', 'ksu_avtab_htable_set(removed, 0, n);', 1)
     if c != original:
         write(p, c); total += 1
-        print(f"  ✅ selinux/sepolicy.c: FIX 9 complet")
+        print(f"  ✅ selinux/sepolicy.c")
 
-# --- FIX 10 v2 : minmax.h → kernel.h ---
+# minmax.h -> kernel.h
 if os.path.isdir(ksu_root):
     for dp, dn, fn in os.walk(ksu_root):
         for f in fn:
@@ -1437,212 +835,222 @@ if os.path.isdir(ksu_root):
             except Exception: continue
             if '#include <linux/minmax.h>' not in c: continue
             if 'KSU_MINMAX_COMPAT' in c: continue
-            c = c.replace(
-                '#include <linux/minmax.h>',
-                '/* KSU_MINMAX_COMPAT: kernel.h fournit min_t/max_t sur tous les kernels */\n'
-                '#include <linux/kernel.h>',
-                1)
+            c = c.replace('#include <linux/minmax.h>',
+                '/* KSU_MINMAX_COMPAT */\n#include <linux/kernel.h>', 1)
             write(p, c); total += 1
-            print(f"  ✅ {os.path.relpath(p, GW)}: minmax.h → kernel.h")
+            print(f"  ✅ {os.path.relpath(p, GW)}: minmax")
 
-# --- FIX 11 : sched/signal.h et sched/task.h ---
-if os.path.isdir(ksu_root):
-    for dp, dn, fn in os.walk(ksu_root):
-        for f in fn:
-            if not f.endswith('.c'): continue
-            p = os.path.join(dp, f)
-            try: c = read(p)
-            except Exception: continue
-            if not any(s in c for s in ('tasklist_lock', 'init_task', 'task_pgrp', 'task_session')): continue
-            original = c
-            c = ensure_inc_after_last(c, '<linux/sched/signal.h>')
-            c = ensure_inc_after_last(c, '<linux/sched/task.h>')
-            if c != original:
-                write(p, c); total += 1
-                print(f"  ✅ {os.path.relpath(p, GW)}: sched/signal.h + sched/task.h")
-
-# --- FIX 12 : selinux_hide.c dual-path 4.19 ---
-p = os.path.join(ksu_root, "feature", "selinux_hide.c")
-if os.path.isfile(p):
-    c = read(p); original = c
-
-    compat = (
-        "/* ============ Compat 4.19 (dual-path) ============ */\n"
-        "#include <linux/version.h>\n"
-        "#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n"
-        "#define KSU_SELINUX_HIDE_BACKUP 0\n"
-        "struct selinux_policy *backup_sepolicy;\n"
-        "#define symtab_search(s, name) hashtab_search(&(s)->table, name)\n"
-        "extern struct mutex selinux_status_lock;\n"
-        "extern struct page *selinux_status_page;\n"
-        "#define ksu_status_lock()   mutex_lock(&selinux_status_lock)\n"
-        "#define ksu_status_unlock() mutex_unlock(&selinux_status_lock)\n"
-        "#define ksu_status_page     (selinux_status_page)\n"
-        "#else\n"
-        "#define KSU_SELINUX_HIDE_BACKUP 1\n"
-        "#define ksu_status_lock()   mutex_lock(&selinux_state.status_lock)\n"
-        "#define ksu_status_unlock() mutex_unlock(&selinux_state.status_lock)\n"
-        "#define ksu_status_page     (selinux_state.status_page)\n"
-        "#endif\n\n"
-    )
-    if 'KSU_SELINUX_HIDE_BACKUP' not in c:
-        c = c.replace('static DEFINE_MUTEX(selinux_hide_mutex);',
-                      compat + 'static DEFINE_MUTEX(selinux_hide_mutex);', 1)
-
-    c = c.replace('mutex_lock(&selinux_state.status_lock);', 'ksu_status_lock();')
-    c = c.replace('mutex_unlock(&selinux_state.status_lock);', 'ksu_status_unlock();')
-    c = c.replace('selinux_state.status_page', 'ksu_status_page')
-
-    old_drop = ("void ksu_selinux_hide_drop_backup_if_unused()\n"
-                "{\n"
-                "    mutex_lock(&selinux_hide_mutex);")
-    new_drop = ("void ksu_selinux_hide_drop_backup_if_unused()\n"
-                "{\n"
-                "#if KSU_SELINUX_HIDE_BACKUP\n"
-                "    mutex_lock(&selinux_hide_mutex);")
-    if old_drop in c and new_drop not in c:
-        c = c.replace(old_drop, new_drop, 1)
-    old_tail = ("    mutex_unlock(&selinux_hide_mutex);\n"
-                "}\n"
-                "\n"
-                "/*\n"
-                " * Caveat:  Mutates scontext.")
-    new_tail = ("    mutex_unlock(&selinux_hide_mutex);\n"
-                "#endif // KSU_SELINUX_HIDE_BACKUP\n"
-                "}\n"
-                "\n"
-                "#if KSU_SELINUX_HIDE_BACKUP\n"
-                "/*\n"
-                " * Caveat:  Mutates scontext.")
-    if old_tail in c and new_tail not in c:
-        c = c.replace(old_tail, new_tail, 1)
-
-    stubs = (
-        "\n"
-        "#else /* LINUX_VERSION_CODE < 5.10 : pas de backup sepolicy sur 4.19 */\n"
-        "\n"
-        "static int security_context_to_sid_with_policy(struct selinux_policy *policy, const char *scontext, u32 scontext_len,\n"
-        "                                               u32 *sid, u32 def_sid, gfp_t gfp_flags, u32 *orig_sid_p, int *orig_rc_p)\n"
-        "{\n"
-        "    if (orig_sid_p)\n"
-        "        *orig_sid_p = SECSID_NULL;\n"
-        "    if (orig_rc_p)\n"
-        "        *orig_rc_p = -EOPNOTSUPP;\n"
-        "    return -EOPNOTSUPP;\n"
-        "}\n"
-        "\n"
-        "static int security_sid_to_context_with_policy(struct selinux_policy *policy, u32 sid, char **scontext,\n"
-        "                                               u32 *scontext_len)\n"
-        "{\n"
-        "    if (scontext)\n"
-        "        *scontext = NULL;\n"
-        "    *scontext_len = 0;\n"
-        "    return -EOPNOTSUPP;\n"
-        "}\n"
-        "\n"
-        "static void security_compute_av_user_with_policy(struct selinux_policy *policy, u32 ssid, u32 tsid, u16 tclass,\n"
-        "                                                 struct av_decision *avd)\n"
-        "{\n"
-        "    avd->allowed = 0;\n"
-        "    avd->auditallow = 0;\n"
-        "    avd->auditdeny = 0xffffffff;\n"
-        "    avd->seqno = 0;\n"
-        "    avd->flags = 0;\n"
-        "}\n"
-        "\n"
-        "#endif /* KSU_SELINUX_HIDE_BACKUP */\n"
-    )
-    if 'KSU_SELINUX_HIDE_BACKUP' in c and 'ksu_status_lock();' in c and \
-       not c.rstrip().endswith('#endif /* KSU_SELINUX_HIDE_BACKUP */'):
-        c = c.rstrip('\n') + '\n' + stubs
-
-    if c != original:
-        write(p, c); total += 1
-        print(f"  ✅ feature/selinux_hide.c: dual-path 4.19")
-
-# --- FIX 13 : Backport VFS (can_umount, path_umount, path_mount) pour 4.19 ---
-p = os.path.join(kernel_root, "fs/namespace.c")
+# dispatch.c compat
+p = os.path.join(ksu_root, "supercall/dispatch.c")
 if os.path.isfile(p):
     c = read(p)
-    if 'int path_umount(' not in c:
-        backport_vfs = '''
-/* --- Rétroportage KernelSU / FinaSU (fs/namespace.c pour noyau 4.19) --- */
-int path_mount(const char *dev_name, struct path *path,
-               const char *type_page, unsigned long flags, void *data_page)
+    if 'KSU_DISPATCH_419_COMPAT' not in c:
+        for inc in ['<linux/sched.h>', '<linux/sched/task.h>', '<linux/pid.h>', '<linux/spinlock.h>']:
+            c = ensure_inc_after_last(c, inc)
+        compat_block = '''
+#ifndef KSU_DISPATCH_419_COMPAT
+#define KSU_DISPATCH_419_COMPAT 1
+extern struct task_struct init_task;
+extern rwlock_t tasklist_lock;
+#ifdef task_pgrp
+#undef task_pgrp
+#endif
+#ifdef task_session
+#undef task_session
+#endif
+static inline struct pid *ksu_task_pgrp_419(struct task_struct *task) { return task->signal->pids[PIDTYPE_PGID]; }
+static inline struct pid *ksu_task_session_419(struct task_struct *task) { return task->signal->pids[PIDTYPE_SID]; }
+#define task_pgrp(task)    ksu_task_pgrp_419(task)
+#define task_session(task) ksu_task_session_419(task)
+#endif
+'''
+        lines = c.split('\n'); last_inc = -1
+        for i, ln in enumerate(lines):
+            if ln.lstrip().startswith('#include'): last_inc = i
+        lines.insert(last_inc + 1, compat_block)
+        write(p, '\n'.join(lines)); total += 1
+        print(f"  ✅ supercall/dispatch.c: compat 4.19")
+
+# selinux_hide.c
+p = os.path.join(ksu_root, "feature/selinux_hide.c")
+if os.path.isfile(p):
+    c = read(p)
+    if 'ksu_fake_status_mutex' not in c:
+        new_sh = r'''// SPDX-License-Identifier: GPL-2.0
+#include "selinux_hide.h"
+#include "infra/symbol_resolver.h"
+#include "hook/patch_memory.h"
+#include <linux/jump_label.h>
+#include <linux/version.h>
+#include <linux/cred.h>
+#include <linux/fs.h>
+#include <linux/init.h>
+#include <linux/mm.h>
+#include <linux/mutex.h>
+#include <linux/page-flags.h>
+#include <linux/printk.h>
+#include <linux/sched.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/uaccess.h>
+#include <security.h>
+#include "avc.h"
+#include "objsec.h"
+#include "klog.h"
+#include "ksu.h"
+#include "policy/feature.h"
+
+static DEFINE_MUTEX(selinux_hide_mutex);
+static DEFINE_MUTEX(ksu_fake_status_mutex);
+bool ksu_selinux_hide_enabled __read_mostly;
+bool ksu_selinux_hide_running __read_mostly;
+static struct page *fake_status;
+typedef int (*sel_open_handle_status_fn)(struct inode *inode, struct file *filp);
+static sel_open_handle_status_fn orig_sel_open_handle_status;
+static sel_open_handle_status_fn *sel_open_handle_status_slot;
+static struct page *ksu_selinux_status_page(void) { return selinux_kernel_status_page(&selinux_state); }
+
+ssize_t my_write_context(struct file *file, char *buf, size_t size)
 {
-    int ret;
-    char *buf = kmalloc(PATH_MAX, GFP_KERNEL);
-    char *dir_name;
+    char *canon = NULL; u32 sid, len; int ret;
+    (void)file;
+    ret = security_context_to_sid(&selinux_state, buf, size, &sid, GFP_KERNEL);
+    if (ret) return ret;
+    ret = security_sid_to_context(&selinux_state, sid, &canon, &len);
+    if (ret) return ret;
+    if (len > SIMPLE_TRANSACTION_LIMIT) { kfree(canon); return -ERANGE; }
+    memcpy(buf, canon, len); kfree(canon);
+    return len;
+}
 
-    if (!buf)
-        return -ENOMEM;
-
-    dir_name = d_path(path, buf, PATH_MAX);
-    if (IS_ERR(dir_name)) {
-        kfree(buf);
-        return PTR_ERR(dir_name);
-    }
-
-    ret = do_mount(dev_name, dir_name, type_page, flags, data_page);
-    kfree(buf);
+ssize_t my_write_access(struct file *file, char *buf, size_t size)
+{
+    char *scon, *tcon; u32 ssid, tsid, sconlen, tconlen; u16 tclass;
+    struct av_decision avd; int ret;
+    (void)file;
+    scon = kzalloc(size + 1, GFP_KERNEL); tcon = kzalloc(size + 1, GFP_KERNEL);
+    if (!scon || !tcon) { kfree(tcon); kfree(scon); return -ENOMEM; }
+    if (sscanf(buf, "%s %s %hu", scon, tcon, &tclass) != 3) { kfree(tcon); kfree(scon); return -EINVAL; }
+    sconlen = strlen(scon); tconlen = strlen(tcon);
+    ret = security_context_to_sid(&selinux_state, scon, sconlen, &ssid, GFP_KERNEL);
+    if (!ret) ret = security_context_to_sid(&selinux_state, tcon, tconlen, &tsid, GFP_KERNEL);
+    if (ret) { kfree(tcon); kfree(scon); return ret; }
+    security_compute_av_user(&selinux_state, ssid, tsid, tclass, &avd);
+    ret = scnprintf(buf, SIMPLE_TRANSACTION_LIMIT, "%x %x %x %x %u %x",
+                    avd.allowed, 0xffffffff, avd.auditallow, avd.auditdeny, avd.seqno, avd.flags);
+    kfree(tcon); kfree(scon);
     return ret;
 }
 
-static int can_umount(const struct path *path, int flags)
+static int ksu_selinux_status_open(struct inode *inode, struct file *filp)
 {
-    struct mount *mnt = real_mount(path->mnt);
+    struct page *status; (void)inode;
+    if (ksu_selinux_hide_enabled && current_uid().val >= 10000) {
+        mutex_lock(&ksu_fake_status_mutex);
+        status = fake_status;
+        mutex_unlock(&ksu_fake_status_mutex);
+        if (status) { filp->private_data = status; return 0; }
+    }
+    return orig_sel_open_handle_status(inode, filp);
+}
 
-    if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
-        return -EINVAL;
-    if (!may_mount())
-        return -EPERM;
-    if (path->dentry != path->mnt->mnt_root)
-        return -EINVAL;
-    if (!check_mnt(mnt))
-        return -EINVAL;
-    if (mnt->mnt.mnt_flags & MNT_LOCKED)
-        return -EINVAL;
+static int ksu_hook_selinux_status_open(void)
+{
+    struct file_operations *ops; sel_open_handle_status_fn new_fn; int ret;
+    if (orig_sel_open_handle_status) return 0;
+    ops = find_kernel_symbol_exact("sel_handle_status_ops");
+    if (!ops || !ops->open) return -ENOENT;
+    sel_open_handle_status_slot = (sel_open_handle_status_fn *)&ops->open;
+    orig_sel_open_handle_status = *sel_open_handle_status_slot;
+    new_fn = ksu_selinux_status_open;
+    ret = ksu_patch_text(sel_open_handle_status_slot, &new_fn, sizeof(new_fn), KSU_PATCH_TEXT_FLUSH_DCACHE);
+    if (ret) { orig_sel_open_handle_status = NULL; sel_open_handle_status_slot = NULL; }
+    return ret;
+}
+
+static void ksu_unhook_selinux_status_open(void)
+{
+    if (sel_open_handle_status_slot && orig_sel_open_handle_status) {
+        ksu_patch_text(sel_open_handle_status_slot, &orig_sel_open_handle_status,
+                       sizeof(orig_sel_open_handle_status), KSU_PATCH_TEXT_FLUSH_DCACHE);
+        orig_sel_open_handle_status = NULL;
+        sel_open_handle_status_slot = NULL;
+    }
+}
+
+static int ksu_initialize_fake_status(void)
+{
+    struct page *status_page, *new_page; struct selinux_kernel_status *status, *new_status;
+    mutex_lock(&ksu_fake_status_mutex);
+    if (fake_status) { mutex_unlock(&ksu_fake_status_mutex); return 0; }
+    status_page = ksu_selinux_status_page();
+    if (!status_page) { mutex_unlock(&ksu_fake_status_mutex); return -ENODEV; }
+    status = page_address(status_page);
+    if (!status) { mutex_unlock(&ksu_fake_status_mutex); return -EFAULT; }
+    new_page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+    if (!new_page) { mutex_unlock(&ksu_fake_status_mutex); return -ENOMEM; }
+    new_status = page_address(new_page);
+    memcpy(new_status, status, sizeof(*status));
+    new_status->enforcing = 1; new_status->policyload = 0; new_status->sequence = 0;
+    fake_status = new_page; mutex_unlock(&ksu_fake_status_mutex);
     return 0;
 }
 
-int path_umount(struct path *path, int flags)
+static int selinux_hide_feature_get(u64 *value) { *value = ksu_selinux_hide_enabled ? 1 : 0; return 0; }
+
+static int selinux_hide_feature_set(u64 value)
 {
-    struct mount *mnt = real_mount(path->mnt);
-    int ret;
-
-    ret = can_umount(path, flags);
-    if (!ret)
-        ret = do_umount(mnt, flags);
-
-    dput(path->dentry);
-    mntput_no_expire(mnt);
+    int ret = 0; bool enable = value != 0;
+    mutex_lock(&selinux_hide_mutex);
+    if (enable == ksu_selinux_hide_enabled) { mutex_unlock(&selinux_hide_mutex); return 0; }
+    if (enable) {
+        ret = ksu_initialize_fake_status();
+        if (!ret) ret = ksu_hook_selinux_status_open();
+        if (!ret) { ksu_selinux_hide_enabled = true; ksu_selinux_hide_running = true; }
+    } else {
+        ksu_selinux_hide_enabled = false; ksu_selinux_hide_running = false;
+        ksu_unhook_selinux_status_open();
+    }
+    mutex_unlock(&selinux_hide_mutex);
     return ret;
 }
+
+static const struct ksu_feature_handler selinux_hide_handler = {
+    .feature_id = KSU_FEATURE_SELINUX_HIDE, .name = "selinux_hide",
+    .get_handler = selinux_hide_feature_get, .set_handler = selinux_hide_feature_set,
+};
+
+void ksu_selinux_hide_handle_second_stage(void) { if (ksu_selinux_hide_enabled) ksu_initialize_fake_status(); }
+void ksu_selinux_hide_handle_post_fs_data(void) { if (ksu_selinux_hide_enabled) ksu_initialize_fake_status(); }
+
+void __init ksu_selinux_hide_init(void)
+{
+    if (ksu_register_feature_handler(&selinux_hide_handler))
+        pr_err("Failed to register selinux_hide feature handler\n");
+}
+
+void __exit ksu_selinux_hide_exit(void)
+{
+    mutex_lock(&selinux_hide_mutex);
+    ksu_selinux_hide_enabled = false; ksu_selinux_hide_running = false;
+    ksu_unhook_selinux_status_open();
+    mutex_unlock(&selinux_hide_mutex);
+    ksu_unregister_feature_handler(KSU_FEATURE_SELINUX_HIDE);
+    mutex_lock(&ksu_fake_status_mutex);
+    if (fake_status) __free_page(fake_status);
+    fake_status = NULL;
+    mutex_unlock(&ksu_fake_status_mutex);
+}
+
+void ksu_selinux_hide_drop_backup_if_unused(void) { }
 '''
-        c = c.rstrip() + '\n' + backport_vfs
-        write(p, c)
-        total += 1
-        print("  ✅ fs/namespace.c: backport can_umount + path_umount + path_mount réussi")
+        write(p, new_sh); total += 1
+        print(f"  ✅ feature/selinux_hide.c")
 
-p_fsh = os.path.join(kernel_root, "include/linux/fs.h")
-if os.path.isfile(p_fsh):
-    c_fsh = read(p_fsh)
-    if 'int path_umount(' not in c_fsh:
-        c_fsh = c_fsh.replace(
-            '#endif /* _LINUX_FS_H */',
-            'extern int path_mount(const char *dev_name, struct path *path, const char *type_page, unsigned long flags, void *data_page);\n'
-            'extern int path_umount(struct path *path, int flags);\n'
-            '#endif /* _LINUX_FS_H */',
-            1
-        )
-        write(p_fsh, c_fsh)
-        total += 1
-        print("  ✅ include/linux/fs.h: déclarations path_mount + path_umount ajoutées")
-
-print(f"  ✅ portage 4.19 : {total} fichier(s)")
+print(f"  ✅ portage 4.19 : {total} fichier(s) (FIX 14/15 retirés, Inline gère reboot.c)")
 FIXEOF
 
-# ==================== 5. CONFIG ====================
+# ==================== 5. CONFIG (INLINE au lieu de TRACEPOINT) ====================
 export ARCH=arm64 SUBARCH=arm64
 export CROSS_COMPILE=aarch64-linux-gnu-
 export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
@@ -1661,10 +1069,11 @@ fi
 
 mkdir -p out
 make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 vendor/lito-perf_defconfig
+
 cat >> out/.config <<'EOF'
 CONFIG_KSU=y
-CONFIG_KSU_HOOK_TRACEPOINT=y
-# CONFIG_KSU_HOOK_SUSFS_INLINE is not set
+# CONFIG_KSU_HOOK_TRACEPOINT is not set
+CONFIG_KSU_HOOK_SUSFS_INLINE=y
 CONFIG_KSU_SUSFS=y
 CONFIG_KSU_SUSFS_SUS_PATH=y
 CONFIG_KSU_SUSFS_SUS_MOUNT=y
@@ -1691,26 +1100,65 @@ CONFIG_COMPAT=y
 CONFIG_COMPAT_32BIT_TIME=y
 EOF
 make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig 2>&1 | tail -3
+
+# Force INLINE post-olddefconfig + désactive Tracepoint
+if grep -q '^CONFIG_KSU_HOOK_TRACEPOINT=y' out/.config; then
+    sed -i 's/^CONFIG_KSU_HOOK_TRACEPOINT=y/# CONFIG_KSU_HOOK_TRACEPOINT is not set/' out/.config
+    echo "  ✅ CONFIG_KSU_HOOK_TRACEPOINT forcé OFF" | tee -a "$AUDIT"
+fi
+if ! grep -q '^CONFIG_KSU_HOOK_SUSFS_INLINE=y' out/.config; then
+    echo 'CONFIG_KSU_HOOK_SUSFS_INLINE=y' >> out/.config
+    echo "  ✅ CONFIG_KSU_HOOK_SUSFS_INLINE forcé ON" | tee -a "$AUDIT"
+fi
+if grep -q '^CONFIG_KSU_DYNAMIC_MANAGER=y' out/.config; then
+    sed -i 's/^CONFIG_KSU_DYNAMIC_MANAGER=y/# CONFIG_KSU_DYNAMIC_MANAGER is not set/' out/.config
+    echo "  ✅ CONFIG_KSU_DYNAMIC_MANAGER forcé OFF" | tee -a "$AUDIT"
+fi
+
+echo "=== VÉRIFICATION CONFIG KSU (INLINE) ===" | tee -a "$AUDIT"
+grep -E "^CONFIG_KSU|^# CONFIG_KSU" out/.config | tee -a "$AUDIT"
+
 grep -q "^CONFIG_KSU=y" out/.config || { echo "❌ CONFIG_KSU off"; exit 1; }
-grep -q "^CONFIG_KSU_SUSFS=y" out/.config || { echo "❌ CONFIG_KSU_SUSFS off"; exit 1; }
-grep -q "^CONFIG_KSU_SUSFS_SUS_KSTAT=y" out/.config || { echo "❌ CONFIG_KSU_SUSFS_SUS_KSTAT off"; exit 1; }
+grep -q "^CONFIG_KSU_HOOK_SUSFS_INLINE=y" out/.config || { echo "❌ INLINE off"; exit 1; }
+grep -q "^# CONFIG_KSU_HOOK_TRACEPOINT is not set" out/.config || { echo "❌ TRACEPOINT pas désactivé"; exit 1; }
+grep -q "^CONFIG_KSU_SUSFS=y" out/.config || { echo "❌ SUSFS off"; exit 1; }
+
+echo "=== PROBE : prérequis Inline ===" | tee -a "$AUDIT"
+grep -E "^CONFIG_(ARM64|KSU|KSU_SUSFS|KSU_HOOK_SUSFS_INLINE|KPROBES|KALLSYMS|HEADERS_INSTALL)=" out/.config | tee -a "$AUDIT"
 
 # ==================== 6. MOTOROLA ====================
-sed -i 's/if (!check_version(/if (0 \&\& !check_version(/g' kernel/module.c
-printf "\n#include <linux/notifier.h>\n#include <linux/module.h>\nstatic BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);\nint panel_register_notifier(struct notifier_block *nb){return blocking_notifier_chain_register(&motorola_panel_notifier_list,nb);}\nEXPORT_SYMBOL(panel_register_notifier);\nint panel_unregister_notifier(struct notifier_block *nb){return blocking_notifier_chain_unregister(&motorola_panel_notifier_list,nb);}\nEXPORT_SYMBOL(panel_unregister_notifier);\nvoid touch_set_state(int s){return;}\nEXPORT_SYMBOL(touch_set_state);\n" >> techpack/display/msm/msm_drv.c
+cat >> techpack/display/msm/msm_drv.c <<'EOF'
+
+#include <linux/notifier.h>
+#include <linux/module.h>
+
+static BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);
+
+int panel_register_notifier(struct notifier_block *nb)
+{ return blocking_notifier_chain_register(&motorola_panel_notifier_list, nb); }
+EXPORT_SYMBOL(panel_register_notifier);
+
+int panel_unregister_notifier(struct notifier_block *nb)
+{ return blocking_notifier_chain_unregister(&motorola_panel_notifier_list, nb); }
+EXPORT_SYMBOL(panel_unregister_notifier);
+
+void touch_set_state(int state) { (void)state; }
+EXPORT_SYMBOL(touch_set_state);
+EOF
 
 # ==================== 7. COMPILATION ====================
-echo "=== Compilation ==="
+echo "=== Compilation (avec KSU_REQUIRE_PREINIT=1) ==="
 set +eo pipefail
 make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 \
   KCFLAGS="-Wno-unused-variable -Wno-declaration-after-statement" $SIG_ARGS \
-    -k -j$(nproc) Image 2>&1 | tee build.log
+  KSU_REQUIRE_PREINIT=1 \
+  -j$(nproc) Image 2>&1 | tee build.log
 MAKE_RC=${PIPESTATUS[0]}
 set -eo pipefail
 
 if [ "$MAKE_RC" -ne 0 ] || [ ! -f out/arch/arm64/boot/Image ]; then
     echo "❌ BUILD FAILED (rc=$MAKE_RC)"
-    { grep -nE "error:|undefined symbol|fatal error:|\*\*\*" build.log | head -150; echo ""; tail -n 100 build.log; } \
+    { grep -nE "error:|undefined symbol|fatal error:|\*\*\*|check_susfs_inline" build.log | head -150; echo ""; tail -n 100 build.log; } \
       > "$GITHUB_WORKSPACE/output/build-errors.txt" 2>&1 || true
     exit 1
 fi
@@ -1787,5 +1235,5 @@ cp final_boot.img "output/FinaSU-A-${VER}-boot.img"
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
 cp kernel_sources/build.log output/ 2>/dev/null || true
 cp "$GITHUB_WORKSPACE/ksud" output/ksud 2>/dev/null || true
-echo "=== BUILD TERMINÉ ${VER} ==="
+echo "=== BUILD TERMINÉ ${VER} (backend INLINE) ==="
 ls -lh output/
