@@ -1127,24 +1127,8 @@ echo "=== PROBE : prérequis Inline ===" | tee -a "$AUDIT"
 grep -E "^CONFIG_(ARM64|KSU|KSU_SUSFS|KSU_HOOK_SUSFS_INLINE|KPROBES|KALLSYMS|HEADERS_INSTALL)=" out/.config | tee -a "$AUDIT"
 
 # ==================== 6. MOTOROLA ====================
-cat >> techpack/display/msm/msm_drv.c <<'EOF'
-
-#include <linux/notifier.h>
-#include <linux/module.h>
-
-static BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);
-
-int panel_register_notifier(struct notifier_block *nb)
-{ return blocking_notifier_chain_register(&motorola_panel_notifier_list, nb); }
-EXPORT_SYMBOL(panel_register_notifier);
-
-int panel_unregister_notifier(struct notifier_block *nb)
-{ return blocking_notifier_chain_unregister(&motorola_panel_notifier_list, nb); }
-EXPORT_SYMBOL(panel_unregister_notifier);
-
-void touch_set_state(int state) { (void)state; }
-EXPORT_SYMBOL(touch_set_state);
-EOF
+sed -i 's/if (!check_version(/if (0 \&\& !check_version(/g' kernel/module.c
+printf "\n#include <linux/notifier.h>\n#include <linux/module.h>\nstatic BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);\nint panel_register_notifier(struct notifier_block *nb){return blocking_notifier_chain_register(&motorola_panel_notifier_list,nb);}\nEXPORT_SYMBOL(panel_register_notifier);\nint panel_unregister_notifier(struct notifier_block *nb){return blocking_notifier_chain_unregister(&motorola_panel_notifier_list,nb);}\nEXPORT_SYMBOL(panel_unregister_notifier);\nvoid touch_set_state(int s){return;}\nEXPORT_SYMBOL(touch_set_state);\n" >> techpack/display/msm/msm_drv.c
 
 # ==================== 7. COMPILATION ====================
 echo "=== Compilation (avec KSU_REQUIRE_PREINIT=1) ==="
