@@ -199,7 +199,7 @@ echo "✅ FinaSU intégré"
         found_kconf=1
         echo "--- $kf"
         grep -E "^config[[:space:]]+KSU" "$kf" 2>/dev/null || echo "  (aucun config KSU_*)"
-    done < <(find drivers/kernelsu -name "Kconfig*" -type f 2>/dev/null)
+    done < <(find -L drivers/kernelsu -name "Kconfig*" -type f 2>/dev/null)
     [ "$found_kconf" -eq 0 ] && echo "  Aucun Kconfig* trouvé dans drivers/kernelsu"
 
     echo ""
@@ -1849,11 +1849,6 @@ EXPORT_SYMBOL(path_umount);
         write(p, c); total += 1
         print(f"  ✅ fs/namespace.c: backport path_mount/path_umount")
 
-		if os.environ.get('HOOK_MODE', '') != 'manual':
-    print(f"  ⏭️ FIX 15 IGNORÉ : hook mode = {os.environ.get('HOOK_MODE', 'inconnu')} (MANUAL_HOOK absent)")
-else:
-    print(f"  → FIX 15 appliqué (hook mode = manual)")
-
 # --- FIX 15 : MANUAL_HOOK patchs kernel 4.19 (fs/exec.c, fs/open.c, fs/read_write.c, fs/stat.c, kernel/reboot.c) ---
 print("  → FIX 15 : patchs kernel MANUAL_HOOK")
 
@@ -1963,7 +1958,6 @@ mkdir -p out
 make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 vendor/lito-perf_defconfig
 cat >> out/.config <<'EOF'
 CONFIG_KSU=y
-CONFIG_KSU_MANUAL_HOOK=y
 # CONFIG_KSU_HOOK_TRACEPOINT is not set
 # CONFIG_KSU_WITH_KPROBES is not set
 # CONFIG_KSU_TAMPER_SYSCALL_TABLE is not set
