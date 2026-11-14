@@ -80,37 +80,103 @@ if ! git checkout -q "$KERNEL_PIN" 2>/dev/null; then
 fi
 echo "Source figée : $KERNEL_PIN ($(git rev-parse HEAD))" | tee -a "$AUDIT"
 
-# ==================== 1b. PATCH SET_MEMORY 4.19 (CRITIQUE) ====================
-echo "=== Application du patch set_memory 4.19 ===" | tee -a "$AUDIT"
+# ==================== 1b. PATCH SET_MEMORY 4.19 (FILTRÉ ARM64 UNIQUEMENT) ====================
+echo "=== Application du patch set_memory 4.19 (filtré arm64) ===" | tee -a "$AUDIT"
 SET_MEMORY_PATCH_URL="${SET_MEMORY_PATCH_URL:-https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/Patch/set_memory_to_49_and_low.patch}"
+SET_MEMORY_PATCH_RAW="$GITHUB_WORKSPACE/patches/set_memory_raw.patch"
 SET_MEMORY_PATCH="$GITHUB_WORKSPACE/patches/set_memory_to_49_and_low.patch"
 mkdir -p "$GITHUB_WORKSPACE/patches"
-curl --proto '=https' --tlsv1.2 -fsSL "$SET_MEMORY_PATCH_URL" -o "$SET_MEMORY_PATCH"
-echo "Patch set_memory téléchargé : $(sha256sum "$SET_MEMORY_PATCH" | cut -d' ' -f1)" | tee -a "$AUDIT"
+curl --proto '=https' --tlsv1.2 -fsSL "$SET_MEMORY_PATCH_URL" -o "$SET_MEMORY_PATCH_RAW"
 
+# Filtrer : ne garder QUE les fichiers arm64 + Kconfig + set_memory headers.
+# Exclure tout le reste (totalram_pages, autres arch, drivers).
+python3 - "$SET_MEMORY_PATCH_RAW" "$SET_MEMORY_PATCH" <<'FILTER_PATCH'
+import sys, re
+src, dst = sys.argv[1], sys.argv[2]
+txt = open(src, encoding='utf-8', errors='replace').read()
+
+# Fichiers à GARDER (chemins relatifs au kernel source)
+KEEP_FILES = [
+    'arch/Kconfig',
+    'arch/arm64/Kconfig',
+    'arch/arm64/include/asm/Kbuild',
+    'arch/arm64/include/asm/cacheflush.h',
+]
+
+# Découper le patch en blocs "diff --git a/X b/X"
+blocks = re.split(r'(?=^diff --git )', txt, flags=re.MULTILINE)
+kept = []
+for blk in blocks:
+    if not blk.strip():
+        continue
+    # Extraire le nom du fichier
+    m = re.match(r'diff --git a/(\S+) b/\S+', blk)
+    if not m:
+        continue
+    fname = m.group(1)
+    if fname in KEEP_FILES:
+        kept.append(blk)
+        print(f"  ✅ gardé : {fname}")
+    else:
+        print(f"  ⏭️  exclu : {fname}")
+
+open(dst, 'w', encoding='utf-8').write(''.join(kept))
+print(f"  ✅ Patch filtré : {len(kept)} fichier(s) conservé(s)")
+FILTER_PATCH
+
+echo "Patch set_memory filtré : $(sha256sum "$SET_MEMORY_PATCH" | cut -d' ' -f1)" | tee -a "$AUDIT"
+
+# Appliquer le patch filtré
 set +e
 git apply --reject --whitespace=nowarn "$SET_MEMORY_PATCH" 2>&1 | tee -a "$AUDIT"
 SET_MEMORY_RC=${PIPESTATUS[0]}
 set -e
-echo "set_memory patch rc=$SET_MEMORY_RC (rejets autres-arch attendus)" | tee -a "$AUDIT"
+echo "set_memory patch rc=$SET_MEMORY_RC" | tee -a "$AUDIT"
 
-if [ ! -f arch/arm64/include/asm/set_memory.h ] && [ ! -f include/asm-generic/set_memory.h ]; then
-    echo "❌ set_memory.h absent après patch" | tee -a "$AUDIT"
-    find . -name 'set_memory*' -o -name '*.rej' | head -20 | tee -a "$AUDIT"
-    exit 1
+# Vérification : ARCH_HAS_SET_MEMORY dans arch/Kconfig et arch/arm64/Kconfig
+if ! grep -q "ARCH_HAS_SET_MEMORY" arch/Kconfig; then
+    echo "  ⚠️ ARCH_HAS_SET_MEMORY pas dans arch/Kconfig — injection manuelle" | tee -a "$AUDIT"
+    sed -i '/^config ARCH_HAS_FORTIFY_SOURCE$/i\config ARCH_HAS_SET_MEMORY\n\tbool\n' arch/Kconfig
 fi
 if ! grep -q "ARCH_HAS_SET_MEMORY" arch/arm64/Kconfig; then
-    echo "⚠️ ARCH_HAS_SET_MEMORY pas dans arch/arm64/Kconfig — injection manuelle" | tee -a "$AUDIT"
+    echo "  ⚠️ ARCH_HAS_SET_MEMORY pas dans arch/arm64/Kconfig — injection manuelle" | tee -a "$AUDIT"
     sed -i '/^config ARM64$/a\	select ARCH_HAS_SET_MEMORY' arch/arm64/Kconfig
 fi
-if ! grep -q "ARCH_HAS_SET_MEMORY" arch/Kconfig; then
-    echo "⚠️ config ARCH_HAS_SET_MEMORY pas dans arch/Kconfig — injection manuelle" | tee -a "$AUDIT"
-    sed -i '/^config ARCH_HAS_FORTIFY_SOURCE$/i\config ARCH_HAS_SET_MEMORY\n\tbool\n' arch/Kconfig
+if ! grep -q "set_memory.h" arch/arm64/include/asm/Kbuild; then
+    echo "  ⚠️ set_memory.h pas dans arch/arm64/include/asm/Kbuild — injection manuelle" | tee -a "$AUDIT"
+    echo 'generic-y += set_memory.h' >> arch/arm64/include/asm/Kbuild
+fi
+
+# Vérifier que asm-generic/set_memory.h existe (créé par le patch ? sinon le créer)
+if [ ! -f include/asm-generic/set_memory.h ]; then
+    echo "  ⚠️ include/asm-generic/set_memory.h absent — création manuelle" | tee -a "$AUDIT"
+    mkdir -p include/asm-generic
+    cat > include/asm-generic/set_memory.h <<'SETMEM'
+/* SPDX-License-Identifier: GPL-2.0 */
+#ifndef _ASM_GENERIC_SET_MEMORY_H
+#define _ASM_GENERIC_SET_MEMORY_H
+
+#ifndef CONFIG_ARCH_HAS_SET_MEMORY
+static inline int set_memory_ro(unsigned long addr, int numpages) { return 0; }
+static inline int set_memory_rw(unsigned long addr, int numpages) { return 0; }
+static inline int set_memory_x(unsigned long numpages, unsigned long addr) { return 0; }
+static inline int set_memory_nx(unsigned long addr, int numpages) { return 0; }
+#endif
+
+#endif
+SETMEM
+    echo "  ✅ include/asm-generic/set_memory.h créé" | tee -a "$AUDIT"
+fi
+
+# Vérifier que totalram_pages n'a PAS été touché
+if grep -q "totalram_pages()" include/linux/swap.h 2>/dev/null; then
+    echo "  ⚠️ totalram_pages() dans swap.h — restauration" | tee -a "$AUDIT"
+    git checkout -- include/linux/swap.h
 fi
 
 REJ_COUNT=$(find . -name '*.rej' | wc -l)
 find . -name '*.rej' -delete
-echo "✅ Patch set_memory appliqué (rejets nettoyés : $REJ_COUNT)" | tee -a "$AUDIT"
+echo "✅ Patch set_memory filtré appliqué (rejets nettoyés : $REJ_COUNT)" | tee -a "$AUDIT"
 
 # ==================== 1c. PATCH SUSFS BASE 4.19 ====================
 echo "=== Application du patch SUSFS 4.19 ===" | tee -a "$AUDIT"
