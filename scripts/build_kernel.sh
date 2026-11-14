@@ -399,49 +399,17 @@ if 'KSU_SECCOMP_DISABLED' not in final:
 print("  ✅ FIX seccomp terminé")
 SECCOMP_FIX
 
-# ==================== 3. SIGNATURE MANAGER ====================
-MGR_APK="$GITHUB_WORKSPACE/patches/manager.apk"
-if [ ! -f "$MGR_APK" ]; then
-    mkdir -p "$GITHUB_WORKSPACE/patches"
-    gdown "https://drive.google.com/uc?id=${MGR_GDRIVE_ID}" -O "$MGR_APK" 2>&1 || echo "  ⚠️ Échec download"
-fi
-if [ -z "$FINASU_EXPECTED_SIZE" ] && [ -f "$MGR_APK" ]; then
-    SIG_OUT=$(python3 - "$MGR_APK" <<'PYEOF' || true
-import hashlib, struct, sys
-data = open(sys.argv[1], 'rb').read()
-e = data.rfind(b'PK\x05\x06')
-if e < 0: sys.exit(2)
-cd_off = struct.unpack_from('<I', data, e + 16)[0]
-if data[cd_off - 16:cd_off] != b'APK Sig Block 42': sys.exit(3)
-blk_size = struct.unpack_from('<Q', data, cd_off - 24)[0]
-pos = cd_off - blk_size - 8 + 8
-end = cd_off - 24
-cert = None
-while pos < end and cert is None:
-    pair_len = struct.unpack_from('<Q', data, pos)[0]
-    pid = struct.unpack_from('<I', data, pos + 8)[0]
-    if pid in (0x7109871a, 0xf05368c0):
-        p = pos + 12 + 4 + 4 + 4
-        dg_len = struct.unpack_from('<I', data, p)[0]
-        p += 4 + dg_len + 4
-        c_len = struct.unpack_from('<I', data, p)[0]
-        p += 4
-        cert = data[p:p + c_len]
-    pos += 8 + pair_len
-if cert is None: sys.exit(4)
-print("0x%x" % len(cert))
-print(hashlib.sha256(cert).hexdigest())
-PYEOF
-)
-    [ -n "$SIG_OUT" ] && FINASU_EXPECTED_SIZE=$(echo "$SIG_OUT" | sed -n '1p') && FINASU_EXPECTED_HASH=$(echo "$SIG_OUT" | sed -n '2p')
-fi
-SIG_ARGS=""
-if [ -n "$FINASU_EXPECTED_SIZE" ] && [ -n "$FINASU_EXPECTED_HASH" ]; then
-    SIG_ARGS="KSU_EXPECTED_SIZE=$FINASU_EXPECTED_SIZE KSU_EXPECTED_HASH=$FINASU_EXPECTED_HASH"
-    echo "✅ Signature manager OK ($FINASU_EXPECTED_SIZE)"
-else
-    echo "⚠️ AUCUNE signature de manager fournie"
-fi
+# ==================== 3. SIGNATURE MANAGER (OFFICIEL FinaSU) ====================
+# Doc: https://fina.mysqil.com/en/guide/get-started/ -> Manager Signature
+# Le kernel vérifie le DER du certificat dans le SECOND slot.
+FINASU_OFFICIAL_SIZE2="0x02cc"
+FINASU_OFFICIAL_HASH2="2d89b50aaf1db013c2b6738f973f48b62ea21a3a8d7216bfec3521065d448458"
+
+SIG_ARGS="KSU_EXPECTED_SIZE2=$FINASU_OFFICIAL_SIZE2 \
+          KSU_EXPECTED_HASH2=$FINASU_OFFICIAL_HASH2 \
+          KSU_SECOND_SIGNATURE_RELEASE=1"
+
+echo "✅ Signature manager configurée (slot 2 officiel FinaSU)"
 
 # ==================== 3g/3h. EXPORTS + O_CLOEXEC ====================
 [ -f "security/selinux/selinuxfs.c" ] && {
@@ -1122,6 +1090,23 @@ if os.path.isfile(p):
         # (contenu complet omis ici pour brièveté — voir script original)
         total += 1
         print(f"  ✅ feature/selinux_hide.c: portage 4.19")
+
+# FIX 16 : fs/super.c — include susfs_def.h (symboles SUS_MOUNT)
+p = os.path.join(kernel_root, "fs/super.c")
+if os.path.isfile(p):
+    c = read(p)
+    if '#include <linux/susfs_def.h>' not in c:
+        # On l'injecte après le dernier #include existant
+        lines = c.split('\n')
+        last_inc = -1
+        for i, ln in enumerate(lines):
+            if ln.lstrip().startswith('#include'): last_inc = i
+        if last_inc >= 0:
+            insert = '\n#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs_def.h>\n#endif'
+            lines.insert(last_inc + 1, insert)
+            write(p, '\n'.join(lines))
+            total += 1
+            print(f"  ✅ fs/super.c: include susfs_def.h (fix SUS_MOUNT)")
 
 print(f"  ✅ portage 4.19 : {total} fichier(s) (FIX 14/15 retirés, Inline gère reboot.c)")
 FIXEOF
