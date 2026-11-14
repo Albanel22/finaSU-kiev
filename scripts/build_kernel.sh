@@ -171,6 +171,126 @@ if [ -n "$REMAINING_REJECTS" ]; then
 fi
 echo "✅ Patch SUSFS 4.19 appliqué" | tee -a "$AUDIT"
 
+# ==================== 1b. BACKPORT path_mount/path_umount (5.9+) pour 4.19 ====================
+if ! grep -q "finasu_backport_path_mount_419" fs/namespace.c; then
+cat >> fs/namespace.c <<'NS419'
+
+/* === finasu_backport_path_mount_419 : path_mount()/path_umount() (ajoutés en 5.9) === */
+#include <linux/version.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
+
+int path_umount(struct path *path, int flags)
+{
+	struct mount *mnt = real_mount(path->mnt);
+	int retval;
+
+	retval = security_sb_umount(mnt, flags);
+	if (retval)
+		return retval;
+
+	if (flags & MNT_EXPIRE)
+		return -EINVAL; /* non supporté par le backport (inutilisé par FinaSU) */
+
+	namespace_lock();
+	lock_mount_hash();
+	event++;
+
+	if (flags & MNT_DETACH) {
+		if (!list_empty(&mnt->mnt_list))
+			umount_tree(mnt, UMOUNT_PROPAGATE);
+	} else {
+		lock_mount(mnt);
+		retval = -EBUSY;
+		if (mnt_get_count(mnt) == 0 && !IS_MNT_BUSY(mnt)) {
+			umount_mnt(mnt);
+			retval = 0;
+		}
+		unlock_mount(mnt);
+	}
+	unlock_mount_hash();
+	namespace_unlock();
+	return retval;
+}
+EXPORT_SYMBOL(path_umount);
+
+int path_mount(const char *dev_name, struct path *path,
+	       unsigned long flags, void *data)
+{
+	unsigned int mnt_flags = 0, sb_flags;
+	int retval = 0;
+
+	/* Discard magic */
+	if ((flags & MS_MGC_MSK) == MS_MGC_VAL)
+		flags &= ~MS_MGC_MSK;
+
+	if (data)
+		((char *)data)[PAGE_SIZE - 1] = 0;
+
+	/* Default to relatime unless overriden */
+	if (!(flags & MS_NOATIME))
+		mnt_flags |= MNT_RELATIME;
+
+	/* Separate the per-mountpoint flags */
+	if (flags & MS_NOSUID)
+		mnt_flags |= MNT_NOSUID;
+	if (flags & MS_NODEV)
+		mnt_flags |= MNT_NODEV;
+	if (flags & MS_NOEXEC)
+		mnt_flags |= MNT_NOEXEC;
+	if (flags & MS_NOATIME)
+		mnt_flags |= MNT_NOATIME;
+	if (flags & MS_NODIRATIME)
+		mnt_flags |= MNT_NODIRATIME;
+	if (flags & MS_STRICTATIME)
+		mnt_flags &= ~(MNT_RELATIME | MNT_NOATIME);
+	if (flags & MS_RDONLY)
+		mnt_flags |= MNT_READONLY;
+
+	/* The default atime for remount is preservation */
+	if ((flags & MS_REMOUNT) &&
+	    ((flags & (MS_NOATIME | MS_NODIRATIME | MS_RELATIME |
+		       MS_STRICTATIME)) == 0)) {
+		mnt_flags &= ~MNT_ATIME_MASK;
+		mnt_flags |= path->mnt->mnt_flags & MNT_ATIME_MASK;
+	}
+
+	sb_flags = flags & (SB_RDONLY |
+			    SB_SYNCHRONOUS |
+			    SB_MANDLOCK |
+			    SB_DIRSYNC |
+			    SB_SILENT |
+			    SB_POSIXACL |
+			    SB_LAZYTIME |
+			    SB_I_VERSION);
+
+	retval = security_sb_mount(dev_name, path, NULL, 0, flags);
+	if (!retval && !may_mount())
+		retval = -EPERM;
+	if (!retval && (flags & SB_MANDLOCK) && !may_mandlock())
+		retval = -EPERM;
+	if (retval)
+		return retval;
+
+	if (flags & MS_REMOUNT)
+		retval = do_remount(path, flags, sb_flags, mnt_flags, data);
+	else if (flags & MS_BIND)
+		retval = do_loopback(path, dev_name, flags & MS_REC);
+	else if (flags & (MS_SHARED | MS_PRIVATE | MS_SLAVE | MS_UNBINDABLE))
+		retval = do_change_type(path, flags);
+	else if (flags & MS_MOVE)
+		retval = do_move_mount(path, dev_name);
+	else
+		retval = do_new_mount(path, dev_name, sb_flags, mnt_flags,
+				      dev_name, data);
+	return retval;
+}
+EXPORT_SYMBOL(path_mount);
+
+#endif /* < 5.9 */
+NS419
+fi
+echo "✅ Backport path_mount/path_umount ajouté à fs/namespace.c" | tee -a "$AUDIT"
+
 # ==================== 2. INTÉGRATION FinaSU ====================
 echo "=== Intégration FinaSU ($FINASU_REF) ==="
 rm -rf drivers/kernelsu FinaSU 2>/dev/null || true
@@ -1468,11 +1588,9 @@ if os.path.isfile(p):
         "#define KSU_SELINUX_HIDE_BACKUP 0\n"
         "struct selinux_policy *backup_sepolicy;\n"
         "#define symtab_search(s, name) hashtab_search(&(s)->table, name)\n"
-        "extern struct mutex selinux_status_lock;\n"
-        "extern struct page *selinux_status_page;\n"
-        "#define ksu_status_lock()   mutex_lock(&selinux_status_lock)\n"
-        "#define ksu_status_unlock() mutex_unlock(&selinux_status_lock)\n"
-        "#define ksu_status_page     (selinux_status_page)\n"
+        "#define ksu_status_lock()   mutex_lock(&selinux_state.ss->status_lock)\n"
+        "#define ksu_status_unlock() mutex_unlock(&selinux_state.ss->status_lock)\n"
+        "#define ksu_status_page     (selinux_state.ss->status_page)\n"
         "#else\n"
         "#define KSU_SELINUX_HIDE_BACKUP 1\n"
         "#define ksu_status_lock()   mutex_lock(&selinux_state.status_lock)\n"
