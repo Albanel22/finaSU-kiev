@@ -13,9 +13,17 @@ jobs:
         
       - name: Run build script
         run: bash scripts/build_kernel.sh
-        
-      - name: Upload results
+
+      - name: Upload build diagnostics and results
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: finaSU-kiev
-          path: output/*
+          name: finaSU-kiev-diagnostics
+          if-no-files-found: warn
+          path: |
+            output/**
+            **/build-errors.txt
+            **/build.log
+            **/build.log.gz
+            **/*audit*.txt
+            **/*summary*.txt
