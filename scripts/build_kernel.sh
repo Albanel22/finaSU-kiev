@@ -1108,6 +1108,26 @@ if os.path.isfile(p):
             total += 1
             print(f"  ✅ fs/super.c: include susfs_def.h (fix SUS_MOUNT)")
 
+# FIX 17 : fs/super.c — déclarations extern manquantes pour SUSFS
+p = os.path.join(kernel_root, "fs/super.c")
+if os.path.isfile(p):
+    c = read(p)
+    if 'susfs_is_current_ksu_domain' in c and 'extern bool susfs_is_current_ksu_domain' not in c:
+        target_inc = '#include <linux/susfs_def.h>'
+        if target_inc in c:
+            externs = '''
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+extern bool susfs_is_current_ksu_domain(void);
+extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
+#endif
+'''
+            c = c.replace(target_inc, target_inc + externs, 1)
+            write(p, c)
+            total += 1
+            print(f"  ✅ fs/super.c: externs SUSFS injectés")
+        else:
+            print(f"  ⚠️ fs/super.c: cible #include <linux/susfs_def.h> introuvable pour les externs")
+
 print(f"  ✅ portage 4.19 : {total} fichier(s) (FIX 14/15 retirés, Inline gère reboot.c)")
 FIXEOF
 
