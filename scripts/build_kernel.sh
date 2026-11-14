@@ -189,6 +189,31 @@ KSU_DIR="drivers/kernelsu"
 KSU_REPO_ROOT="$GITHUB_WORKSPACE/kernel_sources/FinaSU"
 echo "✅ FinaSU intégré"
 
+# ==================== 3h. COMPATIBILITÉ MANAGER : O_CLOEXEC ====================
+# FinaSU v1.5.0 reste sur son backend tracepoint. Cette correction est indépendante
+# de seccomp : elle évite que les descripteurs de communication du Manager/ksud
+# soient fermés prématurément lors d'un execve() sur le noyau 4.19.
+echo "=== Correctif O_CLOEXEC ciblé FinaSU ===" | tee -a "$AUDIT"
+O_CLOEXEC_FILES=0
+while IFS= read -r -d '' f; do
+    sed -i 's/get_unused_fd_flags(O_CLOEXEC)/get_unused_fd_flags(0)/g' "$f"
+    O_CLOEXEC_FILES=$((O_CLOEXEC_FILES + 1))
+    echo "  ✅ get_unused_fd_flags corrigé : $f" | tee -a "$AUDIT"
+done < <(grep -rlZ 'get_unused_fd_flags(O_CLOEXEC)' "$KSU_DIR/" 2>/dev/null || true)
+while IFS= read -r -d '' f; do
+    sed -i \
+        -e 's/O_RDWR | O_CLOEXEC/O_RDWR/g' \
+        -e 's/O_RDWR|O_CLOEXEC/O_RDWR/g' \
+        -e 's/, O_CLOEXEC)/)/g' "$f"
+    O_CLOEXEC_FILES=$((O_CLOEXEC_FILES + 1))
+    echo "  ✅ anon_inode O_CLOEXEC corrigé : $f" | tee -a "$AUDIT"
+done < <(grep -rlZ 'anon_inode_getfile' "$KSU_DIR/" 2>/dev/null || true)
+if grep -RInE 'get_unused_fd_flags\(O_CLOEXEC\)|O_RDWR[[:space:]]*\|[[:space:]]*O_CLOEXEC' "$KSU_DIR/" 2>/dev/null; then
+    echo "❌ O_CLOEXEC résiduel détecté dans le driver FinaSU" | tee -a "$AUDIT"
+    exit 1
+fi
+echo "  ✅ O_CLOEXEC : contrôle terminé ($O_CLOEXEC_FILES fichier(s) inspecté(s))" | tee -a "$AUDIT"
+
 # ==================== 3. SIGNATURE MANAGER ====================
 MGR_APK="$GITHUB_WORKSPACE/patches/manager.apk"
 if [ ! -f "$MGR_APK" ]; then
@@ -1657,6 +1682,14 @@ grep "^CONFIG_KSU_SUSFS" out/.config | tee -a "$AUDIT"
 echo "=== FIN VÉRIFICATION CONFIG ===" | tee -a "$AUDIT"
 
 grep -q "^CONFIG_KSU=y" out/.config || { echo "❌ CONFIG_KSU off"; exit 1; }
+grep -q "^CONFIG_KSU_HOOK_TRACEPOINT=y" out/.config || { echo "❌ backend tracepoint FinaSU absent"; exit 1; }
+if grep -q "^CONFIG_KSU_HOOK_SUSFS_INLINE=y" out/.config; then
+    echo "❌ backend SUSFS inline inattendu : la Voie A exige le backend tracepoint" | tee -a "$AUDIT"
+    exit 1
+fi
+grep -q "^CONFIG_SECCOMP=y" out/.config || { echo "❌ CONFIG_SECCOMP absent"; exit 1; }
+grep -q "^CONFIG_SECCOMP_FILTER=y" out/.config || { echo "❌ CONFIG_SECCOMP_FILTER absent"; exit 1; }
+echo "✅ Voie A confirmée : backend tracepoint FinaSU + seccomp conservé" | tee -a "$AUDIT"
 grep -q "^CONFIG_KSU_SUSFS=y" out/.config || { echo "❌ CONFIG_KSU_SUSFS off"; exit 1; }
 grep -q "^CONFIG_KSU_SUSFS_SUS_KSTAT=y" out/.config || { echo "❌ CONFIG_KSU_SUSFS_SUS_KSTAT off"; exit 1; }
 
