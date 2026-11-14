@@ -186,9 +186,10 @@ echo "Script Inline téléchargé : $(sha256sum "$INLINE_HOOK_SCRIPT" | cut -d' 
 # ksu_handle_setresuid et ksu_hide_setprocattr correctement.
 bash "$INLINE_HOOK_SCRIPT" 2>&1 | tee -a "$AUDIT"
 
-# Vérification
+# ==================== 2c-bis. VÉRIFICATION HOOKS INLINE ====================
+# Les 7 fichiers critiques DOIVENT contenir ksu_handle_* (le script les a tous injectés).
 INLINE_OK=1
-for f in fs/exec.c fs/open.c fs/read_write.c fs/stat.c drivers/input/input.c kernel/reboot.c kernel/sys.c security/selinux/hooks.c; do
+for f in fs/exec.c fs/open.c fs/read_write.c fs/stat.c drivers/input/input.c kernel/reboot.c kernel/sys.c; do
     if ! grep -q "ksu_handle" "$f" 2>/dev/null; then
         echo "❌ $f : aucun ksu_handle_* injecté" | tee -a "$AUDIT"
         INLINE_OK=0
@@ -196,10 +197,24 @@ for f in fs/exec.c fs/open.c fs/read_write.c fs/stat.c drivers/input/input.c ker
         echo "  ✅ $f : $(grep -c "ksu_handle" "$f") ksu_handle_* injecté(s)" | tee -a "$AUDIT"
     fi
 done
+
+# security/selinux/hooks.c : skip légitime si FinaSU n'a pas ksu_hide_setprocattr
+if grep -q "ksu_handle" security/selinux/hooks.c 2>/dev/null; then
+    echo "  ✅ security/selinux/hooks.c : $(grep -c "ksu_handle" security/selinux/hooks.c) ksu_handle_* injecté(s)" | tee -a "$AUDIT"
+else
+    if grep -rq "ksu_hide_setprocattr" drivers/kernelsu/ --include='*.c' --include='*.h' 2>/dev/null; then
+        echo "❌ security/selinux/hooks.c : ksu_hide_setprocattr existe dans FinaSU mais le hook n'a pas été injecté" | tee -a "$AUDIT"
+        INLINE_OK=0
+    else
+        echo "  ⚠️ security/selinux/hooks.c : skip légitime (FinaSU n'a pas ksu_hide_setprocattr)" | tee -a "$AUDIT"
+    fi
+fi
+
 if [ "$INLINE_OK" -ne 1 ]; then
-    echo "❌ Hooks Inline incomplets" | tee -a "$AUDIT"
+    echo "❌ Hooks Inline incomplets — vérifiez les noms de fonctions dans FinaSU" | tee -a "$AUDIT"
     exit 1
 fi
+echo "✅ Hooks Inline complets (7 fichiers critiques + selinux/hooks.c selon disponibilité)" | tee -a "$AUDIT"
 
 # ==================== 2b. SONDE ====================
 {
