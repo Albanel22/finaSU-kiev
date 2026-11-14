@@ -880,6 +880,27 @@ if unguarded:
     raise SystemExit(1)
 print("  ✅ MODULE_IMPORT_NS : toutes les invocations sont protégées")
 
+# --- FIX 2b : runner preinit et UAPI Linux 4.19 ---
+# FinaSU v1.5.0 inclut linux/mount.h dans son nolibc runner. Ce header est
+# interne/non exporté par le noyau 4.19 et n'est donc pas produit par
+# headers_install. linux/fs.h est l'en-tête UAPI 4.19 approprié pour les
+# constantes de montage utilisées par le runner.
+runner_mount = os.path.join(ksu_root, "preinit", "runner", "nolibc", "sys", "mount.h")
+if os.path.isfile(runner_mount):
+    c = read(runner_mount)
+    if '#include <linux/mount.h>' in c:
+        c = c.replace('#include <linux/mount.h>', '#include <linux/fs.h>')
+        write(runner_mount, c)
+        print(f"  ✅ {os.path.relpath(runner_mount, GW)}: linux/mount.h → linux/fs.h (UAPI 4.19)")
+    elif '#include <linux/fs.h>' in c:
+        print(f"  ✅ {os.path.relpath(runner_mount, GW)}: header UAPI 4.19 déjà porté")
+    else:
+        print(f"❌ {os.path.relpath(runner_mount, GW)}: include mount/fs introuvable")
+        raise SystemExit(1)
+else:
+    print(f"❌ runner preinit introuvable : {os.path.relpath(runner_mount, GW)}")
+    raise SystemExit(1)
+
 # --- FIX 3 : file_wrapper.c ---
 p = os.path.join(ksu_root, "infra/file_wrapper.c")
 if os.path.isfile(p):
