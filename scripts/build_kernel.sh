@@ -156,45 +156,6 @@ REJ_COUNT=$(find . -name '*.rej' | wc -l)
 find . -name '*.rej' -delete
 echo "✅ Patch SUSFS base appliqué (rejets backend Tracepoint nettoyés : $REJ_COUNT)" | tee -a "$AUDIT"
 
-# ==================== 1d. HOOKS INLINE (JackA1ltman) ====================
-echo "=== Application des hooks Inline (JackA1ltman) ===" | tee -a "$AUDIT"
-INLINE_HOOK_URL="${INLINE_HOOK_URL:-https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/susfs_inline_hook_patches.sh}"
-INLINE_HOOK_SCRIPT="$GITHUB_WORKSPACE/patches/susfs_inline_hook_patches.sh"
-curl --proto '=https' --tlsv1.2 -fsSL "$INLINE_HOOK_URL" -o "$INLINE_HOOK_SCRIPT"
-chmod +x "$INLINE_HOOK_SCRIPT"
-echo "Script Inline téléchargé : $(sha256sum "$INLINE_HOOK_SCRIPT" | cut -d' ' -f1)" | tee -a "$AUDIT"
-
-# Le script doit être exécuté dans le répertoire racine du kernel (où il y a fs/, kernel/, etc.)
-bash "$INLINE_HOOK_SCRIPT" 2>&1 | tee -a "$AUDIT"
-
-# Vérification : les 8 fichiers critiques doivent contenir ksu_handle_*
-INLINE_OK=1
-for f in fs/exec.c fs/open.c fs/read_write.c fs/stat.c drivers/input/input.c kernel/reboot.c kernel/sys.c security/selinux/hooks.c; do
-    if ! grep -q "ksu_handle" "$f" 2>/dev/null; then
-        echo "❌ $f : aucun ksu_handle_* injecté par le script Inline" | tee -a "$AUDIT"
-        INLINE_OK=0
-    else
-        echo "  ✅ $f : $(grep -c "ksu_handle" "$f") ksu_handle_* injecté(s)" | tee -a "$AUDIT"
-    fi
-done
-if [ "$INLINE_OK" -ne 1 ]; then
-    echo "❌ Hooks Inline incomplets — vérifiez les noms de fonctions dans FinaSU" | tee -a "$AUDIT"
-    exit 1
-fi
-
-# Vérification de la signature des fonctions attendues par FinaSU (si un nom diffère,
-# le build échouera plus tard avec 'implicit declaration').
-echo "=== Vérification des signatures ksu_handle_* attendues par FinaSU ===" | tee -a "$AUDIT"
-FINA_KSU_DIR="$GITHUB_WORKSPACE/kernel_sources/drivers/kernelsu"
-# (drivers/kernelsu n'existe pas encore — il sera créé plus bas, donc on cherche dans le clone FinaSU)
-for fn in ksu_handle_execveat ksu_handle_faccessat ksu_handle_sys_read ksu_handle_stat ksu_handle_vfs_fstat ksu_handle_sys_reboot ksu_handle_setresuid ksu_handle_input_handle_event; do
-    if grep -rq "$fn" "$GITHUB_WORKSPACE/kernel_sources/FinaSU/kernel/" --include='*.c' --include='*.h' 2>/dev/null; then
-        echo "  ✅ $fn trouvé dans FinaSU" | tee -a "$AUDIT"
-    else
-        echo "  ⚠️ $fn non trouvé dans le clone FinaSU — sera vérifié après setup.sh" | tee -a "$AUDIT"
-    fi
-done
-
 # ==================== 2. INTÉGRATION FinaSU ====================
 echo "=== Intégration FinaSU ($FINASU_REF) ==="
 rm -rf drivers/kernelsu FinaSU 2>/dev/null || true
@@ -212,6 +173,33 @@ fi
 KSU_DIR="drivers/kernelsu"
 KSU_REPO_ROOT="$GITHUB_WORKSPACE/kernel_sources/FinaSU"
 echo "✅ FinaSU intégré"
+
+# ==================== 2c. HOOKS INLINE (après intégration FinaSU) ====================
+echo "=== Application des hooks Inline (JackA1ltman) ===" | tee -a "$AUDIT"
+INLINE_HOOK_URL="${INLINE_HOOK_URL:-https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/susfs_inline_hook_patches.sh}"
+INLINE_HOOK_SCRIPT="$GITHUB_WORKSPACE/patches/susfs_inline_hook_patches.sh"
+curl --proto '=https' --tlsv1.2 -fsSL "$INLINE_HOOK_URL" -o "$INLINE_HOOK_SCRIPT"
+chmod +x "$INLINE_HOOK_SCRIPT"
+echo "Script Inline téléchargé : $(sha256sum "$INLINE_HOOK_SCRIPT" | cut -d' ' -f1)" | tee -a "$AUDIT"
+
+# Maintenant drivers/kernelsu existe (symlink créé à l'étape 2), le script peut vérifier
+# ksu_handle_setresuid et ksu_hide_setprocattr correctement.
+bash "$INLINE_HOOK_SCRIPT" 2>&1 | tee -a "$AUDIT"
+
+# Vérification
+INLINE_OK=1
+for f in fs/exec.c fs/open.c fs/read_write.c fs/stat.c drivers/input/input.c kernel/reboot.c kernel/sys.c security/selinux/hooks.c; do
+    if ! grep -q "ksu_handle" "$f" 2>/dev/null; then
+        echo "❌ $f : aucun ksu_handle_* injecté" | tee -a "$AUDIT"
+        INLINE_OK=0
+    else
+        echo "  ✅ $f : $(grep -c "ksu_handle" "$f") ksu_handle_* injecté(s)" | tee -a "$AUDIT"
+    fi
+done
+if [ "$INLINE_OK" -ne 1 ]; then
+    echo "❌ Hooks Inline incomplets" | tee -a "$AUDIT"
+    exit 1
+fi
 
 # ==================== 2b. SONDE ====================
 {
