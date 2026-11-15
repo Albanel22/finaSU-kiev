@@ -1811,8 +1811,11 @@ rm -rf Magisk.apk lib
 cd repack
 set +e; ./magiskboot unpack boot.img; set -e
 cp "$GITHUB_WORKSPACE/kernel_sources/out/arch/arm64/boot/Image" kernel
-./magiskboot cpio ramdisk.cpio "mkdir 0755 data" "mkdir 0755 data/adb" "mkdir 0755 data/adb/ksud" \
-    "add 0755 data/adb/ksud/ksud $GITHUB_WORKSPACE/ksud"
+# FinaSU/KernelSU ouvre exactement /data/adb/ksud comme fichier exécutable.
+# Ne pas créer /data/adb/ksud/ksud : ce chemin est un répertoire incorrect
+# pour le daemon et empêche le noyau de lancer ksud lors d’un appel à su.
+./magiskboot cpio ramdisk.cpio "mkdir 0755 data" "mkdir 0755 data/adb" \
+    "add 0755 data/adb/ksud $GITHUB_WORKSPACE/ksud"
 cp "$GITHUB_WORKSPACE/ksud" ./local_su; chmod 755 ./local_su
 ./magiskboot cpio ramdisk.cpio "mkdir 0755 system" "mkdir 0755 system/bin" "add 06755 system/bin/su ./local_su"
 rm -f ./local_su
@@ -1825,7 +1828,18 @@ mkdir -p verify; cd verify
 cp ../final_boot.img verify_boot.img
 ../repack/magiskboot unpack verify_boot.img 2>/dev/null || true
 [ -f kernel ] && [ "$(sha256sum kernel | cut -d' ' -f1)" = "$(cat /tmp/kernel_compiled_hash.txt)" ] && echo "✅ Noyau IDENTIQUE"
-../repack/magiskboot cpio ramdisk.cpio "exists data/adb/ksud/ksud" 2>/dev/null && echo "✅ ksud OK" || echo "❌ ksud absent"
+if ../repack/magiskboot cpio ramdisk.cpio "exists data/adb/ksud" 2>/dev/null; then
+    echo "✅ ksud OK : data/adb/ksud"
+else
+    echo "❌ ksud absent ou mauvais chemin : data/adb/ksud"
+    exit 1
+fi
+if ../repack/magiskboot cpio ramdisk.cpio "exists system/bin/su" 2>/dev/null; then
+    echo "✅ su OK : system/bin/su"
+else
+    echo "❌ su absent : system/bin/su"
+    exit 1
+fi
 cd ..
 cp final_boot.img "output/FinaSU-A-${VER}-boot.img"
 cp dtbo-stock.img output/dtbo.img 2>/dev/null || true
