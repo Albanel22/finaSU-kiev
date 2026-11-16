@@ -1046,13 +1046,25 @@ W
 fi
 
 mkdir -p out
+
+# --- DIAGNOSTIC DÉCISIF : le patch SUSFS fournit-il les points d'entrée inline ? ---
+{
+  echo "=== Points d'entrée KSU inline dans le noyau (requis par SUSFS_INLINE) ==="
+  grep -n "ksu_handle\|ksu_sucompat\|ksu_setuid" \
+      kernel/sys.c fs/exec.c fs/read_write.c fs/stat.c fs/open.c 2>/dev/null \
+      | head -40 || echo "AUCUN appel ksu_* trouvé dans ces fichiers"
+  echo "=== Fin diagnostic inline ==="
+} | tee -a "$AUDIT"
+
 make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 vendor/lito-perf_defconfig
 
-# Utilisation de scripts/config pour forcer les valeurs sans qu'olddefconfig ne les écrase
 cd out
 ../scripts/config --set-val CONFIG_KSU y
-../scripts/config --set-val CONFIG_KSU_MANUAL_HOOK y
+# Backend : SUSFS Inline (le seul adapté à un non-GKI patché SUSFS)
 ../scripts/config --set-val CONFIG_KSU_HOOK_TRACEPOINT n
+../scripts/config --set-val CONFIG_KSU_HOOK_SUSFS_INLINE y
+# Debug verbeux pour diagnostiquer l'init au boot
+../scripts/config --set-val CONFIG_KSU_DEBUG y
 ../scripts/config --set-val CONFIG_KSU_SUSFS y
 ../scripts/config --set-val CONFIG_KSU_SUSFS_SUS_PATH y
 ../scripts/config --set-val CONFIG_KSU_SUSFS_SUS_MOUNT y
@@ -1063,13 +1075,14 @@ cd out
 ../scripts/config --set-val CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG y
 ../scripts/config --set-val CONFIG_KSU_SUSFS_OPEN_REDIRECT y
 ../scripts/config --set-val CONFIG_KSU_SUSFS_SUS_MAP y
+../scripts/config --set-val CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER y
+# Dépendances de KSU (KPROBES && EXT4_FS) et de SUSFS (THREAD_INFO_IN_TASK)
 ../scripts/config --set-val CONFIG_KPROBES y
 ../scripts/config --set-val CONFIG_HAVE_KPROBES y
 ../scripts/config --set-val CONFIG_KRETPROBES y
 ../scripts/config --set-val CONFIG_KALLSYMS y
 ../scripts/config --set-val CONFIG_KALLSYMS_ALL y
 ../scripts/config --set-val CONFIG_EXT4_FS y
-../scripts/config --set-val CONFIG_HEADERS_INSTALL y
 ../scripts/config --set-val CONFIG_THREAD_INFO_IN_TASK y
 ../scripts/config --set-val CONFIG_FTRACE y
 ../scripts/config --set-val CONFIG_FTRACE_SYSCALLS y
@@ -1079,26 +1092,23 @@ cd out
 ../scripts/config --set-val CONFIG_COMPAT_32BIT_TIME y
 cd ..
 
-# On lance olddefconfig pour résoudre les dépendances restantes, mais nos valeurs forcées devraient tenir
-make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig > /dev/null 2>&1
+make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig 2>&1 | tail -3
 
-# Vérification stricte
-if ! grep -q "^CONFIG_KSU=y" out/.config; then
-    echo "❌ CONFIG_KSU a été rejeté !"
-    grep "CONFIG_KSU" out/.config || true
+# --- Vérification : on dump TOUT le KSU quoi qu'il arrive ---
+{
+  echo "=== .config KSU/SUSFS final ==="
+  grep -E "CONFIG_KSU|CONFIG_HAVE_SYSCALL_TRACEPOINTS|CONFIG_KPROBES|CONFIG_EXT4_FS|CONFIG_THREAD_INFO_IN_TASK" out/.config
+  echo "=== Fin .config ==="
+} | tee -a "$AUDIT"
+
+grep -q "^CONFIG_KSU=y" out/.config || { echo "❌ CONFIG_KSU off"; exit 1; }
+grep -q "^CONFIG_KSU_SUSFS=y" out/.config || { echo "❌ CONFIG_KSU_SUSFS off"; exit 1; }
+if ! grep -q "^CONFIG_KSU_HOOK_SUSFS_INLINE=y" out/.config; then
+    echo "❌ SUSFS_INLINE refusé. Le dump .config ci-dessus donne la raison."
+    echo "   (choice : si INLINE est refusé, TRACEPOINT reprend la main par défaut)"
     exit 1
 fi
-if ! grep -q "^CONFIG_KSU_MANUAL_HOOK=y" out/.config; then
-    echo "❌ CONFIG_KSU_MANUAL_HOOK a été rejeté par olddefconfig !"
-    echo "Configuration KSU actuelle :"
-    grep "CONFIG_KSU" out/.config || true
-    echo "Vérifiez si FinaSU Kconfig contient bien KSU_MANUAL_HOOK ou si une dépendance manque."
-    exit 1
-fi
-if ! grep -q "^CONFIG_KSU_SUSFS=y" out/.config; then
-    echo "❌ CONFIG_KSU_SUSFS a été rejeté !"
-    exit 1
-fi
+echo "✅ Backend actif : KSU_HOOK_SUSFS_INLINE" | tee -a "$AUDIT"
 
 # ==================== 6. MOTOROLA ====================
 sed -i 's/if (!check_version(/if (0 \&\& !check_version(/g' kernel/module.c
@@ -1123,6 +1133,11 @@ echo "✅ Compilation réussie"
 sha256sum out/arch/arm64/boot/Image | cut -d' ' -f1 > /tmp/kernel_compiled_hash.txt
 cp out/arch/arm64/boot/Image "$GITHUB_WORKSPACE/output/Image-${VER}"
 cp out/System.map "$GITHUB_WORKSPACE/output/System.map-${VER}"
+{
+  echo "=== Symboles KSU dans System.map ==="
+  grep -E " (ksu_handle_|kernelsu_init|ksu_syscall|ksu_setuid_hook|ksu_sucompat)" out/System.map | head -30 \
+    || echo "⚠️ aucun symbole ksu_* — KSU ne serait pas lié !"
+} | tee -a "$AUDIT"
 
 # ==================== 8. KSUD ====================
 echo "=== ksud ==="
