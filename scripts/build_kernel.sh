@@ -34,45 +34,24 @@ summarize() {
     {
         echo "=== RÉSUMÉ DU BUILD (code de sortie $rc) ==="
         if [ -f "$BL" ]; then
-            python3 - "$BL" <<'SUMEOF'
-import re, sys
-from collections import Counter
-txt = open(sys.argv[1], encoding='utf-8', errors='replace').read().split('\n')
-err = re.compile(r'^(?:\.\./)*(\S+?):(\d+):(\d+): (?:fatal )?error: (.*)$')
-per_file, per_msg, first_loc = Counter(), Counter(), {}
-for l in txt:
-    m = err.match(l.strip())
-    if m:
-        f, ln, col, msg = m.groups()
-        per_file[f] += 1
-        key = re.sub(r"\s*\[-W[^\]]*\]", "", msg)[:110]
-        per_msg[key] += 1
-        first_loc.setdefault(key, f"{f}:{ln}")
-print(f"erreurs de compilation : {sum(per_file.values())}   fichiers : {len(per_file)}")
-for f, n in per_file.most_common(20): print(f"{n:4d}  {f}")
-for k, n in per_msg.most_common(20): print(f"{n:4d}  {k}   [{first_loc[k]}]")
-SUMEOF
+            echo "########## CONTEXTE DE L'ÉCHEC drivers/kernelsu ##########"
+            grep -n -B 45 "drivers/kernelsu] Error" "$BL" | tail -70
             echo ""
-            echo "=== 15 DERNIÈRES LIGNES DE L'AUDIT ==="
-            tail -n 15 "$AUDIT" 2>/dev/null
+            echo "########## TOUTES LES ANOMALIES (grep élargi) ##########"
+            grep -nE "error:|undefined symbol|undefined reference|fatal error|Error [0-9]+|No rule to make target|modpost|\*\*\*|Stop\.|not found|unknown type name|implicit declaration" "$BL" | tail -80
             echo ""
-            echo "########## API FinaSU (pour câbler les hooks) ##########"
-            head -n 260 "$APIDUMP" 2>/dev/null || echo "(dump API absent)"
-            echo ""
-            echo "########## ERREURS BRUTES ##########"
-            grep -nE "error:|undefined symbol|undefined reference|fatal error|Error [0-9]+|No rule to make target|modpost" "$BL" | tail -60
-            echo ""
-            echo "########## 60 DERNIÈRES LIGNES DE build.log ##########"
-            tail -n 60 "$BL"
+            echo "########## 40 DERNIÈRES LIGNES DE build.log ##########"
+            tail -n 40 "$BL"
         else
             echo "pas de build.log : arrêt AVANT la compilation"
-            echo ""
-            echo "=== 30 DERNIÈRES LIGNES DE L'AUDIT ==="
             tail -n 30 "$AUDIT" 2>/dev/null
-            echo ""
-            echo "########## API FinaSU ##########"
-            head -n 260 "$APIDUMP" 2>/dev/null || echo "(dump API absent)"
         fi
+        echo ""
+        echo "########## DIAG KBUILD / DOC ##########"
+        head -n 120 "$GITHUB_WORKSPACE/output/kbuild-diag.txt" 2>/dev/null || echo "(diag absent)"
+        echo ""
+        echo "########## API FinaSU (rappel) ##########"
+        head -n 60 "$APIDUMP" 2>/dev/null
     } > "$SUM" 2>&1
     cat "$SUM"
     [ -n "${GITHUB_STEP_SUMMARY:-}" ] && { echo '```'; cat "$SUM"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
@@ -268,6 +247,29 @@ echo "✅ FinaSU intégré"
   ls -la FinaSU/kernel/hook/ 2>/dev/null || echo "(absent)"
 } > "$APIDUMP" 2>&1
 echo "📋 API FinaSU dumpée (affichée en fin de log)" | tee -a "$AUDIT"
+
+# ==================== 2e. DIAG KBUILD + DOC INLINE ====================
+{
+  echo "### drivers/kernelsu/Makefile : 60 dernières lignes (partie kbuild ajoutée ?) ###"
+  tail -n 60 drivers/kernelsu/Makefile 2>/dev/null || echo "(absent)"
+  echo
+  echo "### Le Makefile contient-il obj-y / kernelsu-objs ? ###"
+  grep -nE "obj-|kernelsu-objs|ksu-y|SUSFS_INLINE|\\$\(error|\\$\(warning" drivers/kernelsu/Makefile 2>/dev/null | head -40 || echo "(aucun)"
+  echo
+  echo "### setup.sh : ce qu'il fait vraiment ###"
+  sed -n '1,80p' FinaSU/kernel/setup.sh 2>/dev/null || echo "(absent)"
+  echo
+  echo "### hook/arm64/ : contenu ###"
+  ls -la FinaSU/kernel/hook/arm64/ 2>/dev/null
+  echo
+  echo "### Où syscall_fn_t est-il défini pour arm64 ? ###"
+  grep -rn "syscall_fn_t" FinaSU/kernel --include=*.h 2>/dev/null | head -20
+  echo
+  echo "### Doc / CI : mentions du patch SUSFS pinned et du backend INLINE ###"
+  find FinaSU -maxdepth 2 -name "*.md" 2>/dev/null | head -20
+  grep -rn -i "susfs4ksu\|SUSFS_INLINE\|inline" FinaSU/docs FinaSU/.github 2>/dev/null | head -30 || echo "(rien)"
+} > "$GITHUB_WORKSPACE/output/kbuild-diag.txt" 2>&1
+echo "📋 Diag kbuild écrit" | tee -a "$AUDIT"
 
 # ==================== 3. SIGNATURE MANAGER ====================
 MGR_APK="$GITHUB_WORKSPACE/patches/manager.apk"
