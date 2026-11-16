@@ -13,7 +13,7 @@ VER="finasu-A"
 KSU_REF="$FINASU_REF"
 KSUD_FALLBACK_REF="${KSUD_FALLBACK_REF:-v3.4.2}"
 
-echo "=== Build FinaSU ($FINASU_REF) — noyau cible 4.19 + SuSFS + MANUAL_HOOK (forcé) ==="
+echo "=== Build FinaSU ($FINASU_REF) — 4.19 + SuSFS + SUSFS_INLINE + DEBUG ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -22,7 +22,9 @@ MGR_GDRIVE_ID="1Qr07fjThXjmIz_DAmW2GZepoWrNIikXR"
 
 mkdir -p "$GITHUB_WORKSPACE/output"
 AUDIT="$GITHUB_WORKSPACE/output/audit-${VER}.txt"
+APIDUMP="$GITHUB_WORKSPACE/output/finasu-api.txt"
 : > "$AUDIT"
+: > "$APIDUMP"
 
 summarize() {
     local rc=$?
@@ -38,7 +40,6 @@ from collections import Counter
 txt = open(sys.argv[1], encoding='utf-8', errors='replace').read().split('\n')
 err = re.compile(r'^(?:\.\./)*(\S+?):(\d+):(\d+): (?:fatal )?error: (.*)$')
 per_file, per_msg, first_loc = Counter(), Counter(), {}
-undef = Counter()
 for l in txt:
     m = err.match(l.strip())
     if m:
@@ -47,20 +48,31 @@ for l in txt:
         key = re.sub(r"\s*\[-W[^\]]*\]", "", msg)[:110]
         per_msg[key] += 1
         first_loc.setdefault(key, f"{f}:{ln}")
-    u = re.search(r'undefined symbol:\s*(\S+)', l)
-    if u: undef[u.group(1)] += 1
-print(f"erreurs : {sum(per_file.values())}   fichiers : {len(per_file)}")
-for f, n in per_file.most_common(25): print(f"{n:4d}  {f}")
-print()
-for k, n in per_msg.most_common(25): print(f"{n:4d}  {k}   [{first_loc[k]}]")
-if undef:
-    print("\n-- Symboles non définis --")
-    for k, n in undef.most_common(30): print(f"{n:4d}  {k}")
+print(f"erreurs de compilation : {sum(per_file.values())}   fichiers : {len(per_file)}")
+for f, n in per_file.most_common(20): print(f"{n:4d}  {f}")
+for k, n in per_msg.most_common(20): print(f"{n:4d}  {k}   [{first_loc[k]}]")
 SUMEOF
+            echo ""
+            echo "=== 15 DERNIÈRES LIGNES DE L'AUDIT ==="
+            tail -n 15 "$AUDIT" 2>/dev/null
+            echo ""
+            echo "########## API FinaSU (pour câbler les hooks) ##########"
+            head -n 260 "$APIDUMP" 2>/dev/null || echo "(dump API absent)"
+            echo ""
+            echo "########## ERREURS BRUTES ##########"
+            grep -nE "error:|undefined symbol|undefined reference|fatal error|Error [0-9]+|No rule to make target|modpost" "$BL" | tail -60
+            echo ""
+            echo "########## 60 DERNIÈRES LIGNES DE build.log ##########"
+            tail -n 60 "$BL"
+        else
+            echo "pas de build.log : arrêt AVANT la compilation"
+            echo ""
+            echo "=== 30 DERNIÈRES LIGNES DE L'AUDIT ==="
+            tail -n 30 "$AUDIT" 2>/dev/null
+            echo ""
+            echo "########## API FinaSU ##########"
+            head -n 260 "$APIDUMP" 2>/dev/null || echo "(dump API absent)"
         fi
-        echo ""
-        echo "=== 40 DERNIÈRES LIGNES DE L'AUDIT ==="
-        tail -n 40 "$AUDIT" 2>/dev/null
     } > "$SUM" 2>&1
     cat "$SUM"
     [ -n "${GITHUB_STEP_SUMMARY:-}" ] && { echo '```'; cat "$SUM"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
@@ -96,7 +108,6 @@ mkdir -p "$GITHUB_WORKSPACE/patches"
 curl --proto '=https' --tlsv1.2 -fsSL "$SUSFS_419_PATCH_URL" -o "$SUSFS_419_PATCH"
 echo "Patch SUSFS téléchargé : $(sha256sum "$SUSFS_419_PATCH" | cut -d' ' -f1)" | tee -a "$AUDIT"
 MANUAL_SUSFS_PATCH="$GITHUB_WORKSPACE/patches/susfs_419_manual_fix.patch"
-mkdir -p "$(dirname "$MANUAL_SUSFS_PATCH")"
 base64 -d > "$MANUAL_SUSFS_PATCH" <<'SUSFS_MANUAL_B64_EOF'
 LS0tIGEvZnMvTWFrZWZpbGUKKysrIGIvZnMvTWFrZWZpbGUKQEAgLTE0LDYgKzE0LDcgQEAKIAkJ
 cG5vZGUubyBzcGxpY2UubyBzeW5jLm8gdXRpbWVzLm8gZF9wYXRoLm8gXAogCQlzdGFjay5vIGZz
@@ -155,7 +166,7 @@ ZSBlcnJvcnMsIGp1c3QgY2hlY2sgaG93IG11Y2ggd2FzIHN1Y2Nlc3NmdWxseSB0cmFuc2ZlcnJl
 ZCAqLwogCXdoaWxlIChsZW4pIHsKIAkJaW50IGJ5dGVzLCByZXQsIG9mZnNldDsK
 SUSFS_MANUAL_B64_EOF
 set +e
- git apply --reject --whitespace=nowarn "$SUSFS_419_PATCH" 2>&1 | tee -a "$AUDIT"
+git apply --reject --whitespace=nowarn "$SUSFS_419_PATCH" 2>&1 | tee -a "$AUDIT"
 SUSFS_APPLY_RC=${PIPESTATUS[0]}
 set -e
 EXPECTED_REJECTS=$'fs/Makefile.rej\nfs/namespace.c.rej\nfs/proc/task_mmu.c.rej\nfs/super.c.rej\nmm/memory.c.rej'
@@ -226,6 +237,37 @@ fi
 KSU_DIR="drivers/kernelsu"
 KSU_REPO_ROOT="$GITHUB_WORKSPACE/kernel_sources/FinaSU"
 echo "✅ FinaSU intégré"
+
+# ==================== 2d. DUMP API FinaSU (info pour câbler les hooks) ====================
+{
+  echo "### FinaSU fournit-il un patch SUSFS avec hooks KSU ? ###"
+  ls -la FinaSU/kernel/patches/ 2>/dev/null || echo "(pas de kernel/patches/)"
+  ls -la FinaSU/patches/ 2>/dev/null || echo "(pas de patches/)"
+  find FinaSU -maxdepth 3 -iname "*.patch" 2>/dev/null | head -20 || true
+  echo
+  echo "### References SUSFS dans la doc ###"
+  grep -rn -i "susfs" FinaSU/README*.md 2>/dev/null | head -20 || echo "(aucune dans README)"
+  echo
+  echo "### TOUS les points d'entree ksu_handle_* declares dans les headers ###"
+  grep -rn "ksu_handle_" FinaSU/kernel --include=*.h 2>/dev/null | head -40 || echo "(aucun)"
+  echo
+  echo "### kernel/hook/setuid_hook.h ###"
+  cat FinaSU/kernel/hook/setuid_hook.h 2>/dev/null || echo "(absent)"
+  echo
+  echo "### kernel/feature/sucompat.h ###"
+  cat FinaSU/kernel/feature/sucompat.h 2>/dev/null || echo "(absent)"
+  echo
+  echo "### kernel/hook/syscall_hook.h ###"
+  cat FinaSU/kernel/hook/syscall_hook.h 2>/dev/null || echo "(absent)"
+  echo
+  echo "### kernel/hook/syscall_hook.c : signatures + extern + symboles noyau ###"
+  grep -nE "^[a-zA-Z_].*\(|extern |sys_call_table|kallsyms|SUSFS_INLINE" \
+      FinaSU/kernel/hook/syscall_hook.c 2>/dev/null | head -50 || echo "(absent)"
+  echo
+  echo "### Fichiers du dossier hook/ ###"
+  ls -la FinaSU/kernel/hook/ 2>/dev/null || echo "(absent)"
+} > "$APIDUMP" 2>&1
+echo "📋 API FinaSU dumpée (affichée en fin de log)" | tee -a "$AUDIT"
 
 # ==================== 3. SIGNATURE MANAGER ====================
 MGR_APK="$GITHUB_WORKSPACE/patches/manager.apk"
@@ -888,8 +930,7 @@ for dp, dn, fn in os.walk(ksu_root):
             for i, ln in enumerate(lines):
                 if ln.lstrip().startswith('#include'): last_inc = i
             if last_inc >= 0:
-                lines.insert(last_inc + 1, twa)
-                c = '\n'.join(lines)
+                lines.insert(last_inc + 1, twa); c = '\n'.join(lines)
             else:
                 c = twa + c
         if 'put_task_struct' in c:
@@ -929,24 +970,164 @@ if os.path.isfile(p):
     c = c.replace('removed.htable[0] = n;', 'ksu_avtab_htable_set(removed, 0, n);', 1)
     old_open = 'static bool add_filename_trans(struct policydb *db, const char *s, const char *t, const char *c, const char *d,\n                               const char *o)\n{\n    struct type_datum *src, *tgt, *def;'
     new_open = '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\nstatic bool add_filename_trans(struct policydb *db, const char *s, const char *t, const char *c, const char *d,\n                               const char *o)\n{\n    struct type_datum *src, *tgt, *def;'
-    if old_open in c and '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\nstatic bool add_filename_trans' not in c: c = c.replace(old_open, new_open, 1)
+    if old_open in c and '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\nstatic bool add_filename_trans' not in c:
+        c = c.replace(old_open, new_open, 1)
     old_close = 'free_trans:\n    kfree(trans);\nout:\n    return false;\n}'
-    new_close = 'free_trans:\n    kfree(trans);\nout:\n    return false;\n}\n#else\nstatic bool add_filename_trans(struct policydb *db, const char *s, const char *t, const char *c, const char *d, const char *o) {\n    struct type_datum *src, *tgt, *def; struct class_datum *cls; struct filename_trans key; struct filename_trans_datum *datum; struct filename_trans *new_key; struct filename_trans_datum *new_datum; int rc;\n    src = symtab_search(&db->p_types, s); if (!src) { pr_warn("source type %s does not exist\\n", s); return false; }\n    tgt = symtab_search(&db->p_types, t); if (!tgt) { pr_warn("target type %s does not exist\\n", t); return false; }\n    cls = symtab_search(&db->p_classes, c); if (!cls) { pr_warn("class %s does not exist\\n", c); return false; }\n    def = symtab_search(&db->p_types, d); if (!def) { pr_warn("default type %s does not exist\\n", d); return false; }\n    key.stype = src->value; key.ttype = tgt->value; key.tclass = cls->value; key.name = o;\n    datum = hashtab_search(db->filename_trans, &key); if (datum) { datum->otype = def->value; return true; }\n    new_key = kzalloc(sizeof(*new_key), GFP_KERNEL); if (!new_key) return false;\n    new_key->stype = src->value; new_key->ttype = tgt->value; new_key->tclass = cls->value; new_key->name = kstrdup(o, GFP_KERNEL); if (!new_key->name) { kfree(new_key); return false; }\n    new_datum = kzalloc(sizeof(*new_datum), GFP_KERNEL); if (!new_datum) { kfree(new_key->name); kfree(new_key); return false; }\n    new_datum->otype = def->value;\n    rc = hashtab_insert(db->filename_trans, new_key, new_datum); if (rc) { kfree(new_datum); kfree(new_key->name); kfree(new_key); return false; }\n    ebitmap_set_bit(&db->filename_trans_ttypes, tgt->value, 1); return true;\n}\n#endif'
-    if old_close in c and '#else\nstatic bool add_filename_trans' not in c: c = c.replace(old_close, new_close, 1)
+    new_close = r'''free_trans:
+    kfree(trans);
+out:
+    return false;
+}
+#else
+/* API 4.19 : struct filename_trans = {stype, ttype, tclass, name} */
+static bool add_filename_trans(struct policydb *db, const char *s, const char *t, const char *c, const char *d,
+                               const char *o)
+{
+    struct type_datum *src, *tgt, *def;
+    struct class_datum *cls;
+    struct filename_trans key;
+    struct filename_trans_datum *datum;
+    struct filename_trans *new_key;
+    struct filename_trans_datum *new_datum;
+    int rc;
+
+    src = symtab_search(&db->p_types, s);
+    if (!src) { pr_warn("source type %s does not exist\n", s); return false; }
+    tgt = symtab_search(&db->p_types, t);
+    if (!tgt) { pr_warn("target type %s does not exist\n", t); return false; }
+    cls = symtab_search(&db->p_classes, c);
+    if (!cls) { pr_warn("class %s does not exist\n", c); return false; }
+    def = symtab_search(&db->p_types, d);
+    if (!def) { pr_warn("default type %s does not exist\n", d); return false; }
+
+    key.stype = src->value;
+    key.ttype = tgt->value;
+    key.tclass = cls->value;
+    key.name = o;
+
+    datum = hashtab_search(db->filename_trans, &key);
+    if (datum) { datum->otype = def->value; return true; }
+
+    new_key = kzalloc(sizeof(*new_key), GFP_KERNEL);
+    if (!new_key) return false;
+    new_key->stype = src->value;
+    new_key->ttype = tgt->value;
+    new_key->tclass = cls->value;
+    new_key->name = kstrdup(o, GFP_KERNEL);
+    if (!new_key->name) { kfree(new_key); return false; }
+
+    new_datum = kzalloc(sizeof(*new_datum), GFP_KERNEL);
+    if (!new_datum) { kfree(new_key->name); kfree(new_key); return false; }
+    new_datum->otype = def->value;
+
+    rc = hashtab_insert(db->filename_trans, new_key, new_datum);
+    if (rc) { kfree(new_datum); kfree(new_key->name); kfree(new_key); return false; }
+
+    ebitmap_set_bit(&db->filename_trans_ttypes, tgt->value, 1);
+    return true;
+}
+#endif'''
+    if old_close in c and '#else\n/* API 4.19 : struct filename_trans' not in c:
+        c = c.replace(old_close, new_close, 1)
+
     m = re.search(r'^static bool add_type\(struct policydb \*db, const char \*type_name, bool attr\)\n\{', c, re.MULTILINE)
     if m and 'KSU_ADD_TYPE_FLEX_ARRAY' not in c:
         start = m.start(); depth = 0; end = -1; i = m.end() - 1
         while i < len(c):
-            if c[i] == '{': depth += 1
-            elif c[i] == '}': depth -= 1; 
-            if depth == 0: end = i; break
+            if c[i] == '{':
+                depth += 1
+            elif c[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
             i += 1
         if end > 0:
             orig_func = c[start:end+1]
-            flex_version = 'static bool add_type_flex_419(struct policydb *db, const char *type_name, bool attr) {\n    struct type_datum *type = symtab_search(&db->p_types, type_name);\n    if (type) { pr_warn("Type %s already exists\\n", type_name); return true; }\n    u32 value = ++db->p_types.nprim; int k; void *zero = NULL; struct ebitmap empty_bm;\n    type = (struct type_datum *)kzalloc(sizeof(struct type_datum), GFP_KERNEL); if (!type) { pr_err("add_type: alloc type_datum failed.\\n"); return false; }\n    type->primary = 1; type->value = value; type->attribute = attr;\n    char *key = kstrdup(type_name, GFP_KERNEL); if (!key) { pr_err("add_type: alloc key failed.\\n"); return false; }\n    if (symtab_insert(&db->p_types, key, type)) { pr_err("add_type: insert symtab failed.\\n"); return false; }\n    struct flex_array *new_tama = flex_array_alloc(sizeof(struct ebitmap), value, GFP_KERNEL); if (!new_tama) { pr_err("add_type: flex_array_alloc type_attr_map_array failed\\n"); return false; }\n    memset(&empty_bm, 0, sizeof(empty_bm));\n    for (k = 0; k < value; k++) flex_array_put(new_tama, k, &empty_bm, GFP_KERNEL);\n    for (k = 0; k < value - 1; k++) { struct ebitmap *old_bm = (struct ebitmap *)flex_array_get(db->type_attr_map_array, k); struct ebitmap *new_bm = (struct ebitmap *)flex_array_get(new_tama, k); if (old_bm && new_bm) ebitmap_cpy(new_bm, old_bm); }\n    flex_array_free(db->type_attr_map_array); db->type_attr_map_array = new_tama;\n    { struct ebitmap *new_slot = (struct ebitmap *)flex_array_get(new_tama, value - 1); if (new_slot) { ebitmap_init(new_slot); ebitmap_set_bit(new_slot, value - 1, 1); } }\n    struct flex_array *new_tvts = flex_array_alloc(sizeof(void *), value, GFP_KERNEL); if (!new_tvts) { pr_err("add_type: flex_array_alloc type_val_to_struct_array failed\\n"); return false; }\n    for (k = 0; k < value; k++) flex_array_put_ptr(new_tvts, k, zero, GFP_KERNEL);\n    for (k = 0; k < value - 1; k++) { void *pv = flex_array_get_ptr(db->type_val_to_struct_array, k); if (pv) flex_array_put_ptr(new_tvts, k, pv, GFP_KERNEL); }\n    flex_array_free(db->type_val_to_struct_array); db->type_val_to_struct_array = new_tvts; flex_array_put_ptr(new_tvts, value - 1, type, GFP_KERNEL);\n    struct flex_array *new_names = flex_array_alloc(sizeof(char *), value, GFP_KERNEL); if (!new_names) { pr_err("add_type: flex_array_alloc sym_val_to_name failed\\n"); return false; }\n    for (k = 0; k < value; k++) flex_array_put_ptr(new_names, k, zero, GFP_KERNEL);\n    for (k = 0; k < value - 1; k++) { void *pv = flex_array_get_ptr(db->sym_val_to_name[SYM_TYPES], k); if (pv) flex_array_put_ptr(new_names, k, pv, GFP_KERNEL); }\n    flex_array_free(db->sym_val_to_name[SYM_TYPES]); db->sym_val_to_name[SYM_TYPES] = new_names; flex_array_put_ptr(new_names, value - 1, key, GFP_KERNEL);\n    int i; for (i = 0; i < db->p_roles.nprim; ++i) { ebitmap_set_bit(&db->role_val_to_struct[i]->types, value - 1, 1); }\n    return true;\n}'
-            wrapped = orig_func.replace('static bool add_type(struct policydb *db, const char *type_name, bool attr)\n{', 'static bool add_type_5_10(struct policydb *db, const char *type_name, bool attr)\n{', 1)
-            new_func = '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n' + wrapped + '\n#else\n' + flex_version + '\n#endif\n\nstatic bool add_type(struct policydb *db, const char *type_name, bool attr) {\n#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n    return add_type_5_10(db, type_name, attr);\n#else\n    return add_type_flex_419(db, type_name, attr);\n#endif\n}'
+            flex_version = r'''static bool add_type_flex_419(struct policydb *db, const char *type_name, bool attr) {
+    /* KSU_ADD_TYPE_FLEX_ARRAY */
+    struct type_datum *type = symtab_search(&db->p_types, type_name);
+    if (type) { pr_warn("Type %s already exists\n", type_name); return true; }
+
+    u32 value = ++db->p_types.nprim;
+    int k;
+    void *zero = NULL;
+    struct ebitmap empty_bm;
+
+    type = (struct type_datum *)kzalloc(sizeof(struct type_datum), GFP_KERNEL);
+    if (!type) { pr_err("add_type: alloc type_datum failed.\n"); return false; }
+    type->primary = 1;
+    type->value = value;
+    type->attribute = attr;
+    char *key = kstrdup(type_name, GFP_KERNEL);
+    if (!key) { pr_err("add_type: alloc key failed.\n"); return false; }
+    if (symtab_insert(&db->p_types, key, type)) { pr_err("add_type: insert symtab failed.\n"); return false; }
+
+    struct flex_array *new_tama = flex_array_alloc(sizeof(struct ebitmap), value, GFP_KERNEL);
+    if (!new_tama) { pr_err("add_type: flex_array_alloc type_attr_map_array failed\n"); return false; }
+    memset(&empty_bm, 0, sizeof(empty_bm));
+    for (k = 0; k < value; k++)
+        flex_array_put(new_tama, k, &empty_bm, GFP_KERNEL);
+    for (k = 0; k < value - 1; k++) {
+        struct ebitmap *old_bm = (struct ebitmap *)flex_array_get(db->type_attr_map_array, k);
+        struct ebitmap *new_bm = (struct ebitmap *)flex_array_get(new_tama, k);
+        if (old_bm && new_bm)
+            ebitmap_cpy(new_bm, old_bm);
+    }
+    flex_array_free(db->type_attr_map_array);
+    db->type_attr_map_array = new_tama;
+    {
+        struct ebitmap *new_slot = (struct ebitmap *)flex_array_get(new_tama, value - 1);
+        if (new_slot) {
+            ebitmap_init(new_slot);
+            ebitmap_set_bit(new_slot, value - 1, 1);
+        }
+    }
+
+    struct flex_array *new_tvts = flex_array_alloc(sizeof(void *), value, GFP_KERNEL);
+    if (!new_tvts) { pr_err("add_type: flex_array_alloc type_val_to_struct_array failed\n"); return false; }
+    for (k = 0; k < value; k++)
+        flex_array_put_ptr(new_tvts, k, zero, GFP_KERNEL);
+    for (k = 0; k < value - 1; k++) {
+        void *pv = flex_array_get_ptr(db->type_val_to_struct_array, k);
+        if (pv) flex_array_put_ptr(new_tvts, k, pv, GFP_KERNEL);
+    }
+    flex_array_free(db->type_val_to_struct_array);
+    db->type_val_to_struct_array = new_tvts;
+    flex_array_put_ptr(new_tvts, value - 1, type, GFP_KERNEL);
+
+    struct flex_array *new_names = flex_array_alloc(sizeof(char *), value, GFP_KERNEL);
+    if (!new_names) { pr_err("add_type: flex_array_alloc sym_val_to_name failed\n"); return false; }
+    for (k = 0; k < value; k++)
+        flex_array_put_ptr(new_names, k, zero, GFP_KERNEL);
+    for (k = 0; k < value - 1; k++) {
+        void *pv = flex_array_get_ptr(db->sym_val_to_name[SYM_TYPES], k);
+        if (pv) flex_array_put_ptr(new_names, k, pv, GFP_KERNEL);
+    }
+    flex_array_free(db->sym_val_to_name[SYM_TYPES]);
+    db->sym_val_to_name[SYM_TYPES] = new_names;
+    flex_array_put_ptr(new_names, value - 1, key, GFP_KERNEL);
+
+    int i;
+    for (i = 0; i < db->p_roles.nprim; ++i) {
+        ebitmap_set_bit(&db->role_val_to_struct[i]->types, value - 1, 1);
+    }
+    return true;
+}
+'''
+            wrapped = orig_func.replace('static bool add_type(struct policydb *db, const char *type_name, bool attr)\n{',
+                                        'static bool add_type_5_10(struct policydb *db, const char *type_name, bool attr)\n{', 1)
+            new_func = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n' + wrapped + '\n#else\n'
+                        + flex_version + '\n#endif\n\n'
+                        'static bool add_type(struct policydb *db, const char *type_name, bool attr) {\n'
+                        '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n'
+                        '    return add_type_5_10(db, type_name, attr);\n'
+                        '#else\n'
+                        '    return add_type_flex_419(db, type_name, attr);\n'
+                        '#endif\n'
+                        '}')
             c = c[:start] + new_func + c[end+1:]
+
     old = '    struct ebitmap *sattr = &db->type_attr_map_array[type->value - 1];'
     new = '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n    struct ebitmap *sattr = &db->type_attr_map_array[type->value - 1];\n#else\n    struct ebitmap *sattr = (struct ebitmap *)flex_array_get(db->type_attr_map_array, type->value - 1);\n#endif'
     if old in c and new not in c: c = c.replace(old, new, 1)
@@ -954,8 +1135,16 @@ if os.path.isfile(p):
     new = '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\nvoid ksu_destroy_sepolicy(struct selinux_policy *pol)\n{\n    policydb_destroy(&pol->policydb);\n    kfree(pol);\n}\n\nstruct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)\n{'
     if old in c and new not in c: c = c.replace(old, new, 1)
     old_close = 'out_free_data:\n    kvfree(data);\n\n    return ERR_PTR(ret);\n}\n'
-    new_close = 'out_free_data:\n    kvfree(data);\n\n    return ERR_PTR(ret);\n}\n#else\nvoid ksu_destroy_sepolicy(struct selinux_policy *pol) { (void)pol; }\nstruct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)\n{\n    (void)old_pol;\n    return ERR_PTR(-EOPNOTSUPP);\n}\n#endif\n'
-    if old_close in c and '#else\nvoid ksu_destroy_sepolicy' not in c: c = c.replace(old_close, new_close, 1)
+    new_close = ('out_free_data:\n    kvfree(data);\n\n    return ERR_PTR(ret);\n}\n'
+                 '#else\n'
+                 '/* 4.19: pas de struct selinux_policy. policydb modifie en place\n'
+                 ' * sous write_lock(&selinux_state.ss->policy_rwlock) dans rules.c. */\n'
+                 'void ksu_destroy_sepolicy(struct selinux_policy *pol) { (void)pol; }\n'
+                 'struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)\n'
+                 '{\n    (void)old_pol;\n    return ERR_PTR(-EOPNOTSUPP);\n}\n'
+                 '#endif\n')
+    if old_close in c and '#else\n/* 4.19: pas de struct selinux_policy' not in c:
+        c = c.replace(old_close, new_close, 1)
     if c != original:
         write(p, c); total += 1
         print("  ✅ selinux/sepolicy.c: FIX 9 complet")
@@ -985,7 +1174,7 @@ for dp, dn, fn in os.walk(ksu_root):
             write(p, c); total += 1
             print(f"  ✅ {os.path.relpath(p, GW)}: sched/signal.h + sched/task.h")
 
-# FIX 12: selinux_hide.c — LAYOUT 4.19 CONNU
+# FIX 12: selinux_hide.c — LAYOUT 4.19 CONNU (selinux_state.ss->)
 p = os.path.join(ksu_root, "feature", "selinux_hide.c")
 if os.path.isfile(p):
     c = read(p); original = c
@@ -1018,7 +1207,18 @@ if os.path.isfile(p):
     old_tail = "    mutex_unlock(&selinux_hide_mutex);\n}\n\n/*\n * Caveat:  Mutates scontext."
     new_tail = "    mutex_unlock(&selinux_hide_mutex);\n#endif // KSU_SELINUX_HIDE_BACKUP\n}\n\n#if KSU_SELINUX_HIDE_BACKUP\n/*\n * Caveat:  Mutates scontext."
     if old_tail in c and new_tail not in c: c = c.replace(old_tail, new_tail, 1)
-    stubs = "\n#else /* LINUX_VERSION_CODE < 5.10 : pas de backup sepolicy sur 4.19 */\n\nstatic int security_context_to_sid_with_policy(struct selinux_policy *policy, const char *scontext, u32 scontext_len, u32 *sid, u32 def_sid, gfp_t gfp_flags, u32 *orig_sid_p, int *orig_rc_p)\n{\n    if (orig_sid_p) *orig_sid_p = SECSID_NULL;\n    if (orig_rc_p) *orig_rc_p = -EOPNOTSUPP;\n    return -EOPNOTSUPP;\n}\nstatic int security_sid_to_context_with_policy(struct selinux_policy *policy, u32 sid, char **scontext, u32 *scontext_len)\n{\n    if (scontext) *scontext = NULL;\n    *scontext_len = 0;\n    return -EOPNOTSUPP;\n}\nstatic void security_compute_av_user_with_policy(struct selinux_policy *policy, u32 ssid, u32 tsid, u16 tclass, struct av_decision *avd)\n{\n    avd->allowed = 0; avd->auditallow = 0; avd->auditdeny = 0xffffffff; avd->seqno = 0; avd->flags = 0;\n}\n#endif /* KSU_SELINUX_HIDE_BACKUP */\n"
+    stubs = (
+        "\n#else /* LINUX_VERSION_CODE < 5.10 : pas de backup sepolicy sur 4.19 */\n\n"
+        "static int security_context_to_sid_with_policy(struct selinux_policy *policy, const char *scontext, u32 scontext_len,\n"
+        "                                               u32 *sid, u32 def_sid, gfp_t gfp_flags, u32 *orig_sid_p, int *orig_rc_p)\n"
+        "{\n    if (orig_sid_p) *orig_sid_p = SECSID_NULL;\n    if (orig_rc_p) *orig_rc_p = -EOPNOTSUPP;\n    return -EOPNOTSUPP;\n}\n\n"
+        "static int security_sid_to_context_with_policy(struct selinux_policy *policy, u32 sid, char **scontext, u32 *scontext_len)\n"
+        "{\n    if (scontext) *scontext = NULL;\n    *scontext_len = 0;\n    return -EOPNOTSUPP;\n}\n\n"
+        "static void security_compute_av_user_with_policy(struct selinux_policy *policy, u32 ssid, u32 tsid, u16 tclass,\n"
+        "                                                 struct av_decision *avd)\n"
+        "{\n    avd->allowed = 0; avd->auditallow = 0; avd->auditdeny = 0xffffffff; avd->seqno = 0; avd->flags = 0;\n}\n"
+        "#endif /* KSU_SELINUX_HIDE_BACKUP */\n"
+    )
     if 'KSU_SELINUX_HIDE_BACKUP' in c and 'ksu_status_lock();' in c and not c.rstrip().endswith('#endif /* KSU_SELINUX_HIDE_BACKUP */'):
         c = c.rstrip('\n') + '\n' + stubs
     if c != original:
@@ -1028,7 +1228,7 @@ if os.path.isfile(p):
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
 
-# ==================== 5. CONFIG (MÉTHODE ROBUSTE AVEC scripts/config) ====================
+# ==================== 5. CONFIG ====================
 export ARCH=arm64 SUBARCH=arm64
 export CROSS_COMPILE=aarch64-linux-gnu-
 export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
@@ -1047,7 +1247,7 @@ fi
 
 mkdir -p out
 
-# --- DIAGNOSTIC DÉCISIF : le patch SUSFS fournit-il les points d'entrée inline ? ---
+# --- DIAGNOSTIC : le patch SUSFS fournit-il les points d'entrée inline ? ---
 {
   echo "=== Points d'entrée KSU inline dans le noyau (requis par SUSFS_INLINE) ==="
   grep -n "ksu_handle\|ksu_sucompat\|ksu_setuid" \
@@ -1060,10 +1260,8 @@ make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CRO
 
 cd out
 ../scripts/config --set-val CONFIG_KSU y
-# Backend : SUSFS Inline (le seul adapté à un non-GKI patché SUSFS)
 ../scripts/config --set-val CONFIG_KSU_HOOK_TRACEPOINT n
 ../scripts/config --set-val CONFIG_KSU_HOOK_SUSFS_INLINE y
-# Debug verbeux pour diagnostiquer l'init au boot
 ../scripts/config --set-val CONFIG_KSU_DEBUG y
 ../scripts/config --set-val CONFIG_KSU_SUSFS y
 ../scripts/config --set-val CONFIG_KSU_SUSFS_SUS_PATH y
@@ -1076,7 +1274,6 @@ cd out
 ../scripts/config --set-val CONFIG_KSU_SUSFS_OPEN_REDIRECT y
 ../scripts/config --set-val CONFIG_KSU_SUSFS_SUS_MAP y
 ../scripts/config --set-val CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER y
-# Dépendances de KSU (KPROBES && EXT4_FS) et de SUSFS (THREAD_INFO_IN_TASK)
 ../scripts/config --set-val CONFIG_KPROBES y
 ../scripts/config --set-val CONFIG_HAVE_KPROBES y
 ../scripts/config --set-val CONFIG_KRETPROBES y
@@ -1094,7 +1291,6 @@ cd ..
 
 make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig 2>&1 | tail -3
 
-# --- Vérification : on dump TOUT le KSU quoi qu'il arrive ---
 {
   echo "=== .config KSU/SUSFS final ==="
   grep -E "CONFIG_KSU|CONFIG_HAVE_SYSCALL_TRACEPOINTS|CONFIG_KPROBES|CONFIG_EXT4_FS|CONFIG_THREAD_INFO_IN_TASK" out/.config
@@ -1104,8 +1300,7 @@ make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CRO
 grep -q "^CONFIG_KSU=y" out/.config || { echo "❌ CONFIG_KSU off"; exit 1; }
 grep -q "^CONFIG_KSU_SUSFS=y" out/.config || { echo "❌ CONFIG_KSU_SUSFS off"; exit 1; }
 if ! grep -q "^CONFIG_KSU_HOOK_SUSFS_INLINE=y" out/.config; then
-    echo "❌ SUSFS_INLINE refusé. Le dump .config ci-dessus donne la raison."
-    echo "   (choice : si INLINE est refusé, TRACEPOINT reprend la main par défaut)"
+    echo "❌ SUSFS_INLINE refusé — voir le dump .config ci-dessus"
     exit 1
 fi
 echo "✅ Backend actif : KSU_HOOK_SUSFS_INLINE" | tee -a "$AUDIT"
