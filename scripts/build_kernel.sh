@@ -33,8 +33,8 @@ summarize() {
     local SUM="$GITHUB_WORKSPACE/output/build-summary.txt"
     {
         echo "=== RÉSUMÉ DU BUILD (code de sortie $rc) ==="
-        echo "########## SPEC HOOKS INLINE ##########"
-        head -n 220 "$GITHUB_WORKSPACE/output/hooks-spec.txt" 2>/dev/null || echo "(spec absente)"
+        echo "########## SPEC OFFICIELLE ##########"
+        head -n 400 "$GITHUB_WORKSPACE/output/hooks-spec.txt" 2>/dev/null || echo "(spec absente)"
         echo ""
         if [ -f "$BL" ]; then
             echo "########## HOOK-SITES MANQUANTS ##########"
@@ -43,7 +43,7 @@ summarize() {
             echo "########## AUTRES ANOMALIES ##########"
             grep -nE "error:|undefined symbol|fatal error|Error [0-9]+|No rule to make target|\*\*\*|Stop\.|unknown type name" "$BL" | tail -40
         else
-            echo "pas de build.log"
+            echo "pas de build.log : arrêt avant compilation"
             tail -n 20 "$AUDIT" 2>/dev/null
         fi
     } > "$SUM" 2>&1
@@ -265,34 +265,20 @@ echo "📋 API FinaSU dumpée (affichée en fin de log)" | tee -a "$AUDIT"
 } > "$GITHUB_WORKSPACE/output/kbuild-diag.txt" 2>&1
 echo "📋 Diag kbuild écrit" | tee -a "$AUDIT"
 
-# ==================== 2f. SPEC EXACTE DES HOOKS INLINE ====================
+# ==================== 2f. SPEC OFFICIELLE (validateur + doc) ====================
+set +e
 {
-  echo "### Kbuild : logique de vérification des hook-sites (lignes 60-175) ###"
-  sed -n '60,175p' drivers/kernelsu/Kbuild 2>/dev/null || echo "(Kbuild absent)"
+  echo "########## tools/check_susfs_inline.sh ##########"
+  cat FinaSU/kernel/tools/check_susfs_inline.sh 2>/dev/null || echo "(absent)"
   echo
-  echo "### Kbuild : toutes les mentions hook / inline ###"
-  grep -nE "ksu_handle|ksu_setup|ksu_preinit|INLINE|hook-site|input_handle_event" \
-      drivers/kernelsu/Kbuild 2>/dev/null | head -60
+  echo "########## builtin-integration.md ##########"
+  cat FinaSU/website/docs/en/developer/builtin-integration.md 2>/dev/null || echo "(absent)"
   echo
-  echo "### Signatures des 12 fonctions attendues (dans les .h) ###"
-  for f in ksu_handle_input_handle_event ksu_handle_execveat ksu_handle_execveat_sucompat \
-           ksu_handle_post_execveat_sucompat ksu_setup_preinit_file ksu_preinit_handle_post_execveat \
-           ksu_handle_faccessat ksu_handle_sys_read ksu_handle_stat ksu_handle_vfs_fstat \
-           ksu_handle_sys_reboot ksu_handle_setresuid ; do
-    echo "--- $f ---"
-    grep -rn "$f" FinaSU/kernel --include=*.h 2>/dev/null | head -4 || true
-  done
-  echo
-  echo "### Headers racine de FinaSU/kernel (cherche un header d'integration noyau) ###"
-  find FinaSU/kernel -maxdepth 2 -name "*.h" 2>/dev/null | head -40
-  echo
-  echo "### Tous les .md du depot ###"
-  find FinaSU -name "*.md" 2>/dev/null | head -30
-  echo
-  echo "### Docs parlant d'inline / hook-site / input_handle_event ###"
-  grep -rln -i "inline\|hook.site\|input_handle_event" FinaSU/docs 2>/dev/null | head -10 || echo "(pas de docs/)"
+  echo "########## preinit/preinit.h (signatures + stubs) ##########"
+  cat FinaSU/kernel/preinit/preinit.h 2>/dev/null || echo "(absent)"
 } > "$GITHUB_WORKSPACE/output/hooks-spec.txt" 2>&1
-echo "📋 Spec des hooks écrite" | tee -a "$AUDIT"
+set -e
+echo "📋 Spec officielle écrite" | tee -a "$AUDIT"
 
 # ==================== 3. SIGNATURE MANAGER ====================
 MGR_APK="$GITHUB_WORKSPACE/patches/manager.apk"
