@@ -1524,7 +1524,6 @@ if os.path.isfile(p):
         "#define ksu_status_page     (selinux_state.status_page)\n"
         "#endif\n\n"
     )
-    
     if 'KSU_SELINUX_HIDE_BACKUP' not in c:
         c = c.replace('static DEFINE_MUTEX(selinux_hide_mutex);',
                       compat + 'static DEFINE_MUTEX(selinux_hide_mutex);', 1)
@@ -1600,7 +1599,6 @@ if os.path.isfile(p):
     if c != original:
         write(p, c); total += 1
         print(f"  ✅ feature/selinux_hide.c: dual-path 4.19 (API correcte)")
-
 
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
