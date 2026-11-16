@@ -214,46 +214,27 @@ KSU_DIR="drivers/kernelsu"
 KSU_REPO_ROOT="$GITHUB_WORKSPACE/kernel_sources/FinaSU"
 echo "✅ FinaSU intégré"
 
-# ==================== 2g. HOOKS INLINE (JackA1ltman) ====================
-HOOK_SH="$GITHUB_WORKSPACE/patches/susfs_inline_hook_patches.sh"
-curl -fsSL "https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/susfs_inline_hook_patches.sh" \
-     -o "$HOOK_SH"
-# On retire security/selinux/hooks.c : non requis par le validateur, et conflit u:r:su:s0 vs u:r:ksu:s0
-sed -i '/^    security\/selinux\/hooks\.c$/d' "$HOOK_SH"
-
-echo "=== Application des hooks inline ===" | tee -a "$AUDIT"
-set +e
-bash "$HOOK_SH" 2>&1 | tee -a "$AUDIT"
-set -e
-
-# Correctif : FinaSU définit ksu_handle_sys_read en void, pas en int
-sed -i 's/extern __attribute__((cold)) int ksu_handle_sys_read(unsigned int fd);/extern __attribute__((cold)) void ksu_handle_sys_read(unsigned int fd);/' fs/read_write.c
-
-# Vérification des symboles attendus par les externs du script + sources pour les 2 hooks preinit
 set +e
 {
-  echo "=== Symboles requis par les hooks : existent-ils dans FinaSU ? ==="
-  for s in __ksu_is_allow_uid_for_current ksu_is_init_rc_hook_enabled \
-           ksu_is_input_hook_enabled ksu_su_compat_enabled ; do
-    echo "--- $s ---"
-    grep -rn "$s" FinaSU/kernel --include=*.c --include=*.h 2>/dev/null | head -4 \
-      || echo "  ⚠️ INTROUVABLE"
+  echo "########## __do_execve_file : FIN de la fonction ##########"
+  ln=$(grep -nE '^static int __do_execve_file|^static int do_execveat_common' fs/exec.c | head -1 | cut -d: -f1)
+  [ -n "$ln" ] && sed -n "$((ln+95)),$((ln+235))p" fs/exec.c
+  echo
+  echo "########## fs/exec.c : labels + hooks + variables ##########"
+  grep -nE "^out[a-z_]*:|^[a-z_]+:|ksu_handle_|ksu_preinit|ksu_setup_preinit|is_su_session|preinit_fd" fs/exec.c
+  echo
+  echo "########## preinit.c : les 2 fonctions ##########"
+  for f in ksu_setup_preinit_file ksu_preinit_handle_post_execveat ; do
+    echo "===== $f ====="
+    l=$(grep -nE "^(int|bool|void)[^;]*${f}\(" FinaSU/kernel/preinit/preinit.c 2>/dev/null | head -1 | cut -d: -f1)
+    if [ -n "$l" ]; then sed -n "${l},$((l+65))p" FinaSU/kernel/preinit/preinit.c; else echo "(non trouvé — grep brut :)" ; grep -n "$f" FinaSU/kernel/preinit/preinit.c 2>/dev/null | head -6; fi
+    echo
   done
-  echo
-  echo "=== preinit/preinit.h (complet) ==="
-  cat FinaSU/kernel/preinit/preinit.h 2>/dev/null
-  echo
-  echo "=== fs/exec.c : do_execveat_common après patch ==="
-  ln=$(grep -nE '^static int do_execveat_common|^static int __do_execve_file' fs/exec.c | head -1 | cut -d: -f1)
-  [ -n "$ln" ] && sed -n "${ln},$((ln+95))p" fs/exec.c
+  echo "########## preinit.c : toutes mentions de preinit_fd ##########"
+  grep -n "preinit_fd" FinaSU/kernel/preinit/preinit.c 2>/dev/null | head -30
 } > "$SPEC" 2>&1
 set -e
-
-# VERDICT IMMÉDIAT du validateur, sans attendre la compilation
-echo "=== VERDICT check_susfs_inline.sh ===" | tee -a "$AUDIT"
-set +e
-sh FinaSU/kernel/tools/check_susfs_inline.sh "$PWD" 2>&1 | tee -a "$AUDIT"
-set -e
+echo "📋 Contrat preinit + structure exec.c écrits" | tee -a "$AUDIT"
 
 # ==================== 3. SIGNATURE MANAGER ====================
 MGR_APK="$GITHUB_WORKSPACE/patches/manager.apk"
