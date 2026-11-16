@@ -275,10 +275,15 @@ fi
     sed -i 's/^static const struct file_operations sel_handle_status_ops/const struct file_operations sel_handle_status_ops/' security/selinux/selinuxfs.c
     sed -i 's/^static DEFINE_MUTEX(sel_mutex)/DEFINE_MUTEX(sel_mutex)/' security/selinux/selinuxfs.c
 }
+
+# CORRECTION : sed plus tolérant pour retirer le 'static' de status_lock et status_page
 [ -f "security/selinux/ss/status.c" ] && {
-    sed -i 's/^static struct page \*selinux_status_page/struct page *selinux_status_page/' security/selinux/ss/status.c
-    sed -i 's/^static DEFINE_MUTEX(selinux_status_lock)/DEFINE_MUTEX(selinux_status_lock)/' security/selinux/ss/status.c
+    # Retirer 'static' de selinux_status_page (tolérant aux espaces)
+    sed -i -E 's/^static[[:space:]]+(struct page[[:space:]]*\*[[:space:]]*selinux_status_page)/\1/' security/selinux/ss/status.c
+    # Retirer 'static' de selinux_status_lock (tolérant aux espaces)
+    sed -i -E 's/^static[[:space:]]+(DEFINE_MUTEX\(selinux_status_lock\))/\1/' security/selinux/ss/status.c
 }
+
 [ -f "security/selinux/ss/services.c" ] && sed -i 's/^static DEFINE_RWLOCK(policy_rwlock)/DEFINE_RWLOCK(policy_rwlock)/' security/selinux/ss/services.c
 [ -f "security/selinux/hooks.c" ] && sed -i 's/^static struct security_operations selinux_ops/struct security_operations selinux_ops/' security/selinux/hooks.c
 
@@ -1497,7 +1502,7 @@ p = os.path.join(ksu_root, "feature", "selinux_hide.c")
 if os.path.isfile(p):
     c = read(p); original = c
 
-    compat = (
+        compat = (
         "/* ============ Compat 4.19 (dual-path) ============ */\n"
         "#include <linux/version.h>\n"
         "#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n"
@@ -1506,6 +1511,9 @@ if os.path.isfile(p):
         "#define KSU_SELINUX_HIDE_BACKUP 0\n"
         "struct selinux_policy *backup_sepolicy;\n"
         "#define symtab_search(s, name) hashtab_search(&(s)->table, name)\n"
+        "/* Déclarations extern pour les variables de status.c */\n"
+        "extern struct mutex selinux_status_lock;\n"
+        "extern struct page *selinux_status_page;\n"
         "#define ksu_status_lock()   mutex_lock(&selinux_status_lock)\n"
         "#define ksu_status_unlock() mutex_unlock(&selinux_status_lock)\n"
         "#define ksu_status_page     (selinux_status_page)\n"
@@ -1516,6 +1524,7 @@ if os.path.isfile(p):
         "#define ksu_status_page     (selinux_state.status_page)\n"
         "#endif\n\n"
     )
+    
     if 'KSU_SELINUX_HIDE_BACKUP' not in c:
         c = c.replace('static DEFINE_MUTEX(selinux_hide_mutex);',
                       compat + 'static DEFINE_MUTEX(selinux_hide_mutex);', 1)
