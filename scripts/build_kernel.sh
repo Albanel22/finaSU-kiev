@@ -1509,74 +1509,23 @@ for dp, dn, fn in os.walk(ksu_root):
             write(p, c); total += 1
             print(f"  ✅ {os.path.relpath(p, GW)}: sched/signal.h + sched/task.h")
 
-# --- FIX 12 : selinux_hide.c — AUTO-DÉTECTION du layout status_lock/status_page ---
-# On ne devine plus : on lit les headers du noyau et on choisit l'expression exacte.
+# --- FIX 12 : selinux_hide.c — LAYOUT 4.19 CONNU ---
+# Le dump montre : status_lock/status_page sont dans selinux_state.ss->
 p = os.path.join(ksu_root, "feature", "selinux_hide.c")
 if os.path.isfile(p):
     c = read(p); original = c
 
-    def safe_read(rel):
-        fp = os.path.join(kernel_root, rel)
-        return read(fp) if os.path.isfile(fp) else ""
-
-    sec_h  = safe_read("security/selinux/include/security.h")
-    svc_h  = safe_read("security/selinux/ss/services.h")
-    stat_c = safe_read("security/selinux/ss/status.c")
-    if not stat_c:
-        stat_c = safe_read("security/selinux/status.c")
-
-    m_state = re.search(r'struct selinux_state\s*\{.*?\};', sec_h, re.DOTALL)
-    m_ss    = re.search(r'struct selinux_ss\s*\{.*?\};', svc_h, re.DOTALL)
-    state_body = m_state.group(0) if m_state else ""
-    ss_body    = m_ss.group(0) if m_ss else ""
-
-    print("  --- AUTO-DETECT status_lock/status_page ---")
-    print(f"    selinux_state.status_lock : {'status_lock' in state_body}")
-    print(f"    selinux_ss.status_lock    : {'status_lock' in ss_body}")
-    print(f"    globale selinux_status_lock dans status.c : {'selinux_status_lock' in stat_c}")
-
-    extra_decl = ""
-    if 'status_lock' in state_body:
-        mode = "selinux_state.status_lock"
-        lock_e   = "mutex_lock(&selinux_state.status_lock)"
-        unlock_e = "mutex_unlock(&selinux_state.status_lock)"
-        page_e   = "(selinux_state.status_page)"
-    elif 'status_lock' in ss_body:
-        mode = "selinux_state.ss->status_lock"
-        lock_e   = "mutex_lock(&selinux_state.ss->status_lock)"
-        unlock_e = "mutex_unlock(&selinux_state.ss->status_lock)"
-        page_e   = "(selinux_state.ss->status_page)"
-    elif 'selinux_status_lock' in stat_c:
-        mode = "globales selinux_status_lock / selinux_status_page"
-        extra_decl = ("extern struct mutex selinux_status_lock;\n"
-                      "extern struct page *selinux_status_page;\n")
-        lock_e   = "mutex_lock(&selinux_status_lock)"
-        unlock_e = "mutex_unlock(&selinux_status_lock)"
-        page_e   = "(selinux_status_page)"
-    else:
-        mode = "INTROUVABLE -> mutex/page LOCAUX (fake status INERTE, voir audit)"
-        print("  ⚠️⚠️ status_lock/status_page introuvables dans le noyau.")
-        print("  ⚠️⚠️ Le faux statut SELinux sera INERTE. Dump des structs dans l'audit pour correction.")
-        extra_decl = ("static DEFINE_MUTEX(ksu_local_status_lock);\n"
-                      "static struct page *ksu_local_status_page;\n")
-        lock_e   = "mutex_lock(&ksu_local_status_lock)"
-        unlock_e = "mutex_unlock(&ksu_local_status_lock)"
-        page_e   = "(ksu_local_status_page)"
-
-    print(f"    => MODE RETENU : {mode}")
-
     compat = (
-        "/* ============ Compat 4.19 (auto-detect) ============ */\n"
+        "/* ============ Compat 4.19 (layout connu) ============ */\n"
         "#include <linux/version.h>\n"
         "#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n"
-        f"/* status layout detecte : {mode} */\n"
+        "/* 4.19 : status_lock/status_page sont dans selinux_state.ss-> */\n"
         "#define KSU_SELINUX_HIDE_BACKUP 0\n"
         "struct selinux_policy *backup_sepolicy;\n"
         "#define symtab_search(s, name) hashtab_search(&(s)->table, name)\n"
-        + extra_decl +
-        f"#define ksu_status_lock()   {lock_e}\n"
-        f"#define ksu_status_unlock() {unlock_e}\n"
-        f"#define ksu_status_page     {page_e}\n"
+        "#define ksu_status_lock()   mutex_lock(&selinux_state.ss->status_lock)\n"
+        "#define ksu_status_unlock() mutex_unlock(&selinux_state.ss->status_lock)\n"
+        "#define ksu_status_page     (selinux_state.ss->status_page)\n"
         "#else\n"
         "#define KSU_SELINUX_HIDE_BACKUP 1\n"
         "#define ksu_status_lock()   mutex_lock(&selinux_state.status_lock)\n"
@@ -1658,7 +1607,7 @@ if os.path.isfile(p):
 
     if c != original:
         write(p, c); total += 1
-        print(f"  ✅ feature/selinux_hide.c: dual-path 4.19 ({mode})")
+        print("  ✅ feature/selinux_hide.c: dual-path 4.19 (layout selinux_state.ss->)")
 
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
