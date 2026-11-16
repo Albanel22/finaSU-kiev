@@ -13,7 +13,7 @@ VER="finasu-A"
 KSU_REF="$FINASU_REF"
 KSUD_FALLBACK_REF="${KSUD_FALLBACK_REF:-v3.4.2}"
 
-echo "=== Build FinaSU ($FINASU_REF) — 4.19 + SuSFS + SUSFS_INLINE + DEBUG ==="
+echo "=== Build FinaSU ($FINASU_REF) — 4.19 + SuSFS + SUSFS_INLINE + PREINIT ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -22,9 +22,9 @@ MGR_GDRIVE_ID="1Qr07fjThXjmIz_DAmW2GZepoWrNIikXR"
 
 mkdir -p "$GITHUB_WORKSPACE/output"
 AUDIT="$GITHUB_WORKSPACE/output/audit-${VER}.txt"
-APIDUMP="$GITHUB_WORKSPACE/output/finasu-api.txt"
+SPEC="$GITHUB_WORKSPACE/output/hooks-spec.txt"
 : > "$AUDIT"
-: > "$APIDUMP"
+: > "$SPEC"
 
 summarize() {
     local rc=$?
@@ -33,18 +33,21 @@ summarize() {
     local SUM="$GITHUB_WORKSPACE/output/build-summary.txt"
     {
         echo "=== RÉSUMÉ DU BUILD (code de sortie $rc) ==="
-        echo "########## SPEC OFFICIELLE ##########"
-        head -n 400 "$GITHUB_WORKSPACE/output/hooks-spec.txt" 2>/dev/null || echo "(spec absente)"
+        echo "########## SPEC / DEFINITIONS DES POINTS D'ENTREE ##########"
+        head -n 400 "$SPEC" 2>/dev/null || echo "(spec absente)"
         echo ""
         if [ -f "$BL" ]; then
             echo "########## HOOK-SITES MANQUANTS ##########"
             grep -nE "SUSFS Inline:|hook-site check" "$BL" | head -30
             echo ""
             echo "########## AUTRES ANOMALIES ##########"
-            grep -nE "error:|undefined symbol|fatal error|Error [0-9]+|No rule to make target|\*\*\*|Stop\.|unknown type name" "$BL" | tail -40
+            grep -nE "error:|undefined symbol|fatal error|Error [0-9]+|No rule to make target|\*\*\*|Stop\.|unknown type name|UAPI headers" "$BL" | tail -40
+            echo ""
+            echo "########## 30 DERNIÈRES LIGNES DE build.log ##########"
+            tail -n 30 "$BL"
         else
             echo "pas de build.log : arrêt avant compilation"
-            tail -n 20 "$AUDIT" 2>/dev/null
+            tail -n 25 "$AUDIT" 2>/dev/null
         fi
     } > "$SUM" 2>&1
     cat "$SUM"
@@ -211,74 +214,23 @@ KSU_DIR="drivers/kernelsu"
 KSU_REPO_ROOT="$GITHUB_WORKSPACE/kernel_sources/FinaSU"
 echo "✅ FinaSU intégré"
 
-# ==================== 2d. DUMP API FinaSU (info pour câbler les hooks) ====================
-{
-  echo "### FinaSU fournit-il un patch SUSFS avec hooks KSU ? ###"
-  ls -la FinaSU/kernel/patches/ 2>/dev/null || echo "(pas de kernel/patches/)"
-  ls -la FinaSU/patches/ 2>/dev/null || echo "(pas de patches/)"
-  find FinaSU -maxdepth 3 -iname "*.patch" 2>/dev/null | head -20 || true
-  echo
-  echo "### References SUSFS dans la doc ###"
-  grep -rn -i "susfs" FinaSU/README*.md 2>/dev/null | head -20 || echo "(aucune dans README)"
-  echo
-  echo "### TOUS les points d'entree ksu_handle_* declares dans les headers ###"
-  grep -rn "ksu_handle_" FinaSU/kernel --include=*.h 2>/dev/null | head -40 || echo "(aucun)"
-  echo
-  echo "### kernel/hook/setuid_hook.h ###"
-  cat FinaSU/kernel/hook/setuid_hook.h 2>/dev/null || echo "(absent)"
-  echo
-  echo "### kernel/feature/sucompat.h ###"
-  cat FinaSU/kernel/feature/sucompat.h 2>/dev/null || echo "(absent)"
-  echo
-  echo "### kernel/hook/syscall_hook.h ###"
-  cat FinaSU/kernel/hook/syscall_hook.h 2>/dev/null || echo "(absent)"
-  echo
-  echo "### kernel/hook/syscall_hook.c : signatures + extern + symboles noyau ###"
-  grep -nE "^[a-zA-Z_].*\(|extern |sys_call_table|kallsyms|SUSFS_INLINE" \
-      FinaSU/kernel/hook/syscall_hook.c 2>/dev/null | head -50 || echo "(absent)"
-  echo
-  echo "### Fichiers du dossier hook/ ###"
-  ls -la FinaSU/kernel/hook/ 2>/dev/null || echo "(absent)"
-} > "$APIDUMP" 2>&1
-echo "📋 API FinaSU dumpée (affichée en fin de log)" | tee -a "$AUDIT"
-
-# ==================== 2e. DIAG KBUILD + DOC INLINE ====================
-{
-  echo "### drivers/kernelsu/Makefile : 60 dernières lignes (partie kbuild ajoutée ?) ###"
-  tail -n 60 drivers/kernelsu/Makefile 2>/dev/null || echo "(absent)"
-  echo
-  echo "### Le Makefile contient-il obj-y / kernelsu-objs ? ###"
-  grep -nE "obj-|kernelsu-objs|ksu-y|SUSFS_INLINE|\\$\(error|\\$\(warning" drivers/kernelsu/Makefile 2>/dev/null | head -40 || echo "(aucun)"
-  echo
-  echo "### setup.sh : ce qu'il fait vraiment ###"
-  sed -n '1,80p' FinaSU/kernel/setup.sh 2>/dev/null || echo "(absent)"
-  echo
-  echo "### hook/arm64/ : contenu ###"
-  ls -la FinaSU/kernel/hook/arm64/ 2>/dev/null
-  echo
-  echo "### Où syscall_fn_t est-il défini pour arm64 ? ###"
-  grep -rn "syscall_fn_t" FinaSU/kernel --include=*.h 2>/dev/null | head -20
-  echo
-  echo "### Doc / CI : mentions du patch SUSFS pinned et du backend INLINE ###"
-  find FinaSU -maxdepth 2 -name "*.md" 2>/dev/null | head -20
-  grep -rn -i "susfs4ksu\|SUSFS_INLINE\|inline" FinaSU/docs FinaSU/.github 2>/dev/null | head -30 || echo "(rien)"
-} > "$GITHUB_WORKSPACE/output/kbuild-diag.txt" 2>&1
-echo "📋 Diag kbuild écrit" | tee -a "$AUDIT"
-
-# ==================== 2f. SPEC OFFICIELLE (validateur + doc) ====================
+# ==================== 2f. DEFINITIONS DES POINTS D'ENTREE ====================
 set +e
 {
-  echo "########## tools/check_susfs_inline.sh ##########"
-  cat FinaSU/kernel/tools/check_susfs_inline.sh 2>/dev/null || echo "(absent)"
-  echo
-  echo "########## builtin-integration.md ##########"
-  cat FinaSU/website/docs/en/developer/builtin-integration.md 2>/dev/null || echo "(absent)"
-  echo
-  echo "########## preinit/preinit.h (signatures + stubs) ##########"
-  cat FinaSU/kernel/preinit/preinit.h 2>/dev/null || echo "(absent)"
-} > "$GITHUB_WORKSPACE/output/hooks-spec.txt" 2>&1
+  for f in ksu_handle_input_handle_event ksu_handle_execveat ksu_handle_execveat_sucompat \
+           ksu_handle_post_execveat_sucompat ksu_handle_faccessat ksu_handle_sys_read \
+           ksu_handle_stat ksu_handle_vfs_fstat ksu_handle_sys_reboot ; do
+    echo "===== $f : definition ====="
+    grep -rnE -B2 -A8 "^(long|int|void|bool|static)[^;]*${f}\(" FinaSU/kernel --include=*.c 2>/dev/null | head -22
+    echo "----- occurrences -----"
+    grep -rn "${f}" FinaSU/kernel --include=*.c 2>/dev/null | head -5
+    echo
+  done
+  echo "########## include/ksu.h ##########"
+  cat FinaSU/kernel/include/ksu.h 2>/dev/null
+} > "$SPEC" 2>&1
 set -e
-echo "📋 Spec officielle écrite" | tee -a "$AUDIT"
+echo "📋 Définitions des points d'entrée écrites" | tee -a "$AUDIT"
 
 # ==================== 3. SIGNATURE MANAGER ====================
 MGR_APK="$GITHUB_WORKSPACE/patches/manager.apk"
@@ -1258,12 +1210,11 @@ fi
 
 mkdir -p out
 
-# --- DIAGNOSTIC : le patch SUSFS fournit-il les points d'entrée inline ? ---
 {
-  echo "=== Points d'entrée KSU inline dans le noyau (requis par SUSFS_INLINE) ==="
-  grep -n "ksu_handle\|ksu_sucompat\|ksu_setuid" \
-      kernel/sys.c fs/exec.c fs/read_write.c fs/stat.c fs/open.c 2>/dev/null \
-      | head -40 || echo "AUCUN appel ksu_* trouvé dans ces fichiers"
+  echo "=== Points d'entrée KSU inline présents dans le noyau ? ==="
+  grep -n "ksu_handle\|ksu_setup_preinit\|ksu_preinit_handle" \
+      kernel/sys.c fs/exec.c fs/read_write.c fs/stat.c fs/open.c kernel/reboot.c drivers/input/input.c 2>/dev/null \
+      | head -40 || echo "AUCUN (patch d'intégration inline à écrire)"
   echo "=== Fin diagnostic inline ==="
 } | tee -a "$AUDIT"
 
@@ -1291,6 +1242,7 @@ cd out
 ../scripts/config --set-val CONFIG_KALLSYMS y
 ../scripts/config --set-val CONFIG_KALLSYMS_ALL y
 ../scripts/config --set-val CONFIG_EXT4_FS y
+../scripts/config --set-val CONFIG_HEADERS_INSTALL y
 ../scripts/config --set-val CONFIG_THREAD_INFO_IN_TASK y
 ../scripts/config --set-val CONFIG_FTRACE y
 ../scripts/config --set-val CONFIG_FTRACE_SYSCALLS y
@@ -1304,7 +1256,7 @@ make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CRO
 
 {
   echo "=== .config KSU/SUSFS final ==="
-  grep -E "CONFIG_KSU|CONFIG_HAVE_SYSCALL_TRACEPOINTS|CONFIG_KPROBES|CONFIG_EXT4_FS|CONFIG_THREAD_INFO_IN_TASK" out/.config
+  grep -E "CONFIG_KSU|CONFIG_HEADERS_INSTALL|CONFIG_HAVE_SYSCALL_TRACEPOINTS|CONFIG_KPROBES|CONFIG_EXT4_FS|CONFIG_THREAD_INFO_IN_TASK" out/.config
   echo "=== Fin .config ==="
 } | tee -a "$AUDIT"
 
@@ -1316,6 +1268,15 @@ if ! grep -q "^CONFIG_KSU_HOOK_SUSFS_INLINE=y" out/.config; then
 fi
 echo "✅ Backend actif : KSU_HOOK_SUSFS_INLINE" | tee -a "$AUDIT"
 
+# UAPI headers : requis par le preinit runner (Kbuild teste out/usr/include/linux/unistd.h)
+echo "=== Installation des UAPI headers (preinit) ==="
+make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 headers_install 2>&1 | tail -5
+if [ -f out/usr/include/linux/unistd.h ]; then
+    echo "✅ UAPI headers présents : preinit sera compilé" | tee -a "$AUDIT"
+else
+    echo "⚠️ out/usr/include/linux/unistd.h absent — preinit serait désactivé" | tee -a "$AUDIT"
+fi
+
 # ==================== 6. MOTOROLA ====================
 sed -i 's/if (!check_version(/if (0 \&\& !check_version(/g' kernel/module.c
 printf "\n#include <linux/notifier.h>\n#include <linux/module.h>\nstatic BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);\nint panel_register_notifier(struct notifier_block *nb){return blocking_notifier_chain_register(&motorola_panel_notifier_list,nb);}\nEXPORT_SYMBOL(panel_register_notifier);\nint panel_unregister_notifier(struct notifier_block *nb){return blocking_notifier_chain_unregister(&motorola_panel_notifier_list,nb);}\nEXPORT_SYMBOL(panel_unregister_notifier);\nvoid touch_set_state(int s){return;}\nEXPORT_SYMBOL(touch_set_state);\n" >> techpack/display/msm/msm_drv.c
@@ -1324,7 +1285,7 @@ printf "\n#include <linux/notifier.h>\n#include <linux/module.h>\nstatic BLOCKIN
 echo "=== Compilation ==="
 set +eo pipefail
 make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 \
-  KCFLAGS="-Wno-unused-variable -Wno-declaration-after-statement" $SIG_ARGS \
+  KCFLAGS="-Wno-unused-variable -Wno-declaration-after-statement" KSU_REQUIRE_PREINIT=1 $SIG_ARGS \
     -k -j$(nproc) Image 2>&1 | tee build.log
 MAKE_RC=${PIPESTATUS[0]}
 set -eo pipefail
@@ -1341,7 +1302,7 @@ cp out/arch/arm64/boot/Image "$GITHUB_WORKSPACE/output/Image-${VER}"
 cp out/System.map "$GITHUB_WORKSPACE/output/System.map-${VER}"
 {
   echo "=== Symboles KSU dans System.map ==="
-  grep -E " (ksu_handle_|kernelsu_init|ksu_syscall|ksu_setuid_hook|ksu_sucompat)" out/System.map | head -30 \
+  grep -E " (ksu_handle_|kernelsu_init|ksu_syscall|ksu_setuid_hook|ksu_sucompat|ksu_preinit)" out/System.map | head -30 \
     || echo "⚠️ aucun symbole ksu_* — KSU ne serait pas lié !"
 } | tee -a "$AUDIT"
 
