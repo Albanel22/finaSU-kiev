@@ -13,7 +13,7 @@ VER="finasu-A"
 KSU_REF="$FINASU_REF"
 KSUD_FALLBACK_REF="${KSUD_FALLBACK_REF:-v3.4.2}"
 
-echo "=== Build FinaSU ($FINASU_REF) — noyau cible 4.19 + SuSFS + MANUAL_HOOK ==="
+echo "=== Build FinaSU ($FINASU_REF) — noyau cible 4.19 + SuSFS + MANUAL_HOOK (forcé) ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -511,7 +511,8 @@ int handle_sepolicy(void __user *user_data, u64 data_len) {
         expected_argc = sepol_expected_argc(header.cmd);
         if (expected_argc < 0 || expected_argc > KSU_SEPOLICY_MAX_ARGS) { ret = -EINVAL; break; }
         for (arg_index = 0; arg_index < (u32)expected_argc; arg_index++) {
-            ret = sepol_read_string(&cursor, &args[arg_index]); if (ret < 0) break;
+            ret = sepol_read_string(&cursor, &args[arg_index]);
+            if (ret < 0) break;
         }
         if (ret < 0) break;
         ret = apply_one_sepolicy_cmd(KSU_DB419, &header, args);
@@ -737,8 +738,11 @@ if os.path.isfile(p):
     if old in c and new not in c: c = c.replace(old, new, 1)
     old = '        return orig->f_op->remap_file_range(orig, pos_in, file_out, pos_out, len, remap_flags);\n    }\n}\n'
     new = '        return orig->f_op->remap_file_range(orig, pos_in, file_out, pos_out, len, remap_flags);\n    }\n}\n#endif /* 5.0.0 */\n'
-    if old in c and '#endif /* 5.0.0 */\n\nstatic int ksu_wrapper_fadvise' not in c: c = c.replace(old, new, 1)
-    if c != original: write(p, c); total += 1; print("  ✅ infra/file_wrapper.c: guards 4.19")
+    if old in c and '#endif /* 5.0.0 */\n\nstatic int ksu_wrapper_fadvise' not in c:
+        c = c.replace(old, new, 1)
+    if c != original:
+        write(p, c); total += 1
+        print("  ✅ infra/file_wrapper.c: guards 4.19")
 
 # FIX 4: seccomp_cache.c
 p = os.path.join(ksu_root, "infra/seccomp_cache.c")
@@ -749,8 +753,10 @@ if os.path.isfile(p):
         lines = c.split('\n'); last_inc = -1
         for i, ln in enumerate(lines):
             if ln.lstrip().startswith('#include'): last_inc = i
-        if last_inc >= 0: lines.insert(last_inc + 1, compat)
-        write(p, '\n'.join(lines)); total += 1; print("  ✅ infra/seccomp_cache.c: SECCOMP_ARCH_NATIVE_NR")
+        if last_inc >= 0:
+            lines.insert(last_inc + 1, compat)
+            write(p, '\n'.join(lines)); total += 1
+            print("  ✅ infra/seccomp_cache.c: SECCOMP_ARCH_NATIVE_NR")
 
 # FIX 5: su_mount_ns.c
 p = os.path.join(ksu_root, "infra/su_mount_ns.c")
@@ -758,7 +764,8 @@ if os.path.isfile(p):
     c = read(p)
     if '#include <uapi/linux/mount.h>' in c and 'KSU_MOUNT_HDR_COMPAT' not in c:
         c = c.replace('#include <uapi/linux/mount.h>', '#include <linux/version.h>\n#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0)\n#include <uapi/linux/mount.h>\n#else\n#include <linux/mount.h>\n#endif\n#define KSU_MOUNT_HDR_COMPAT 1')
-        write(p, c); total += 1; print("  ✅ infra/su_mount_ns.c: uapi/linux/mount.h")
+        write(p, c); total += 1
+        print("  ✅ infra/su_mount_ns.c: uapi/linux/mount.h")
 
 # FIX 6: pkg_observer.c
 p = os.path.join(ksu_root, "manager/pkg_observer.c")
@@ -863,7 +870,8 @@ int ksu_observer_init(void) {
 }
 void __exit ksu_observer_exit(void) { unwatch_one_dir(&g_watch); fsnotify_put_group(g); pr_info("observer exit done\n"); }
 '''
-        write(p, new_c); total += 1; print("  ✅ manager/pkg_observer.c: réécrit 4.19")
+        write(p, new_c); total += 1
+        print("  ✅ manager/pkg_observer.c: réécrit 4.19")
 
 # FIX 7: TWA_RESUME + put_task_struct
 for dp, dn, fn in os.walk(ksu_root):
@@ -879,12 +887,17 @@ for dp, dn, fn in os.walk(ksu_root):
             lines = c.split('\n'); last_inc = -1
             for i, ln in enumerate(lines):
                 if ln.lstrip().startswith('#include'): last_inc = i
-            if last_inc >= 0: lines.insert(last_inc + 1, twa); c = '\n'.join(lines)
-            else: c = twa + c
+            if last_inc >= 0:
+                lines.insert(last_inc + 1, twa)
+                c = '\n'.join(lines)
+            else:
+                c = twa + c
         if 'put_task_struct' in c:
             c = ensure_inc_after_last(c, '<linux/sched.h>')
             c = ensure_inc_after_last(c, '<linux/sched/task.h>')
-        if c != original: write(p, c); total += 1; print(f"  ✅ {os.path.relpath(p, GW)}: TWA_RESUME + sched/task.h")
+        if c != original:
+            write(p, c); total += 1
+            print(f"  ✅ {os.path.relpath(p, GW)}: TWA_RESUME + sched/task.h")
 
 # FIX 8: app_profile.c
 p = os.path.join(ksu_root, "policy/app_profile.c")
@@ -900,7 +913,9 @@ if os.path.isfile(p):
     if old in c and '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n    seccomp_filter_release(fake)' not in c:
         new = '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n    seccomp_filter_release(fake);\n#else\n    put_seccomp_filter(fake);\n#endif\n'
         c = c.replace(old, new, 1)
-    if c != original: write(p, c); total += 1; print("  ✅ policy/app_profile.c: seccomp_filter_release backporté")
+    if c != original:
+        write(p, c); total += 1
+        print("  ✅ policy/app_profile.c: seccomp_filter_release backporté")
 
 # FIX 9: sepolicy.c
 p = os.path.join(ksu_root, "selinux/sepolicy.c")
@@ -941,7 +956,9 @@ if os.path.isfile(p):
     old_close = 'out_free_data:\n    kvfree(data);\n\n    return ERR_PTR(ret);\n}\n'
     new_close = 'out_free_data:\n    kvfree(data);\n\n    return ERR_PTR(ret);\n}\n#else\nvoid ksu_destroy_sepolicy(struct selinux_policy *pol) { (void)pol; }\nstruct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)\n{\n    (void)old_pol;\n    return ERR_PTR(-EOPNOTSUPP);\n}\n#endif\n'
     if old_close in c and '#else\nvoid ksu_destroy_sepolicy' not in c: c = c.replace(old_close, new_close, 1)
-    if c != original: write(p, c); total += 1; print("  ✅ selinux/sepolicy.c: FIX 9 complet")
+    if c != original:
+        write(p, c); total += 1
+        print("  ✅ selinux/sepolicy.c: FIX 9 complet")
 
 # FIX 10: minmax.h -> kernel.h
 for dp, dn, fn in os.walk(ksu_root):
@@ -951,7 +968,8 @@ for dp, dn, fn in os.walk(ksu_root):
         c = read(p)
         if '#include <linux/minmax.h>' not in c or 'KSU_MINMAX_COMPAT' in c: continue
         c = c.replace('#include <linux/minmax.h>', '/* KSU_MINMAX_COMPAT: kernel.h fournit min_t/max_t */\n#include <linux/kernel.h>', 1)
-        write(p, c); total += 1; print(f"  ✅ {os.path.relpath(p, GW)}: minmax.h -> kernel.h")
+        write(p, c); total += 1
+        print(f"  ✅ {os.path.relpath(p, GW)}: minmax.h -> kernel.h")
 
 # FIX 11: sched/signal.h + sched/task.h
 for dp, dn, fn in os.walk(ksu_root):
@@ -963,7 +981,9 @@ for dp, dn, fn in os.walk(ksu_root):
         original = c
         c = ensure_inc_after_last(c, '<linux/sched/signal.h>')
         c = ensure_inc_after_last(c, '<linux/sched/task.h>')
-        if c != original: write(p, c); total += 1; print(f"  ✅ {os.path.relpath(p, GW)}: sched/signal.h + sched/task.h")
+        if c != original:
+            write(p, c); total += 1
+            print(f"  ✅ {os.path.relpath(p, GW)}: sched/signal.h + sched/task.h")
 
 # FIX 12: selinux_hide.c — LAYOUT 4.19 CONNU
 p = os.path.join(ksu_root, "feature", "selinux_hide.c")
@@ -1001,12 +1021,14 @@ if os.path.isfile(p):
     stubs = "\n#else /* LINUX_VERSION_CODE < 5.10 : pas de backup sepolicy sur 4.19 */\n\nstatic int security_context_to_sid_with_policy(struct selinux_policy *policy, const char *scontext, u32 scontext_len, u32 *sid, u32 def_sid, gfp_t gfp_flags, u32 *orig_sid_p, int *orig_rc_p)\n{\n    if (orig_sid_p) *orig_sid_p = SECSID_NULL;\n    if (orig_rc_p) *orig_rc_p = -EOPNOTSUPP;\n    return -EOPNOTSUPP;\n}\nstatic int security_sid_to_context_with_policy(struct selinux_policy *policy, u32 sid, char **scontext, u32 *scontext_len)\n{\n    if (scontext) *scontext = NULL;\n    *scontext_len = 0;\n    return -EOPNOTSUPP;\n}\nstatic void security_compute_av_user_with_policy(struct selinux_policy *policy, u32 ssid, u32 tsid, u16 tclass, struct av_decision *avd)\n{\n    avd->allowed = 0; avd->auditallow = 0; avd->auditdeny = 0xffffffff; avd->seqno = 0; avd->flags = 0;\n}\n#endif /* KSU_SELINUX_HIDE_BACKUP */\n"
     if 'KSU_SELINUX_HIDE_BACKUP' in c and 'ksu_status_lock();' in c and not c.rstrip().endswith('#endif /* KSU_SELINUX_HIDE_BACKUP */'):
         c = c.rstrip('\n') + '\n' + stubs
-    if c != original: write(p, c); total += 1; print("  ✅ feature/selinux_hide.c: dual-path 4.19 (layout selinux_state.ss->)")
+    if c != original:
+        write(p, c); total += 1
+        print("  ✅ feature/selinux_hide.c: dual-path 4.19 (layout selinux_state.ss->)")
 
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
 
-# ==================== 5. CONFIG ====================
+# ==================== 5. CONFIG (MÉTHODE ROBUSTE AVEC scripts/config) ====================
 export ARCH=arm64 SUBARCH=arm64
 export CROSS_COMPILE=aarch64-linux-gnu-
 export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
@@ -1025,40 +1047,58 @@ fi
 
 mkdir -p out
 make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 vendor/lito-perf_defconfig
-cat >> out/.config <<'EOF'
-CONFIG_KSU=y
-# CONFIG_KSU_HOOK_TRACEPOINT is not set
-CONFIG_KSU_MANUAL_HOOK=y
-# CONFIG_KSU_HOOK_SUSFS_INLINE is not set
-CONFIG_KSU_SUSFS=y
-CONFIG_KSU_SUSFS_SUS_PATH=y
-CONFIG_KSU_SUSFS_SUS_MOUNT=y
-CONFIG_KSU_SUSFS_SUS_KSTAT=y
-CONFIG_KSU_SUSFS_SPOOF_UNAME=y
-CONFIG_KSU_SUSFS_ENABLE_LOG=y
-CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
-CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
-CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
-CONFIG_KSU_SUSFS_SUS_MAP=y
-CONFIG_KPROBES=y
-CONFIG_HAVE_KPROBES=y
-CONFIG_KRETPROBES=y
-CONFIG_KALLSYMS=y
-CONFIG_KALLSYMS_ALL=y
-CONFIG_EXT4_FS=y
-CONFIG_HEADERS_INSTALL=y
-CONFIG_THREAD_INFO_IN_TASK=y
-CONFIG_FTRACE=y
-CONFIG_FTRACE_SYSCALLS=y
-CONFIG_SECCOMP=y
-CONFIG_SECCOMP_FILTER=y
-CONFIG_COMPAT=y
-CONFIG_COMPAT_32BIT_TIME=y
-EOF
-make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig 2>&1 | tail -3
-grep -q "^CONFIG_KSU=y" out/.config || { echo "❌ CONFIG_KSU off"; exit 1; }
-grep -q "^CONFIG_KSU_MANUAL_HOOK=y" out/.config || { echo "❌ CONFIG_KSU_MANUAL_HOOK off"; exit 1; }
-grep -q "^CONFIG_KSU_SUSFS=y" out/.config || { echo "❌ CONFIG_KSU_SUSFS off"; exit 1; }
+
+# Utilisation de scripts/config pour forcer les valeurs sans qu'olddefconfig ne les écrase
+cd out
+../scripts/config --set-val CONFIG_KSU y
+../scripts/config --set-val CONFIG_KSU_MANUAL_HOOK y
+../scripts/config --set-val CONFIG_KSU_HOOK_TRACEPOINT n
+../scripts/config --set-val CONFIG_KSU_SUSFS y
+../scripts/config --set-val CONFIG_KSU_SUSFS_SUS_PATH y
+../scripts/config --set-val CONFIG_KSU_SUSFS_SUS_MOUNT y
+../scripts/config --set-val CONFIG_KSU_SUSFS_SUS_KSTAT y
+../scripts/config --set-val CONFIG_KSU_SUSFS_SPOOF_UNAME y
+../scripts/config --set-val CONFIG_KSU_SUSFS_ENABLE_LOG y
+../scripts/config --set-val CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS y
+../scripts/config --set-val CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG y
+../scripts/config --set-val CONFIG_KSU_SUSFS_OPEN_REDIRECT y
+../scripts/config --set-val CONFIG_KSU_SUSFS_SUS_MAP y
+../scripts/config --set-val CONFIG_KPROBES y
+../scripts/config --set-val CONFIG_HAVE_KPROBES y
+../scripts/config --set-val CONFIG_KRETPROBES y
+../scripts/config --set-val CONFIG_KALLSYMS y
+../scripts/config --set-val CONFIG_KALLSYMS_ALL y
+../scripts/config --set-val CONFIG_EXT4_FS y
+../scripts/config --set-val CONFIG_HEADERS_INSTALL y
+../scripts/config --set-val CONFIG_THREAD_INFO_IN_TASK y
+../scripts/config --set-val CONFIG_FTRACE y
+../scripts/config --set-val CONFIG_FTRACE_SYSCALLS y
+../scripts/config --set-val CONFIG_SECCOMP y
+../scripts/config --set-val CONFIG_SECCOMP_FILTER y
+../scripts/config --set-val CONFIG_COMPAT y
+../scripts/config --set-val CONFIG_COMPAT_32BIT_TIME y
+cd ..
+
+# On lance olddefconfig pour résoudre les dépendances restantes, mais nos valeurs forcées devraient tenir
+make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 olddefconfig > /dev/null 2>&1
+
+# Vérification stricte
+if ! grep -q "^CONFIG_KSU=y" out/.config; then
+    echo "❌ CONFIG_KSU a été rejeté !"
+    grep "CONFIG_KSU" out/.config || true
+    exit 1
+fi
+if ! grep -q "^CONFIG_KSU_MANUAL_HOOK=y" out/.config; then
+    echo "❌ CONFIG_KSU_MANUAL_HOOK a été rejeté par olddefconfig !"
+    echo "Configuration KSU actuelle :"
+    grep "CONFIG_KSU" out/.config || true
+    echo "Vérifiez si FinaSU Kconfig contient bien KSU_MANUAL_HOOK ou si une dépendance manque."
+    exit 1
+fi
+if ! grep -q "^CONFIG_KSU_SUSFS=y" out/.config; then
+    echo "❌ CONFIG_KSU_SUSFS a été rejeté !"
+    exit 1
+fi
 
 # ==================== 6. MOTOROLA ====================
 sed -i 's/if (!check_version(/if (0 \&\& !check_version(/g' kernel/module.c
