@@ -13,7 +13,7 @@ VER="finasu-A"
 KSU_REF="$FINASU_REF"
 KSUD_FALLBACK_REF="${KSUD_FALLBACK_REF:-v3.4.2}"
 
-echo "=== Build FinaSU ($FINASU_REF) — 4.19 + SuSFS + SUSFS_INLINE + PREINIT ==="
+echo "=== Build FinaSU ($FINASU_REF) — 4.19 + SuSFS + SUSFS_INLINE + hooks ==="
 df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
@@ -33,15 +33,15 @@ summarize() {
     local SUM="$GITHUB_WORKSPACE/output/build-summary.txt"
     {
         echo "=== RÉSUMÉ DU BUILD (code de sortie $rc) ==="
-        echo "########## SPEC / DEFINITIONS DES POINTS D'ENTREE ##########"
-        head -n 400 "$SPEC" 2>/dev/null || echo "(spec absente)"
+        echo "########## SPEC / SYMBOLES / SOURCES ##########"
+        head -n 300 "$SPEC" 2>/dev/null || echo "(spec absente)"
         echo ""
         if [ -f "$BL" ]; then
             echo "########## HOOK-SITES MANQUANTS ##########"
             grep -nE "SUSFS Inline:|hook-site check" "$BL" | head -30
             echo ""
             echo "########## AUTRES ANOMALIES ##########"
-            grep -nE "error:|undefined symbol|fatal error|Error [0-9]+|No rule to make target|\*\*\*|Stop\.|unknown type name|UAPI headers" "$BL" | tail -40
+            grep -nE "error:|undefined symbol|fatal error|Error [0-9]+|No rule to make target|\*\*\*|Stop\.|unknown type name|UAPI headers|conflicting" "$BL" | tail -45
             echo ""
             echo "########## 30 DERNIÈRES LIGNES DE build.log ##########"
             tail -n 30 "$BL"
@@ -214,23 +214,46 @@ KSU_DIR="drivers/kernelsu"
 KSU_REPO_ROOT="$GITHUB_WORKSPACE/kernel_sources/FinaSU"
 echo "✅ FinaSU intégré"
 
-# ==================== 2f. DEFINITIONS DES POINTS D'ENTREE ====================
+# ==================== 2g. HOOKS INLINE (JackA1ltman) ====================
+HOOK_SH="$GITHUB_WORKSPACE/patches/susfs_inline_hook_patches.sh"
+curl -fsSL "https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/susfs_inline_hook_patches.sh" \
+     -o "$HOOK_SH"
+# On retire security/selinux/hooks.c : non requis par le validateur, et conflit u:r:su:s0 vs u:r:ksu:s0
+sed -i '/^    security\/selinux\/hooks\.c$/d' "$HOOK_SH"
+
+echo "=== Application des hooks inline ===" | tee -a "$AUDIT"
+set +e
+bash "$HOOK_SH" 2>&1 | tee -a "$AUDIT"
+set -e
+
+# Correctif : FinaSU définit ksu_handle_sys_read en void, pas en int
+sed -i 's/extern __attribute__((cold)) int ksu_handle_sys_read(unsigned int fd);/extern __attribute__((cold)) void ksu_handle_sys_read(unsigned int fd);/' fs/read_write.c
+
+# Vérification des symboles attendus par les externs du script + sources pour les 2 hooks preinit
 set +e
 {
-  for f in ksu_handle_input_handle_event ksu_handle_execveat ksu_handle_execveat_sucompat \
-           ksu_handle_post_execveat_sucompat ksu_handle_faccessat ksu_handle_sys_read \
-           ksu_handle_stat ksu_handle_vfs_fstat ksu_handle_sys_reboot ; do
-    echo "===== $f : definition ====="
-    grep -rnE -B2 -A8 "^(long|int|void|bool|static)[^;]*${f}\(" FinaSU/kernel --include=*.c 2>/dev/null | head -22
-    echo "----- occurrences -----"
-    grep -rn "${f}" FinaSU/kernel --include=*.c 2>/dev/null | head -5
-    echo
+  echo "=== Symboles requis par les hooks : existent-ils dans FinaSU ? ==="
+  for s in __ksu_is_allow_uid_for_current ksu_is_init_rc_hook_enabled \
+           ksu_is_input_hook_enabled ksu_su_compat_enabled ; do
+    echo "--- $s ---"
+    grep -rn "$s" FinaSU/kernel --include=*.c --include=*.h 2>/dev/null | head -4 \
+      || echo "  ⚠️ INTROUVABLE"
   done
-  echo "########## include/ksu.h ##########"
-  cat FinaSU/kernel/include/ksu.h 2>/dev/null
+  echo
+  echo "=== preinit/preinit.h (complet) ==="
+  cat FinaSU/kernel/preinit/preinit.h 2>/dev/null
+  echo
+  echo "=== fs/exec.c : do_execveat_common après patch ==="
+  ln=$(grep -nE '^static int do_execveat_common|^static int __do_execve_file' fs/exec.c | head -1 | cut -d: -f1)
+  [ -n "$ln" ] && sed -n "${ln},$((ln+95))p" fs/exec.c
 } > "$SPEC" 2>&1
 set -e
-echo "📋 Définitions des points d'entrée écrites" | tee -a "$AUDIT"
+
+# VERDICT IMMÉDIAT du validateur, sans attendre la compilation
+echo "=== VERDICT check_susfs_inline.sh ===" | tee -a "$AUDIT"
+set +e
+sh FinaSU/kernel/tools/check_susfs_inline.sh "$PWD" 2>&1 | tee -a "$AUDIT"
+set -e
 
 # ==================== 3. SIGNATURE MANAGER ====================
 MGR_APK="$GITHUB_WORKSPACE/patches/manager.apk"
@@ -1210,14 +1233,6 @@ fi
 
 mkdir -p out
 
-{
-  echo "=== Points d'entrée KSU inline présents dans le noyau ? ==="
-  grep -n "ksu_handle\|ksu_setup_preinit\|ksu_preinit_handle" \
-      kernel/sys.c fs/exec.c fs/read_write.c fs/stat.c fs/open.c kernel/reboot.c drivers/input/input.c 2>/dev/null \
-      | head -40 || echo "AUCUN (patch d'intégration inline à écrire)"
-  echo "=== Fin diagnostic inline ==="
-} | tee -a "$AUDIT"
-
 make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 vendor/lito-perf_defconfig
 
 cd out
@@ -1268,7 +1283,7 @@ if ! grep -q "^CONFIG_KSU_HOOK_SUSFS_INLINE=y" out/.config; then
 fi
 echo "✅ Backend actif : KSU_HOOK_SUSFS_INLINE" | tee -a "$AUDIT"
 
-# UAPI headers : requis par le preinit runner (Kbuild teste out/usr/include/linux/unistd.h)
+# UAPI headers : requis par le preinit runner
 echo "=== Installation des UAPI headers (preinit) ==="
 make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 headers_install 2>&1 | tail -5
 if [ -f out/usr/include/linux/unistd.h ]; then
