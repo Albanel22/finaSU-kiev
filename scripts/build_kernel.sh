@@ -294,6 +294,39 @@ grep -rl "anon_inode_getfile" "$KSU_DIR/" 2>/dev/null | while read -r f; do
     sed -i 's/O_RDWR | O_CLOEXEC/O_RDWR/g; s/O_RDWR|O_CLOEXEC/O_RDWR/g; s/, O_CLOEXEC)/)/g' "$f"
 done || true
 
+# ==================== 3i. EXPORT SYMBOLES SELINUX POUR 4.19 ====================
+# En 4.19, ces symboles existent mais ne sont pas exportés.
+# On doit les exporter manuellement pour que FinaSU puisse y accéder.
+echo "=== Export des symboles SELinux pour 4.19 ==="
+
+# Exporter selinux_status_lock et selinux_status_page depuis status.c
+if [ -f "security/selinux/ss/status.c" ]; then
+    if ! grep -q "EXPORT_SYMBOL(selinux_status_lock)" security/selinux/ss/status.c; then
+        echo "" >> security/selinux/ss/status.c
+        echo "EXPORT_SYMBOL(selinux_status_lock);" >> security/selinux/ss/status.c
+        echo "EXPORT_SYMBOL(selinux_status_page);" >> security/selinux/ss/status.c
+        echo "✅ selinux_status_lock et selinux_status_page exportés"
+    fi
+fi
+
+# Exporter selinux_ss depuis hooks.c
+if [ -f "security/selinux/hooks.c" ]; then
+    if ! grep -q "EXPORT_SYMBOL(selinux_ss)" security/selinux/hooks.c; then
+        echo "" >> security/selinux/hooks.c
+        echo "EXPORT_SYMBOL(selinux_ss);" >> security/selinux/hooks.c
+        echo "✅ selinux_ss exporté"
+    fi
+fi
+
+# Exporter selinux_avc depuis avc.c
+if [ -f "security/selinux/avc.c" ]; then
+    if ! grep -q "EXPORT_SYMBOL(selinux_avc)" security/selinux/avc.c; then
+        echo "" >> security/selinux/avc.c
+        echo "EXPORT_SYMBOL(selinux_avc);" >> security/selinux/avc.c
+        echo "✅ selinux_avc exporté"
+    fi
+fi
+
 # ==================== 4a. rules.c dual-path ====================
 # CORRECTION 2 : Utilisation des vraies globales 4.19 (selinux_ss, selinux_avc)
 # au lieu de selinux_state.ss qui n'existe qu'à partir de 5.x
