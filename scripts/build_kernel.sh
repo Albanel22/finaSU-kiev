@@ -38,6 +38,7 @@ from collections import Counter
 txt = open(sys.argv[1], encoding='utf-8', errors='replace').read().split('\n')
 err = re.compile(r'^(?:\.\./)*(\S+?):(\d+):(\d+): (?:fatal )?error: (.*)$')
 per_file, per_msg, first_loc = Counter(), Counter(), {}
+undef = Counter()
 for l in txt:
     m = err.match(l.strip())
     if m:
@@ -46,12 +47,20 @@ for l in txt:
         key = re.sub(r"\s*\[-W[^\]]*\]", "", msg)[:110]
         per_msg[key] += 1
         first_loc.setdefault(key, f"{f}:{ln}")
+    u = re.search(r'undefined symbol:\s*(\S+)', l)
+    if u: undef[u.group(1)] += 1
 print(f"erreurs : {sum(per_file.values())}   fichiers : {len(per_file)}")
 for f, n in per_file.most_common(25): print(f"{n:4d}  {f}")
 print()
 for k, n in per_msg.most_common(25): print(f"{n:4d}  {k}   [{first_loc[k]}]")
+if undef:
+    print("\n-- Symboles non définis --")
+    for k, n in undef.most_common(30): print(f"{n:4d}  {k}")
 SUMEOF
         fi
+        echo ""
+        echo "=== 40 DERNIÈRES LIGNES DE L'AUDIT ==="
+        tail -n 40 "$AUDIT" 2>/dev/null
     } > "$SUM" 2>&1
     cat "$SUM"
     [ -n "${GITHUB_STEP_SUMMARY:-}" ] && { echo '```'; cat "$SUM"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
@@ -172,35 +181,30 @@ fi
 echo "✅ Patch SUSFS 4.19 appliqué" | tee -a "$AUDIT"
 
 # ==================== 1b. STUBS path_mount/path_umount pour 4.19 ====================
-# CORRECTION 1 : Remplacement du backport complexe par des stubs simples
-# Le backport 5.9→4.19 échouait à cause d'API internes incompatibles.
-# Les stubs satisfont l'éditeur de liens sans exécuter de code dangereux,
-# car kernel_umount.c est déjà stubé pour 4.19 (fonctionnalité désactivée).
+# Le backport 5.9→4.19 est incompatible (security_sb_mount, IS_MNT_BUSY, umount_mnt...).
+# kernel_umount.c et su_mount_ns.c sont stubés => ces fonctions ne sont jamais appelées.
 if grep -q "finasu_backport_path_mount_419" fs/namespace.c 2>/dev/null; then
     sed -i '/\/\* === finasu_backport_path_mount_419/,/\/\* < 5.9 \*\//d' fs/namespace.c
 fi
-
 if ! grep -q "finasu_stub_path_mount_419" fs/namespace.c; then
 cat >> fs/namespace.c <<'NS419'
 
-/* === finasu_stub_path_mount_419 : stubs pour éviter les erreurs de backport complexe === */
+/* === finasu_stub_path_mount_419 : API 5.9 absente de 4.19, appelants désactivés === */
 #include <linux/version.h>
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
 
 int path_umount(struct path *path, int flags)
 {
-    pr_info("path_umount stubbed for 4.19\n");
+    pr_info("path_umount: no-op (4.19, caller disabled)\n");
     return 0;
 }
-EXPORT_SYMBOL(path_umount);
 
 int path_mount(const char *dev_name, struct path *path,
                unsigned long flags, void *data)
 {
-    pr_info("path_mount stubbed for 4.19\n");
+    pr_info("path_mount: no-op (4.19, caller disabled)\n");
     return 0;
 }
-EXPORT_SYMBOL(path_mount);
 
 #endif /* < 5.9 */
 NS419
@@ -224,6 +228,22 @@ fi
 KSU_DIR="drivers/kernelsu"
 KSU_REPO_ROOT="$GITHUB_WORKSPACE/kernel_sources/FinaSU"
 echo "✅ FinaSU intégré"
+
+# ==================== 2c. DIAGNOSTIC LAYOUT SELINUX (vérité terrain) ====================
+echo "=== Diagnostic layout SELinux du noyau ===" | tee -a "$AUDIT"
+{
+  echo "--- struct selinux_state (security/selinux/include/security.h) ---"
+  sed -n '/^struct selinux_state[[:space:]]*{/,/^};/p' security/selinux/include/security.h 2>/dev/null || echo "(absent)"
+  echo "--- struct selinux_ss (security/selinux/ss/services.h) ---"
+  sed -n '/^struct selinux_ss[[:space:]]*{/,/^};/p' security/selinux/ss/services.h 2>/dev/null || echo "(absent)"
+  echo "--- struct selinux_avc (security/selinux/include/avc.h) ---"
+  sed -n '/^struct selinux_avc[[:space:]]*{/,/^};/p' security/selinux/include/avc.h 2>/dev/null || echo "(absent)"
+  echo "--- symboles status dans security/selinux/ ---"
+  grep -rn "status_lock\|status_page" security/selinux/ 2>/dev/null | head -40 || echo "(aucun)"
+  echo "--- globals selinux_state / selinux_ss / selinux_avc ---"
+  grep -rn "^struct selinux_state selinux_state\|^static struct selinux_ss\|^struct selinux_ss \|^static struct selinux_avc\|^struct selinux_avc " security/selinux/ 2>/dev/null | head -20 || echo "(aucun)"
+} >> "$AUDIT" 2>&1
+echo "  📋 layout dumpé dans audit-${VER}.txt"
 
 # ==================== 3. SIGNATURE MANAGER ====================
 MGR_APK="$GITHUB_WORKSPACE/patches/manager.apk"
@@ -264,26 +284,26 @@ fi
 SIG_ARGS=""
 if [ -n "$FINASU_EXPECTED_SIZE" ] && [ -n "$FINASU_EXPECTED_HASH" ]; then
     SIG_ARGS="KSU_EXPECTED_SIZE=$FINASU_EXPECTED_SIZE KSU_EXPECTED_HASH=$FINASU_EXPECTED_HASH"
-    echo "✅ Signature manager OK ($FINASU_EXPECTED_SIZE)"
+    echo "✅ Signature manager OK ($FINASU_EXPECTED_SIZE / $FINASU_EXPECTED_HASH)" | tee -a "$AUDIT"
 else
-    echo "⚠️ AUCUNE signature de manager fournie"
+    echo "⚠️ AUCUNE signature de manager fournie — le manager ne sera PAS reconnu" | tee -a "$AUDIT"
 fi
 
-# ==================== 3g/3h. EXPORTS + O_CLOEXEC ====================
+# ==================== 3g/3h. RETRAIT DES 'static' + O_CLOEXEC ====================
+# NOTE : FinaSU est built-in (obj-y). EXPORT_SYMBOL est inutile ici.
+# Seul compte le fait qu'un symbole ne soit pas 'static' s'il est référencé depuis un autre fichier.
+# On ne touche PAS à hooks.c pour selinux_ss : ce symbole n'existe pas comme globale.
 [ -f "security/selinux/selinuxfs.c" ] && {
     sed -i 's/^static ssize_t (\*write_op\[\])/ssize_t (*write_op[])/' security/selinux/selinuxfs.c
     sed -i 's/^static const struct file_operations sel_handle_status_ops/const struct file_operations sel_handle_status_ops/' security/selinux/selinuxfs.c
     sed -i 's/^static DEFINE_MUTEX(sel_mutex)/DEFINE_MUTEX(sel_mutex)/' security/selinux/selinuxfs.c
 }
-
-# CORRECTION : sed plus tolérant pour retirer le 'static' de status_lock et status_page
-[ -f "security/selinux/ss/status.c" ] && {
-    # Retirer 'static' de selinux_status_page (tolérant aux espaces)
-    sed -i -E 's/^static[[:space:]]+(struct page[[:space:]]*\*[[:space:]]*selinux_status_page)/\1/' security/selinux/ss/status.c
-    # Retirer 'static' de selinux_status_lock (tolérant aux espaces)
-    sed -i -E 's/^static[[:space:]]+(DEFINE_MUTEX\(selinux_status_lock\))/\1/' security/selinux/ss/status.c
-}
-
+# Retrait tolérant du 'static' si jamais ces globales existent (sinon no-op)
+for f in security/selinux/ss/status.c security/selinux/selinuxfs.c security/selinux/status.c; do
+    [ -f "$f" ] || continue
+    sed -i -E 's/^static[[:space:]]+(struct page[[:space:]]*\*[[:space:]]*selinux_status_page)/\1/' "$f"
+    sed -i -E 's/^static[[:space:]]+(DEFINE_MUTEX\(selinux_status_lock\))/\1/' "$f"
+done
 [ -f "security/selinux/ss/services.c" ] && sed -i 's/^static DEFINE_RWLOCK(policy_rwlock)/DEFINE_RWLOCK(policy_rwlock)/' security/selinux/ss/services.c
 [ -f "security/selinux/hooks.c" ] && sed -i 's/^static struct security_operations selinux_ops/struct security_operations selinux_ops/' security/selinux/hooks.c
 
@@ -293,44 +313,11 @@ done || true
 grep -rl "anon_inode_getfile" "$KSU_DIR/" 2>/dev/null | while read -r f; do
     sed -i 's/O_RDWR | O_CLOEXEC/O_RDWR/g; s/O_RDWR|O_CLOEXEC/O_RDWR/g; s/, O_CLOEXEC)/)/g' "$f"
 done || true
-
-# ==================== 3i. EXPORT SYMBOLES SELINUX POUR 4.19 ====================
-# En 4.19, ces symboles existent mais ne sont pas exportés.
-# On doit les exporter manuellement pour que FinaSU puisse y accéder.
-echo "=== Export des symboles SELinux pour 4.19 ==="
-
-# Exporter selinux_status_lock et selinux_status_page depuis status.c
-if [ -f "security/selinux/ss/status.c" ]; then
-    if ! grep -q "EXPORT_SYMBOL(selinux_status_lock)" security/selinux/ss/status.c; then
-        echo "" >> security/selinux/ss/status.c
-        echo "EXPORT_SYMBOL(selinux_status_lock);" >> security/selinux/ss/status.c
-        echo "EXPORT_SYMBOL(selinux_status_page);" >> security/selinux/ss/status.c
-        echo "✅ selinux_status_lock et selinux_status_page exportés"
-    fi
-fi
-
-# Exporter selinux_ss depuis hooks.c
-if [ -f "security/selinux/hooks.c" ]; then
-    if ! grep -q "EXPORT_SYMBOL(selinux_ss)" security/selinux/hooks.c; then
-        echo "" >> security/selinux/hooks.c
-        echo "EXPORT_SYMBOL(selinux_ss);" >> security/selinux/hooks.c
-        echo "✅ selinux_ss exporté"
-    fi
-fi
-
-# Exporter selinux_avc depuis avc.c
-if [ -f "security/selinux/avc.c" ]; then
-    if ! grep -q "EXPORT_SYMBOL(selinux_avc)" security/selinux/avc.c; then
-        echo "" >> security/selinux/avc.c
-        echo "EXPORT_SYMBOL(selinux_avc);" >> security/selinux/avc.c
-        echo "✅ selinux_avc exporté"
-    fi
-fi
+echo "✅ Retraits de 'static' appliqués (aucun EXPORT_SYMBOL ajouté)" | tee -a "$AUDIT"
 
 # ==================== 4a. rules.c dual-path ====================
-# CORRECTION 2 : Utilisation des vraies globales 4.19 (selinux_ss, selinux_avc)
-# au lieu de selinux_state.ss qui n'existe qu'à partir de 5.x
-echo "=== Réécriture rules.c dual-path (4.19: selinux_ss.policydb) ==="
+# 4.19 : selinux_state.ss->policydb / selinux_state.avc  (PROUVÉ par les logs : compilait)
+echo "=== Réécriture rules.c dual-path (4.19: selinux_state.ss->policydb) ==="
 cat > "$KSU_DIR/selinux/rules.c" << 'RULESEOF'
 #include "linux/rcupdate.h"
 #include "security.h"
@@ -502,81 +489,87 @@ static int apply_one_sepolicy_cmd(struct policydb *db, const struct sepol_data *
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 
-/* 4.19 : selinux_ss et selinux_avc sont des globales directes */
-extern struct selinux_ss selinux_ss;
-extern struct selinux_avc selinux_avc;
+/* ===== 4.19 : policydb via selinux_state.ss, avc via selinux_state.avc ===== */
 extern int avc_ss_reset(struct selinux_avc *avc, u32 seqno);
+
+#define KSU_DB419   (&selinux_state.ss->policydb)
+#define KSU_LOCK419 write_lock(&selinux_state.ss->policy_rwlock)
+#define KSU_UNLOCK419 write_unlock(&selinux_state.ss->policy_rwlock)
 
 static void reset_avc_cache_419(void)
 {
-    avc_ss_reset(&selinux_avc, 0);
+    if (selinux_state.avc)
+        avc_ss_reset(selinux_state.avc, 0);
     selnl_notify_policyload(0);
     selinux_xfrm_notify_policyload();
 }
 
 void apply_kernelsu_rules(void)
 {
+    struct policydb *db;
+
     if (!getenforce())
-        pr_info("SELinux permissive or disabled, apply rules! (old kernel path)\n");
+        pr_info("SELinux permissive or disabled, apply rules! (4.19 path)\n");
 
-    write_lock(&selinux_ss.policy_rwlock);
+    KSU_LOCK419;
+    db = KSU_DB419;
 
-    ksu_type(&selinux_ss.policydb, KERNEL_SU_DOMAIN, "domain");
-    ksu_permissive(&selinux_ss.policydb, KERNEL_SU_DOMAIN);
-    ksu_typeattribute(&selinux_ss.policydb, KERNEL_SU_DOMAIN, "mlstrustedsubject");
-    ksu_typeattribute(&selinux_ss.policydb, KERNEL_SU_DOMAIN, "netdomain");
-    ksu_typeattribute(&selinux_ss.policydb, KERNEL_SU_DOMAIN, "bluetoothdomain");
+    ksu_type(db, KERNEL_SU_DOMAIN, "domain");
+    ksu_permissive(db, KERNEL_SU_DOMAIN);
+    ksu_typeattribute(db, KERNEL_SU_DOMAIN, "mlstrustedsubject");
+    ksu_typeattribute(db, KERNEL_SU_DOMAIN, "netdomain");
+    ksu_typeattribute(db, KERNEL_SU_DOMAIN, "bluetoothdomain");
 
-    ksu_type(&selinux_ss.policydb, KERNEL_SU_FILE, "file_type");
-    ksu_typeattribute(&selinux_ss.policydb, KERNEL_SU_FILE, "mlstrustedobject");
-    ksu_allow(&selinux_ss.policydb, "domain", KERNEL_SU_FILE, ALL, ALL);
-    ksu_allow(&selinux_ss.policydb, KERNEL_SU_DOMAIN, ALL, ALL, ALL);
+    ksu_type(db, KERNEL_SU_FILE, "file_type");
+    ksu_typeattribute(db, KERNEL_SU_FILE, "mlstrustedobject");
+    ksu_allow(db, "domain", KERNEL_SU_FILE, ALL, ALL);
+    ksu_allow(db, KERNEL_SU_DOMAIN, ALL, ALL, ALL);
 
-    if (selinux_ss.policydb.policyvers >= POLICYDB_VERSION_XPERMS_IOCTL) {
-        ksu_allowxperm(&selinux_ss.policydb, KERNEL_SU_DOMAIN, ALL, "blk_file", ALL);
-        ksu_allowxperm(&selinux_ss.policydb, KERNEL_SU_DOMAIN, ALL, "fifo_file", ALL);
-        ksu_allowxperm(&selinux_ss.policydb, KERNEL_SU_DOMAIN, ALL, "chr_file", ALL);
-        ksu_allowxperm(&selinux_ss.policydb, KERNEL_SU_DOMAIN, ALL, "file", ALL);
+    if (db->policyvers >= POLICYDB_VERSION_XPERMS_IOCTL) {
+        ksu_allowxperm(db, KERNEL_SU_DOMAIN, ALL, "blk_file", ALL);
+        ksu_allowxperm(db, KERNEL_SU_DOMAIN, ALL, "fifo_file", ALL);
+        ksu_allowxperm(db, KERNEL_SU_DOMAIN, ALL, "chr_file", ALL);
+        ksu_allowxperm(db, KERNEL_SU_DOMAIN, ALL, "file", ALL);
     }
 
-    ksu_allow(&selinux_ss.policydb, "init", KERNEL_SU_DOMAIN, ALL, ALL);
-    ksu_allow(&selinux_ss.policydb, "servicemanager", KERNEL_SU_DOMAIN, "dir", "search");
-    ksu_allow(&selinux_ss.policydb, "servicemanager", KERNEL_SU_DOMAIN, "dir", "read");
-    ksu_allow(&selinux_ss.policydb, "servicemanager", KERNEL_SU_DOMAIN, "file", "open");
-    ksu_allow(&selinux_ss.policydb, "servicemanager", KERNEL_SU_DOMAIN, "file", "read");
-    ksu_allow(&selinux_ss.policydb, "servicemanager", KERNEL_SU_DOMAIN, "process", "getattr");
-    ksu_allow(&selinux_ss.policydb, "domain", KERNEL_SU_DOMAIN, "process", "sigchld");
-    ksu_allow(&selinux_ss.policydb, "logd", KERNEL_SU_DOMAIN, "dir", "search");
-    ksu_allow(&selinux_ss.policydb, "logd", KERNEL_SU_DOMAIN, "file", "read");
-    ksu_allow(&selinux_ss.policydb, "logd", KERNEL_SU_DOMAIN, "file", "open");
-    ksu_allow(&selinux_ss.policydb, "logd", KERNEL_SU_DOMAIN, "file", "getattr");
-    ksu_allow(&selinux_ss.policydb, "domain", KERNEL_SU_DOMAIN, "fd", "use");
-    ksu_allow(&selinux_ss.policydb, "domain", KERNEL_SU_DOMAIN, "fifo_file", "write");
-    ksu_allow(&selinux_ss.policydb, "domain", KERNEL_SU_DOMAIN, "fifo_file", "read");
-    ksu_allow(&selinux_ss.policydb, "domain", KERNEL_SU_DOMAIN, "fifo_file", "open");
-    ksu_allow(&selinux_ss.policydb, "domain", KERNEL_SU_DOMAIN, "fifo_file", "getattr");
-    ksu_allow(&selinux_ss.policydb, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "read");
-    ksu_allow(&selinux_ss.policydb, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "write");
-    ksu_allow(&selinux_ss.policydb, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "connectto");
-    ksu_allow(&selinux_ss.policydb, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "getopt");
-    ksu_allow(&selinux_ss.policydb, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "getattr");
-    ksu_allow(&selinux_ss.policydb, "domain", KERNEL_SU_DOMAIN, "memfd_file", "execute");
-    ksu_allow(&selinux_ss.policydb, "domain", KERNEL_SU_DOMAIN, "memfd_file", "getattr");
-    ksu_allow(&selinux_ss.policydb, "domain", KERNEL_SU_DOMAIN, "memfd_file", "map");
-    ksu_allow(&selinux_ss.policydb, "domain", KERNEL_SU_DOMAIN, "memfd_file", "read");
-    ksu_allow(&selinux_ss.policydb, "domain", KERNEL_SU_DOMAIN, "memfd_file", "write");
-    ksu_allow(&selinux_ss.policydb, "hwservicemanager", KERNEL_SU_DOMAIN, "dir", "search");
-    ksu_allow(&selinux_ss.policydb, "hwservicemanager", KERNEL_SU_DOMAIN, "file", "read");
-    ksu_allow(&selinux_ss.policydb, "hwservicemanager", KERNEL_SU_DOMAIN, "file", "open");
-    ksu_allow(&selinux_ss.policydb, "hwservicemanager", KERNEL_SU_DOMAIN, "process", "getattr");
-    ksu_allow(&selinux_ss.policydb, "domain", KERNEL_SU_DOMAIN, "binder", ALL);
-    ksu_allow(&selinux_ss.policydb, "system_server", KERNEL_SU_DOMAIN, "process", "getpgid");
-    ksu_allow(&selinux_ss.policydb, "system_server", KERNEL_SU_DOMAIN, "process", "sigkill");
+    ksu_allow(db, "init", KERNEL_SU_DOMAIN, ALL, ALL);
+    ksu_allow(db, "servicemanager", KERNEL_SU_DOMAIN, "dir", "search");
+    ksu_allow(db, "servicemanager", KERNEL_SU_DOMAIN, "dir", "read");
+    ksu_allow(db, "servicemanager", KERNEL_SU_DOMAIN, "file", "open");
+    ksu_allow(db, "servicemanager", KERNEL_SU_DOMAIN, "file", "read");
+    ksu_allow(db, "servicemanager", KERNEL_SU_DOMAIN, "process", "getattr");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "process", "sigchld");
+    ksu_allow(db, "logd", KERNEL_SU_DOMAIN, "dir", "search");
+    ksu_allow(db, "logd", KERNEL_SU_DOMAIN, "file", "read");
+    ksu_allow(db, "logd", KERNEL_SU_DOMAIN, "file", "open");
+    ksu_allow(db, "logd", KERNEL_SU_DOMAIN, "file", "getattr");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "fd", "use");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "fifo_file", "write");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "fifo_file", "read");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "fifo_file", "open");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "fifo_file", "getattr");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "read");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "write");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "connectto");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "getopt");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "getattr");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "memfd_file", "execute");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "memfd_file", "getattr");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "memfd_file", "map");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "memfd_file", "read");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "memfd_file", "write");
+    ksu_allow(db, "hwservicemanager", KERNEL_SU_DOMAIN, "dir", "search");
+    ksu_allow(db, "hwservicemanager", KERNEL_SU_DOMAIN, "file", "read");
+    ksu_allow(db, "hwservicemanager", KERNEL_SU_DOMAIN, "file", "open");
+    ksu_allow(db, "hwservicemanager", KERNEL_SU_DOMAIN, "process", "getattr");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "binder", ALL);
+    ksu_allow(db, "system_server", KERNEL_SU_DOMAIN, "process", "getpgid");
+    ksu_allow(db, "system_server", KERNEL_SU_DOMAIN, "process", "sigkill");
 #ifdef CONFIG_KSU_SUSFS
-    ksu_allow(&selinux_ss.policydb, "zygote", "labeledfs", "filesystem", "unmount");
+    ksu_allow(db, "zygote", "labeledfs", "filesystem", "unmount");
 #endif
 
-    write_unlock(&selinux_ss.policy_rwlock);
+    KSU_UNLOCK419;
 
     reset_avc_cache_419();
 #ifdef CONFIG_KSU_SUSFS
@@ -603,7 +596,7 @@ int handle_sepolicy(void __user *user_data, u64 data_len)
     if (!getenforce())
         pr_info("SELinux permissive or disabled when handle policy!\n");
 
-    write_lock(&selinux_ss.policy_rwlock);
+    KSU_LOCK419;
     cursor.cur = payload;
     cursor.end = payload + (size_t)data_len;
     ret = 0;
@@ -623,12 +616,12 @@ int handle_sepolicy(void __user *user_data, u64 data_len)
             if (ret < 0) break;
         }
         if (ret < 0) break;
-        ret = apply_one_sepolicy_cmd(&selinux_ss.policydb, &header, args);
+        ret = apply_one_sepolicy_cmd(KSU_DB419, &header, args);
         if (ret < 0) pr_err("sepol: cmd #%u failed cmd=%u subcmd=%u\n", cmd_index, header.cmd, header.subcmd);
         else success_cmd_count++;
         cmd_index++;
     }
-    write_unlock(&selinux_ss.policy_rwlock);
+    KSU_UNLOCK419;
     reset_avc_cache_419();
 #ifdef CONFIG_KSU_SUSFS
     susfs_set_batch_sid();
@@ -861,10 +854,10 @@ out_free:
 
 #endif /* LINUX_VERSION_CODE >= 5.10.0 */
 RULESEOF
-echo "  ✅ rules.c dual-path réinstallé (API 4.19 correcte)"
+echo "  ✅ rules.c dual-path réinstallé (selinux_state.ss / selinux_state.avc)" | tee -a "$AUDIT"
 
-# ==================== 4b. COMPATIBILITÉ 4.19 (11 fixes) ====================
-echo "=== Correctifs ciblés 4.19 (11 fixes) ==="
+# ==================== 4b. COMPATIBILITÉ 4.19 ====================
+echo "=== Correctifs ciblés 4.19 ==="
 python3 - "$GITHUB_WORKSPACE" <<'FIXEOF' 2>&1 | tee -a "$AUDIT"
 import os, sys, re
 
@@ -904,31 +897,29 @@ if os.path.isfile(p):
             insert = '\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif // CONFIG_KSU_SUSFS_SUS_KSTAT'
             c = c[:eol] + insert + c[eol:]
             write(p, c); total += 1
-            print(f"  ✅ fs/stat.c: include susfs_def.h")
+            print("  ✅ fs/stat.c: include susfs_def.h")
 
 # --- FIX 2 : MODULE_IMPORT_NS ---
-if os.path.isdir(ksu_root):
-    for dp, dn, fn in os.walk(ksu_root):
-        for f in fn:
-            if not f.endswith(('.c', '.h')): continue
-            p = os.path.join(dp, f)
-            try: c = read(p)
-            except Exception: continue
-            if 'MODULE_IMPORT_NS' not in c: continue
-            lines = c.split('\n'); out = []; changed = False
-            for ln in lines:
-                s = ln.strip()
-                if s.startswith('MODULE_IMPORT_NS(') and s.endswith(');'):
-                    prev = out[-1].strip() if out else ''
-                    if prev != '#ifdef MODULE_IMPORT_NS':
-                        out.append('#ifdef MODULE_IMPORT_NS')
-                        out.append(ln)
-                        out.append('#endif')
-                        changed = True; continue
-                out.append(ln)
-            if changed:
-                write(p, '\n'.join(out)); total += 1
-                print(f"  ✅ {os.path.relpath(p, GW)}: MODULE_IMPORT_NS")
+for dp, dn, fn in os.walk(ksu_root):
+    for f in fn:
+        if not f.endswith(('.c', '.h')): continue
+        p = os.path.join(dp, f)
+        c = read(p)
+        if 'MODULE_IMPORT_NS' not in c: continue
+        lines = c.split('\n'); out = []; changed = False
+        for ln in lines:
+            s = ln.strip()
+            if s.startswith('MODULE_IMPORT_NS(') and s.endswith(');'):
+                prev = out[-1].strip() if out else ''
+                if prev != '#ifdef MODULE_IMPORT_NS':
+                    out.append('#ifdef MODULE_IMPORT_NS')
+                    out.append(ln)
+                    out.append('#endif')
+                    changed = True; continue
+            out.append(ln)
+        if changed:
+            write(p, '\n'.join(out)); total += 1
+            print(f"  ✅ {os.path.relpath(p, GW)}: MODULE_IMPORT_NS")
 
 # --- FIX 3 : file_wrapper.c ---
 p = os.path.join(ksu_root, "infra/file_wrapper.c")
@@ -965,7 +956,7 @@ if os.path.isfile(p):
         c = c.replace(old, new, 1)
     if c != original:
         write(p, c); total += 1
-        print(f"  ✅ infra/file_wrapper.c: guards 4.19")
+        print("  ✅ infra/file_wrapper.c: guards 4.19")
 
 # --- FIX 4 : seccomp_cache.c ---
 p = os.path.join(ksu_root, "infra/seccomp_cache.c")
@@ -982,7 +973,7 @@ if os.path.isfile(p):
         if last_inc >= 0:
             lines.insert(last_inc + 1, compat)
             write(p, '\n'.join(lines)); total += 1
-            print(f"  ✅ infra/seccomp_cache.c: SECCOMP_ARCH_NATIVE_NR")
+            print("  ✅ infra/seccomp_cache.c: SECCOMP_ARCH_NATIVE_NR")
 
 # --- FIX 5 : su_mount_ns.c ---
 p = os.path.join(ksu_root, "infra/su_mount_ns.c")
@@ -994,7 +985,7 @@ if os.path.isfile(p):
             '#include <uapi/linux/mount.h>\n#else\n#include <linux/mount.h>\n#endif\n'
             '#define KSU_MOUNT_HDR_COMPAT 1')
         write(p, c); total += 1
-        print(f"  ✅ infra/su_mount_ns.c: uapi/linux/mount.h")
+        print("  ✅ infra/su_mount_ns.c: uapi/linux/mount.h")
 
 # --- FIX 6 : pkg_observer.c ---
 p = os.path.join(ksu_root, "manager/pkg_observer.c")
@@ -1164,35 +1155,33 @@ void __exit ksu_observer_exit(void)
 }
 '''
         write(p, new_c); total += 1
-        print(f"  ✅ manager/pkg_observer.c: réécrit 4.19")
+        print("  ✅ manager/pkg_observer.c: réécrit 4.19")
 
 # --- FIX 7 : TWA_RESUME + put_task_struct ---
-if os.path.isdir(ksu_root):
-    for dp, dn, fn in os.walk(ksu_root):
-        for f in fn:
-            if not f.endswith(('.c', '.h')): continue
-            p = os.path.join(dp, f)
-            try: c = read(p)
-            except Exception: continue
-            if not any(s in c for s in ('TWA_RESUME', 'put_task_struct')): continue
-            original = c
-            if 'TWA_RESUME' in c and '#ifndef TWA_RESUME' not in c:
-                twa = '\n#ifndef TWA_RESUME\n#define TWA_RESUME 0\n#endif\n'
-                c = ensure_inc_after_last(c, '<linux/version.h>')
-                lines = c.split('\n'); last_inc = -1
-                for i, ln in enumerate(lines):
-                    if ln.lstrip().startswith('#include'): last_inc = i
-                if last_inc >= 0:
-                    lines.insert(last_inc + 1, twa)
-                    c = '\n'.join(lines)
-                else:
-                    c = twa + c
-            if 'put_task_struct' in c:
-                c = ensure_inc_after_last(c, '<linux/sched.h>')
-                c = ensure_inc_after_last(c, '<linux/sched/task.h>')
-            if c != original:
-                write(p, c); total += 1
-                print(f"  ✅ {os.path.relpath(p, GW)}: TWA_RESUME + sched/task.h")
+for dp, dn, fn in os.walk(ksu_root):
+    for f in fn:
+        if not f.endswith(('.c', '.h')): continue
+        p = os.path.join(dp, f)
+        c = read(p)
+        if not any(s in c for s in ('TWA_RESUME', 'put_task_struct')): continue
+        original = c
+        if 'TWA_RESUME' in c and '#ifndef TWA_RESUME' not in c:
+            twa = '\n#ifndef TWA_RESUME\n#define TWA_RESUME 0\n#endif\n'
+            c = ensure_inc_after_last(c, '<linux/version.h>')
+            lines = c.split('\n'); last_inc = -1
+            for i, ln in enumerate(lines):
+                if ln.lstrip().startswith('#include'): last_inc = i
+            if last_inc >= 0:
+                lines.insert(last_inc + 1, twa)
+                c = '\n'.join(lines)
+            else:
+                c = twa + c
+        if 'put_task_struct' in c:
+            c = ensure_inc_after_last(c, '<linux/sched.h>')
+            c = ensure_inc_after_last(c, '<linux/sched/task.h>')
+        if c != original:
+            write(p, c); total += 1
+            print(f"  ✅ {os.path.relpath(p, GW)}: TWA_RESUME + sched/task.h")
 
 # --- FIX 8 : app_profile.c ---
 p = os.path.join(ksu_root, "policy/app_profile.c")
@@ -1214,7 +1203,7 @@ if os.path.isfile(p):
         c = c.replace(old, new, 1)
     if c != original:
         write(p, c); total += 1
-        print(f"  ✅ policy/app_profile.c: seccomp_filter_release backporté")
+        print("  ✅ policy/app_profile.c: seccomp_filter_release backporté")
 
 # --- FIX 9 : sepolicy.c ---
 p = os.path.join(ksu_root, "selinux/sepolicy.c")
@@ -1277,10 +1266,7 @@ out:
     return false;
 }
 #else
-/* API 4.19 : struct filename_trans = {stype, ttype, tclass, name}
- *             struct filename_trans_datum = {otype}
- *             db->filename_trans = hashtab*
- *             db->filename_trans_ttypes = ebitmap des ttypes */
+/* API 4.19 : struct filename_trans = {stype, ttype, tclass, name} */
 static bool add_filename_trans(struct policydb *db, const char *s, const char *t, const char *c, const char *d,
                                const char *o)
 {
@@ -1477,9 +1463,8 @@ static bool add_filename_trans(struct policydb *db, const char *s, const char *t
                  "    return ERR_PTR(ret);\n"
                  "}\n"
                  "#else\n"
-                 "/* 4.19: struct selinux_policy n'existe pas. Le policydb est\n"
-                 " * modifie en place sous write_lock(&selinux_ss.policy_rwlock)\n"
-                 " * dans rules.c. Ces fonctions ne sont jamais appelees sur 4.19. */\n"
+                 "/* 4.19: pas de struct selinux_policy. policydb modifie en place\n"
+                 " * sous write_lock(&selinux_state.ss->policy_rwlock) dans rules.c. */\n"
                  "void ksu_destroy_sepolicy(struct selinux_policy *pol) { (void)pol; }\n"
                  "struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)\n"
                  "{\n"
@@ -1487,69 +1472,111 @@ static bool add_filename_trans(struct policydb *db, const char *s, const char *t
                  "    return ERR_PTR(-EOPNOTSUPP);\n"
                  "}\n"
                  "#endif\n")
-    if old_close in c and '#else\n/* 4.19: struct selinux_policy n' not in c:
+    if old_close in c and '#else\n/* 4.19: pas de struct selinux_policy' not in c:
         c = c.replace(old_close, new_close, 1)
 
     if c != original:
         write(p, c); total += 1
-        print(f"  ✅ selinux/sepolicy.c: FIX 9 complet")
+        print("  ✅ selinux/sepolicy.c: FIX 9 complet")
 
-# --- FIX 10 v2 : minmax.h → kernel.h ---
-if os.path.isdir(ksu_root):
-    for dp, dn, fn in os.walk(ksu_root):
-        for f in fn:
-            if not f.endswith(('.c', '.h')): continue
-            p = os.path.join(dp, f)
-            try: c = read(p)
-            except Exception: continue
-            if '#include <linux/minmax.h>' not in c: continue
-            if 'KSU_MINMAX_COMPAT' in c: continue
-            c = c.replace(
-                '#include <linux/minmax.h>',
-                '/* KSU_MINMAX_COMPAT: kernel.h fournit min_t/max_t sur tous les kernels */\n'
-                '#include <linux/kernel.h>',
-                1)
+# --- FIX 10 : minmax.h -> kernel.h ---
+for dp, dn, fn in os.walk(ksu_root):
+    for f in fn:
+        if not f.endswith(('.c', '.h')): continue
+        p = os.path.join(dp, f)
+        c = read(p)
+        if '#include <linux/minmax.h>' not in c: continue
+        if 'KSU_MINMAX_COMPAT' in c: continue
+        c = c.replace(
+            '#include <linux/minmax.h>',
+            '/* KSU_MINMAX_COMPAT: kernel.h fournit min_t/max_t */\n'
+            '#include <linux/kernel.h>',
+            1)
+        write(p, c); total += 1
+        print(f"  ✅ {os.path.relpath(p, GW)}: minmax.h -> kernel.h")
+
+# --- FIX 11 : sched/signal.h + sched/task.h ---
+for dp, dn, fn in os.walk(ksu_root):
+    for f in fn:
+        if not f.endswith('.c'): continue
+        p = os.path.join(dp, f)
+        c = read(p)
+        if not any(s in c for s in ('tasklist_lock', 'init_task', 'task_pgrp', 'task_session')): continue
+        original = c
+        c = ensure_inc_after_last(c, '<linux/sched/signal.h>')
+        c = ensure_inc_after_last(c, '<linux/sched/task.h>')
+        if c != original:
             write(p, c); total += 1
-            print(f"  ✅ {os.path.relpath(p, GW)}: minmax.h → kernel.h")
+            print(f"  ✅ {os.path.relpath(p, GW)}: sched/signal.h + sched/task.h")
 
-# --- FIX 11 : sched/signal.h et sched/task.h ---
-if os.path.isdir(ksu_root):
-    for dp, dn, fn in os.walk(ksu_root):
-        for f in fn:
-            if not f.endswith('.c'): continue
-            p = os.path.join(dp, f)
-            try: c = read(p)
-            except Exception: continue
-            if not any(s in c for s in ('tasklist_lock', 'init_task', 'task_pgrp', 'task_session')): continue
-            original = c
-            c = ensure_inc_after_last(c, '<linux/sched/signal.h>')
-            c = ensure_inc_after_last(c, '<linux/sched/task.h>')
-            if c != original:
-                write(p, c); total += 1
-                print(f"  ✅ {os.path.relpath(p, GW)}: sched/signal.h + sched/task.h")
-
-# --- FIX 12 : selinux_hide.c dual-path 4.19 ---
-# CORRECTION 3 : Utilisation des vraies globales 4.19 (selinux_status_lock, selinux_status_page)
-# au lieu de selinux_state.ss->status_lock qui n'existe qu'à partir de 5.x
+# --- FIX 12 : selinux_hide.c — AUTO-DÉTECTION du layout status_lock/status_page ---
+# On ne devine plus : on lit les headers du noyau et on choisit l'expression exacte.
 p = os.path.join(ksu_root, "feature", "selinux_hide.c")
 if os.path.isfile(p):
     c = read(p); original = c
 
+    def safe_read(rel):
+        fp = os.path.join(kernel_root, rel)
+        return read(fp) if os.path.isfile(fp) else ""
+
+    sec_h  = safe_read("security/selinux/include/security.h")
+    svc_h  = safe_read("security/selinux/ss/services.h")
+    stat_c = safe_read("security/selinux/ss/status.c")
+    if not stat_c:
+        stat_c = safe_read("security/selinux/status.c")
+
+    m_state = re.search(r'struct selinux_state\s*\{.*?\};', sec_h, re.DOTALL)
+    m_ss    = re.search(r'struct selinux_ss\s*\{.*?\};', svc_h, re.DOTALL)
+    state_body = m_state.group(0) if m_state else ""
+    ss_body    = m_ss.group(0) if m_ss else ""
+
+    print("  --- AUTO-DETECT status_lock/status_page ---")
+    print(f"    selinux_state.status_lock : {'status_lock' in state_body}")
+    print(f"    selinux_ss.status_lock    : {'status_lock' in ss_body}")
+    print(f"    globale selinux_status_lock dans status.c : {'selinux_status_lock' in stat_c}")
+
+    extra_decl = ""
+    if 'status_lock' in state_body:
+        mode = "selinux_state.status_lock"
+        lock_e   = "mutex_lock(&selinux_state.status_lock)"
+        unlock_e = "mutex_unlock(&selinux_state.status_lock)"
+        page_e   = "(selinux_state.status_page)"
+    elif 'status_lock' in ss_body:
+        mode = "selinux_state.ss->status_lock"
+        lock_e   = "mutex_lock(&selinux_state.ss->status_lock)"
+        unlock_e = "mutex_unlock(&selinux_state.ss->status_lock)"
+        page_e   = "(selinux_state.ss->status_page)"
+    elif 'selinux_status_lock' in stat_c:
+        mode = "globales selinux_status_lock / selinux_status_page"
+        extra_decl = ("extern struct mutex selinux_status_lock;\n"
+                      "extern struct page *selinux_status_page;\n")
+        lock_e   = "mutex_lock(&selinux_status_lock)"
+        unlock_e = "mutex_unlock(&selinux_status_lock)"
+        page_e   = "(selinux_status_page)"
+    else:
+        mode = "INTROUVABLE -> mutex/page LOCAUX (fake status INERTE, voir audit)"
+        print("  ⚠️⚠️ status_lock/status_page introuvables dans le noyau.")
+        print("  ⚠️⚠️ Le faux statut SELinux sera INERTE. Dump des structs dans l'audit pour correction.")
+        extra_decl = ("static DEFINE_MUTEX(ksu_local_status_lock);\n"
+                      "static struct page *ksu_local_status_page;\n")
+        lock_e   = "mutex_lock(&ksu_local_status_lock)"
+        unlock_e = "mutex_unlock(&ksu_local_status_lock)"
+        page_e   = "(ksu_local_status_page)"
+
+    print(f"    => MODE RETENU : {mode}")
+
     compat = (
-        "/* ============ Compat 4.19 (dual-path) ============ */\n"
+        "/* ============ Compat 4.19 (auto-detect) ============ */\n"
         "#include <linux/version.h>\n"
         "#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n"
-        "/* 4.19 : selinux_ss et selinux_avc sont des globales directes.\n"
-        " * status_lock/status_page sont les globales de ss/status.c (sans 'static'). */\n"
+        f"/* status layout detecte : {mode} */\n"
         "#define KSU_SELINUX_HIDE_BACKUP 0\n"
         "struct selinux_policy *backup_sepolicy;\n"
         "#define symtab_search(s, name) hashtab_search(&(s)->table, name)\n"
-        "/* Déclarations extern pour les variables de status.c */\n"
-        "extern struct mutex selinux_status_lock;\n"
-        "extern struct page *selinux_status_page;\n"
-        "#define ksu_status_lock()   mutex_lock(&selinux_status_lock)\n"
-        "#define ksu_status_unlock() mutex_unlock(&selinux_status_lock)\n"
-        "#define ksu_status_page     (selinux_status_page)\n"
+        + extra_decl +
+        f"#define ksu_status_lock()   {lock_e}\n"
+        f"#define ksu_status_unlock() {unlock_e}\n"
+        f"#define ksu_status_page     {page_e}\n"
         "#else\n"
         "#define KSU_SELINUX_HIDE_BACKUP 1\n"
         "#define ksu_status_lock()   mutex_lock(&selinux_state.status_lock)\n"
@@ -1574,6 +1601,7 @@ if os.path.isfile(p):
                 "    mutex_lock(&selinux_hide_mutex);")
     if old_drop in c and new_drop not in c:
         c = c.replace(old_drop, new_drop, 1)
+
     old_tail = ("    mutex_unlock(&selinux_hide_mutex);\n"
                 "}\n"
                 "\n"
@@ -1625,13 +1653,12 @@ if os.path.isfile(p):
         "#endif /* KSU_SELINUX_HIDE_BACKUP */\n"
     )
     if 'KSU_SELINUX_HIDE_BACKUP' in c and 'ksu_status_lock();' in c and \
-       old_tail.replace('    mutex_unlock(&selinux_hide_mutex);', '#endif // KSU_SELINUX_HIDE_BACKUP') not in c and \
        not c.rstrip().endswith('#endif /* KSU_SELINUX_HIDE_BACKUP */'):
         c = c.rstrip('\n') + '\n' + stubs
 
     if c != original:
         write(p, c); total += 1
-        print(f"  ✅ feature/selinux_hide.c: dual-path 4.19 (API correcte)")
+        print(f"  ✅ feature/selinux_hide.c: dual-path 4.19 ({mode})")
 
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
