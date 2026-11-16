@@ -1502,7 +1502,7 @@ p = os.path.join(ksu_root, "feature", "selinux_hide.c")
 if os.path.isfile(p):
     c = read(p); original = c
 
-        compat = (
+    compat = (
         "/* ============ Compat 4.19 (dual-path) ============ */\n"
         "#include <linux/version.h>\n"
         "#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n"
