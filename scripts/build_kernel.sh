@@ -33,25 +33,19 @@ summarize() {
     local SUM="$GITHUB_WORKSPACE/output/build-summary.txt"
     {
         echo "=== RÉSUMÉ DU BUILD (code de sortie $rc) ==="
+        echo "########## SPEC HOOKS INLINE ##########"
+        head -n 220 "$GITHUB_WORKSPACE/output/hooks-spec.txt" 2>/dev/null || echo "(spec absente)"
+        echo ""
         if [ -f "$BL" ]; then
-            echo "########## CONTEXTE DE L'ÉCHEC drivers/kernelsu ##########"
-            grep -n -B 45 "drivers/kernelsu] Error" "$BL" | tail -70
+            echo "########## HOOK-SITES MANQUANTS ##########"
+            grep -nE "SUSFS Inline:|hook-site check" "$BL" | head -30
             echo ""
-            echo "########## TOUTES LES ANOMALIES (grep élargi) ##########"
-            grep -nE "error:|undefined symbol|undefined reference|fatal error|Error [0-9]+|No rule to make target|modpost|\*\*\*|Stop\.|not found|unknown type name|implicit declaration" "$BL" | tail -80
-            echo ""
-            echo "########## 40 DERNIÈRES LIGNES DE build.log ##########"
-            tail -n 40 "$BL"
+            echo "########## AUTRES ANOMALIES ##########"
+            grep -nE "error:|undefined symbol|fatal error|Error [0-9]+|No rule to make target|\*\*\*|Stop\.|unknown type name" "$BL" | tail -40
         else
-            echo "pas de build.log : arrêt AVANT la compilation"
-            tail -n 30 "$AUDIT" 2>/dev/null
+            echo "pas de build.log"
+            tail -n 20 "$AUDIT" 2>/dev/null
         fi
-        echo ""
-        echo "########## DIAG KBUILD / DOC ##########"
-        head -n 120 "$GITHUB_WORKSPACE/output/kbuild-diag.txt" 2>/dev/null || echo "(diag absent)"
-        echo ""
-        echo "########## API FinaSU (rappel) ##########"
-        head -n 60 "$APIDUMP" 2>/dev/null
     } > "$SUM" 2>&1
     cat "$SUM"
     [ -n "${GITHUB_STEP_SUMMARY:-}" ] && { echo '```'; cat "$SUM"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
@@ -270,6 +264,35 @@ echo "📋 API FinaSU dumpée (affichée en fin de log)" | tee -a "$AUDIT"
   grep -rn -i "susfs4ksu\|SUSFS_INLINE\|inline" FinaSU/docs FinaSU/.github 2>/dev/null | head -30 || echo "(rien)"
 } > "$GITHUB_WORKSPACE/output/kbuild-diag.txt" 2>&1
 echo "📋 Diag kbuild écrit" | tee -a "$AUDIT"
+
+# ==================== 2f. SPEC EXACTE DES HOOKS INLINE ====================
+{
+  echo "### Kbuild : logique de vérification des hook-sites (lignes 60-175) ###"
+  sed -n '60,175p' drivers/kernelsu/Kbuild 2>/dev/null || echo "(Kbuild absent)"
+  echo
+  echo "### Kbuild : toutes les mentions hook / inline ###"
+  grep -nE "ksu_handle|ksu_setup|ksu_preinit|INLINE|hook-site|input_handle_event" \
+      drivers/kernelsu/Kbuild 2>/dev/null | head -60
+  echo
+  echo "### Signatures des 12 fonctions attendues (dans les .h) ###"
+  for f in ksu_handle_input_handle_event ksu_handle_execveat ksu_handle_execveat_sucompat \
+           ksu_handle_post_execveat_sucompat ksu_setup_preinit_file ksu_preinit_handle_post_execveat \
+           ksu_handle_faccessat ksu_handle_sys_read ksu_handle_stat ksu_handle_vfs_fstat \
+           ksu_handle_sys_reboot ksu_handle_setresuid ; do
+    echo "--- $f ---"
+    grep -rn "$f" FinaSU/kernel --include=*.h 2>/dev/null | head -4 || true
+  done
+  echo
+  echo "### Headers racine de FinaSU/kernel (cherche un header d'integration noyau) ###"
+  find FinaSU/kernel -maxdepth 2 -name "*.h" 2>/dev/null | head -40
+  echo
+  echo "### Tous les .md du depot ###"
+  find FinaSU -name "*.md" 2>/dev/null | head -30
+  echo
+  echo "### Docs parlant d'inline / hook-site / input_handle_event ###"
+  grep -rln -i "inline\|hook.site\|input_handle_event" FinaSU/docs 2>/dev/null | head -10 || echo "(pas de docs/)"
+} > "$GITHUB_WORKSPACE/output/hooks-spec.txt" 2>&1
+echo "📋 Spec des hooks écrite" | tee -a "$AUDIT"
 
 # ==================== 3. SIGNATURE MANAGER ====================
 MGR_APK="$GITHUB_WORKSPACE/patches/manager.apk"
