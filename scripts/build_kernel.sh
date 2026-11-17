@@ -1095,6 +1095,29 @@ grep -q "^CONFIG_KSU_HOOK_SUSFS_INLINE=y" out/.config || { echo "❌ INLINE off"
 make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 headers_install 2>&1 | tail -2
 [ -f out/usr/include/linux/unistd.h ] && echo "✅ UAPI headers OK (preinit actif)" | tee -a "$AUDIT"
 
+# 4.19 n'a pas include/uapi/linux/mount.h (ajouté en 5.2).
+# Le runner nolibc l'inclut => shim minimal. MS_* sont dans uapi/linux/fs.h en 4.19.
+if [ ! -f out/usr/include/linux/mount.h ]; then
+cat > out/usr/include/linux/mount.h <<'MNTSHIM'
+#ifndef _LINUX_MOUNT_H
+#define _LINUX_MOUNT_H
+/* Shim 4.19 : les drapeaux MS_* vivent dans linux/fs.h avant 5.2 */
+#include <linux/fs.h>
+#endif
+MNTSHIM
+echo "✅ shim out/usr/include/linux/mount.h créé" | tee -a "$AUDIT"
+fi
+
+# Diag : ce que le runner attend réellement de ce header
+set +e
+{
+  echo "### nolibc/sys/mount.h ###"
+  cat FinaSU/kernel/preinit/runner/nolibc/sys/mount.h 2>/dev/null | head -40
+  echo "### headers UAPI linux/ disponibles (mount / fs) ###"
+  ls -la out/usr/include/linux/mount.h out/usr/include/linux/fs.h 2>/dev/null
+} >> "$SPEC" 2>&1
+set -e
+
 # ==================== 6. MOTOROLA ====================
 sed -i 's/if (!check_version(/if (0 \&\& !check_version(/g' kernel/module.c
 printf "\n#include <linux/notifier.h>\n#include <linux/module.h>\nstatic BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);\nint panel_register_notifier(struct notifier_block *nb){return blocking_notifier_chain_register(&motorola_panel_notifier_list,nb);}\nEXPORT_SYMBOL(panel_register_notifier);\nint panel_unregister_notifier(struct notifier_block *nb){return blocking_notifier_chain_unregister(&motorola_panel_notifier_list,nb);}\nEXPORT_SYMBOL(panel_unregister_notifier);\nvoid touch_set_state(int s){return;}\nEXPORT_SYMBOL(touch_set_state);\n" >> techpack/display/msm/msm_drv.c
