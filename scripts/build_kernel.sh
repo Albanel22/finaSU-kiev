@@ -737,35 +737,218 @@ if os.path.isfile(p):
         c=c.replace(old,'#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n'+old+'#else\n    put_seccomp_filter(fake);\n#endif\n',1)
     if c!=o: write(p,c); total+=1; print("  ✅ app_profile.c seccomp")
 
-# FIX 9 : sepolicy.c (flex_array 4.19)
+# FIX 9 : sepolicy.c — dual-path COMPLET 4.19
 p = os.path.join(KS,"selinux/sepolicy.c")
 if os.path.isfile(p):
-    c=read(p); o=c
+    c = read(p); o = c
     c = inc(c,'<linux/flex_array.h>')
+
+    # 9a. macros avtab (flex_array en 4.19)
     if 'ksu_avtab_htable_get' not in c and '#define KSU_SUPPORT_ADD_TYPE' in c:
-        c=c.replace('#define KSU_SUPPORT_ADD_TYPE\n',
-          '#define KSU_SUPPORT_ADD_TYPE\n\n#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n'
+        c = c.replace('#define KSU_SUPPORT_ADD_TYPE\n',
+          '#define KSU_SUPPORT_ADD_TYPE\n\n'
+          '#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n'
           '#define ksu_avtab_htable_get(h,i) ((struct avtab_node *)flex_array_get_ptr((h).htable,(i)))\n'
           '#define ksu_avtab_htable_set(h,i,v) flex_array_put_ptr((h).htable,(i),(v),GFP_ATOMIC)\n'
-          '#else\n#define ksu_avtab_htable_get(h,i) ((h).htable[(i)])\n'
-          '#define ksu_avtab_htable_set(h,i,v) ((h).htable[(i)] = (v))\n#endif\n',1)
-    c=c.replace('for (n = db->te_avtab.htable[i]; n; prev = n, n = n->next) {',
-                'for (n = ksu_avtab_htable_get(db->te_avtab, i); n; prev = n, n = n->next) {',1)
-    c=c.replace('db->te_avtab.htable[i] = n->next;','ksu_avtab_htable_set(db->te_avtab, i, n->next);',1)
-    c=c.replace('removed.htable[0] = n;','ksu_avtab_htable_set(removed, 0, n);',1)
-    old='    struct ebitmap *sattr = &db->type_attr_map_array[type->value - 1];'
-    new=('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n'+old+
-         '\n#else\n    struct ebitmap *sattr = (struct ebitmap *)flex_array_get(db->type_attr_map_array, type->value - 1);\n#endif')
-    if old in c and new not in c: c=c.replace(old,new,1)
-    old=('void ksu_destroy_sepolicy(struct selinux_policy *pol)\n{\n    policydb_destroy(&pol->policydb);\n'
-         '    kfree(pol);\n}\n\nstruct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)\n{')
-    if old in c: c=c.replace(old,'#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n'+old,1)
-    oc='out_free_data:\n    kvfree(data);\n\n    return ERR_PTR(ret);\n}\n'
-    nc=(oc+'#else\nvoid ksu_destroy_sepolicy(struct selinux_policy *pol) { (void)pol; }\n'
-        'struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)\n'
-        '{\n    (void)old_pol;\n    return ERR_PTR(-EOPNOTSUPP);\n}\n#endif\n')
-    if oc in c and '#else\nvoid ksu_destroy_sepolicy' not in c: c=c.replace(oc,nc,1)
-    if c!=o: write(p,c); total+=1; print("  ✅ sepolicy.c flex_array")
+          '#else\n'
+          '#define ksu_avtab_htable_get(h,i) ((h).htable[(i)])\n'
+          '#define ksu_avtab_htable_set(h,i,v) ((h).htable[(i)] = (v))\n'
+          '#endif\n', 1)
+    c = c.replace('for (n = db->te_avtab.htable[i]; n; prev = n, n = n->next) {',
+                  'for (n = ksu_avtab_htable_get(db->te_avtab, i); n; prev = n, n = n->next) {', 1)
+    c = c.replace('db->te_avtab.htable[i] = n->next;',
+                  'ksu_avtab_htable_set(db->te_avtab, i, n->next);', 1)
+    c = c.replace('removed.htable[0] = n;',
+                  'ksu_avtab_htable_set(removed, 0, n);', 1)
+
+    # 9b. add_filename_trans : API 5.9+ vs hashtab 4.19
+    old_open = ('static bool add_filename_trans(struct policydb *db, const char *s, const char *t, const char *c, const char *d,\n'
+                '                               const char *o)\n{\n    struct type_datum *src, *tgt, *def;')
+    new_open = '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n' + old_open
+    if old_open in c and '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\nstatic bool add_filename_trans' not in c:
+        c = c.replace(old_open, new_open, 1)
+
+    old_close = 'free_trans:\n    kfree(trans);\nout:\n    return false;\n}'
+    new_close = r'''free_trans:
+    kfree(trans);
+out:
+    return false;
+}
+#else
+/* 4.19 : filename_trans = {stype,ttype,tclass,name}, datum = {otype},
+ *        db->filename_trans est un hashtab, ttypes est un ebitmap */
+static bool add_filename_trans(struct policydb *db, const char *s, const char *t, const char *c, const char *d,
+                               const char *o)
+{
+    struct type_datum *src, *tgt, *def;
+    struct class_datum *cls;
+    struct filename_trans key;
+    struct filename_trans_datum *datum;
+    struct filename_trans *new_key;
+    struct filename_trans_datum *new_datum;
+    int rc;
+
+    src = symtab_search(&db->p_types, s);
+    if (!src) { pr_warn("source type %s does not exist\n", s); return false; }
+    tgt = symtab_search(&db->p_types, t);
+    if (!tgt) { pr_warn("target type %s does not exist\n", t); return false; }
+    cls = symtab_search(&db->p_classes, c);
+    if (!cls) { pr_warn("class %s does not exist\n", c); return false; }
+    def = symtab_search(&db->p_types, d);
+    if (!def) { pr_warn("default type %s does not exist\n", d); return false; }
+
+    key.stype = src->value;
+    key.ttype = tgt->value;
+    key.tclass = cls->value;
+    key.name = o;
+
+    datum = hashtab_search(db->filename_trans, &key);
+    if (datum) { datum->otype = def->value; return true; }
+
+    new_key = kzalloc(sizeof(*new_key), GFP_KERNEL);
+    if (!new_key) return false;
+    new_key->stype = src->value;
+    new_key->ttype = tgt->value;
+    new_key->tclass = cls->value;
+    new_key->name = kstrdup(o, GFP_KERNEL);
+    if (!new_key->name) { kfree(new_key); return false; }
+
+    new_datum = kzalloc(sizeof(*new_datum), GFP_KERNEL);
+    if (!new_datum) { kfree(new_key->name); kfree(new_key); return false; }
+    new_datum->otype = def->value;
+
+    rc = hashtab_insert(db->filename_trans, new_key, new_datum);
+    if (rc) { kfree(new_datum); kfree(new_key->name); kfree(new_key); return false; }
+
+    ebitmap_set_bit(&db->filename_trans_ttypes, tgt->value, 1);
+    return true;
+}
+#endif'''
+    if old_close in c and '#else\n/* 4.19 : filename_trans' not in c:
+        c = c.replace(old_close, new_close, 1)
+
+    # 9c. add_type : tableaux 5.10+ vs flex_array 4.19
+    m = re.search(r'^static bool add_type\(struct policydb \*db, const char \*type_name, bool attr\)\n\{', c, re.MULTILINE)
+    if m and 'KSU_ADD_TYPE_FLEX_ARRAY' not in c:
+        start = m.start(); depth = 0; end = -1; i = m.end() - 1
+        while i < len(c):
+            if c[i] == '{':
+                depth += 1
+            elif c[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    end = i; break
+            i += 1
+        if end > 0:
+            orig_func = c[start:end+1]
+            flex_version = r'''static bool add_type_flex_419(struct policydb *db, const char *type_name, bool attr) {
+    /* KSU_ADD_TYPE_FLEX_ARRAY */
+    struct type_datum *type = symtab_search(&db->p_types, type_name);
+    if (type) { pr_warn("Type %s already exists\n", type_name); return true; }
+
+    u32 value = ++db->p_types.nprim;
+    int k;
+    void *zero = NULL;
+    struct ebitmap empty_bm;
+
+    type = (struct type_datum *)kzalloc(sizeof(struct type_datum), GFP_KERNEL);
+    if (!type) { pr_err("add_type: alloc type_datum failed.\n"); return false; }
+    type->primary = 1;
+    type->value = value;
+    type->attribute = attr;
+    char *key = kstrdup(type_name, GFP_KERNEL);
+    if (!key) { pr_err("add_type: alloc key failed.\n"); return false; }
+    if (symtab_insert(&db->p_types, key, type)) { pr_err("add_type: insert symtab failed.\n"); return false; }
+
+    struct flex_array *new_tama = flex_array_alloc(sizeof(struct ebitmap), value, GFP_KERNEL);
+    if (!new_tama) { pr_err("add_type: flex_array_alloc type_attr_map_array failed\n"); return false; }
+    memset(&empty_bm, 0, sizeof(empty_bm));
+    for (k = 0; k < value; k++)
+        flex_array_put(new_tama, k, &empty_bm, GFP_KERNEL);
+    for (k = 0; k < value - 1; k++) {
+        struct ebitmap *old_bm = (struct ebitmap *)flex_array_get(db->type_attr_map_array, k);
+        struct ebitmap *new_bm = (struct ebitmap *)flex_array_get(new_tama, k);
+        if (old_bm && new_bm)
+            ebitmap_cpy(new_bm, old_bm);
+    }
+    flex_array_free(db->type_attr_map_array);
+    db->type_attr_map_array = new_tama;
+    {
+        struct ebitmap *new_slot = (struct ebitmap *)flex_array_get(new_tama, value - 1);
+        if (new_slot) {
+            ebitmap_init(new_slot);
+            ebitmap_set_bit(new_slot, value - 1, 1);
+        }
+    }
+
+    struct flex_array *new_tvts = flex_array_alloc(sizeof(void *), value, GFP_KERNEL);
+    if (!new_tvts) { pr_err("add_type: flex_array_alloc type_val_to_struct_array failed\n"); return false; }
+    for (k = 0; k < value; k++)
+        flex_array_put_ptr(new_tvts, k, zero, GFP_KERNEL);
+    for (k = 0; k < value - 1; k++) {
+        void *pv = flex_array_get_ptr(db->type_val_to_struct_array, k);
+        if (pv) flex_array_put_ptr(new_tvts, k, pv, GFP_KERNEL);
+    }
+    flex_array_free(db->type_val_to_struct_array);
+    db->type_val_to_struct_array = new_tvts;
+    flex_array_put_ptr(new_tvts, value - 1, type, GFP_KERNEL);
+
+    struct flex_array *new_names = flex_array_alloc(sizeof(char *), value, GFP_KERNEL);
+    if (!new_names) { pr_err("add_type: flex_array_alloc sym_val_to_name failed\n"); return false; }
+    for (k = 0; k < value; k++)
+        flex_array_put_ptr(new_names, k, zero, GFP_KERNEL);
+    for (k = 0; k < value - 1; k++) {
+        void *pv = flex_array_get_ptr(db->sym_val_to_name[SYM_TYPES], k);
+        if (pv) flex_array_put_ptr(new_names, k, pv, GFP_KERNEL);
+    }
+    flex_array_free(db->sym_val_to_name[SYM_TYPES]);
+    db->sym_val_to_name[SYM_TYPES] = new_names;
+    flex_array_put_ptr(new_names, value - 1, key, GFP_KERNEL);
+
+    int i;
+    for (i = 0; i < db->p_roles.nprim; ++i) {
+        ebitmap_set_bit(&db->role_val_to_struct[i]->types, value - 1, 1);
+    }
+    return true;
+}
+'''
+            wrapped = orig_func.replace(
+                'static bool add_type(struct policydb *db, const char *type_name, bool attr)\n{',
+                'static bool add_type_5_10(struct policydb *db, const char *type_name, bool attr)\n{', 1)
+            new_func = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n' + wrapped + '\n#else\n'
+                        + flex_version + '\n#endif\n\n'
+                        'static bool add_type(struct policydb *db, const char *type_name, bool attr) {\n'
+                        '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n'
+                        '    return add_type_5_10(db, type_name, attr);\n'
+                        '#else\n'
+                        '    return add_type_flex_419(db, type_name, attr);\n'
+                        '#endif\n'
+                        '}')
+            c = c[:start] + new_func + c[end+1:]
+
+    # 9d. sattr
+    old = '    struct ebitmap *sattr = &db->type_attr_map_array[type->value - 1];'
+    new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n' + old +
+           '\n#else\n    struct ebitmap *sattr = (struct ebitmap *)flex_array_get(db->type_attr_map_array, type->value - 1);\n#endif')
+    if old in c and new not in c:
+        c = c.replace(old, new, 1)
+
+    # 9e. ksu_destroy_sepolicy / ksu_dup_sepolicy
+    old = ('void ksu_destroy_sepolicy(struct selinux_policy *pol)\n{\n    policydb_destroy(&pol->policydb);\n'
+           '    kfree(pol);\n}\n\nstruct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)\n{')
+    if old in c and '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\nvoid ksu_destroy_sepolicy' not in c:
+        c = c.replace(old, '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n' + old, 1)
+    oc = 'out_free_data:\n    kvfree(data);\n\n    return ERR_PTR(ret);\n}\n'
+    nc = (oc + '#else\n'
+          '/* 4.19 : pas de struct selinux_policy ; policydb modifié en place dans rules.c */\n'
+          'void ksu_destroy_sepolicy(struct selinux_policy *pol) { (void)pol; }\n'
+          'struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)\n'
+          '{\n    (void)old_pol;\n    return ERR_PTR(-EOPNOTSUPP);\n}\n#endif\n')
+    if oc in c and '#else\n/* 4.19 : pas de struct selinux_policy' not in c:
+        c = c.replace(oc, nc, 1)
+
+    if c != o:
+        write(p,c); total+=1; print("  ✅ sepolicy.c : dual-path COMPLET (avtab + filename_trans + add_type)")
 
 # FIX 10 : minmax.h
 for dp,dn,fn in os.walk(KS):
