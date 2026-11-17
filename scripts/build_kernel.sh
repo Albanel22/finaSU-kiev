@@ -261,17 +261,30 @@ if [ -n "$FINASU_EXPECTED_SIZE" ] && [ -n "$FINASU_EXPECTED_HASH" ]; then
     echo "✅ Signature manager OK" | tee -a "$AUDIT"
 fi
 
-# ==================== 3h. RETRAIT 'static' + O_CLOEXEC ====================
+# ==================== 3h. RETRAIT 'static' (O_CLOEXEC PRÉSERVÉ) ====================
 for f in security/selinux/ss/status.c security/selinux/selinuxfs.c security/selinux/status.c; do
     [ -f "$f" ] || continue
     sed -i -E 's/^static[[:space:]]+(struct page[[:space:]]*\*[[:space:]]*selinux_status_page)/\1/' "$f"
     sed -i -E 's/^static[[:space:]]+(DEFINE_MUTEX\(selinux_status_lock\))/\1/' "$f"
 done
 [ -f security/selinux/ss/services.c ] && sed -i 's/^static DEFINE_RWLOCK(policy_rwlock)/DEFINE_RWLOCK(policy_rwlock)/' security/selinux/ss/services.c
-grep -rl "get_unused_fd_flags(O_CLOEXEC)" "$KSU_DIR/" 2>/dev/null | while read -r f; do
-    sed -i 's/get_unused_fd_flags(O_CLOEXEC)/get_unused_fd_flags(0)/g' "$f"; done || true
-grep -rl "anon_inode_getfile" "$KSU_DIR/" 2>/dev/null | while read -r f; do
-    sed -i 's/O_RDWR | O_CLOEXEC/O_RDWR/g; s/O_RDWR|O_CLOEXEC/O_RDWR/g; s/, O_CLOEXEC)/)/g' "$f"; done || true
+
+# O_CLOEXEC est valide sur 4.19 (get_unused_fd_flags / anon_inode_getfile inchangés
+# depuis 3.x). Le stripping provoquait une fuite du FD preinit vers zygote, puis
+# l'abort "Not allowlisted (8)" dans nativeForkSystemServer. NE PAS Y TOUCHER.
+
+# Filet de sécurité : si un build précédent a déjà altéré les sources, on restaure.
+grep -rl "get_unused_fd_flags(0)" "$KSU_DIR/" 2>/dev/null | while read -r f; do
+    sed -i 's/get_unused_fd_flags(0)/get_unused_fd_flags(O_CLOEXEC)/g' "$f"
+done || true
+
+# Vérification dure : plus aucun O_CLOEXEC ne doit avoir disparu
+{
+  echo "=== Contrôle O_CLOEXEC dans FinaSU ==="
+  grep -rn "get_unused_fd_flags" "$KSU_DIR/" 2>/dev/null | head -20
+  echo "--- anon_inode_getfile ---"
+  grep -rn "anon_inode_getfile" "$KSU_DIR/" 2>/dev/null | head -20
+} | tee -a "$AUDIT"
 
 # ==================== 4a. rules.c dual-path ====================
 cat > "$KSU_DIR/selinux/rules.c" << 'RULESEOF'
