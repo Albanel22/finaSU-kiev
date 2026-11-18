@@ -5,7 +5,7 @@ GITHUB_WORKSPACE="${GITHUB_WORKSPACE:-$PWD}"
 export GITHUB_WORKSPACE
 
 FINASU_URL="${FINASU_URL:-https://github.com/LyraVoid/FinaSU.git}"
-FINASU_REF="${FINASU_REF:-latest}"
+FINASU_REF="${FINASU_REF:-v1.5.0}"
 KERNEL_PIN="${KERNEL_PIN:-9426323c2acd0865fd565a6dd8a9f39f831cbec3}"
 FINASU_EXPECTED_SIZE="${FINASU_EXPECTED_SIZE:-}"
 FINASU_EXPECTED_HASH="${FINASU_EXPECTED_HASH:-}"
@@ -19,7 +19,7 @@ df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
 DTBO_GDRIVE_ID="11451aa0CCzyVtNTYOK2n6oH6E0PT-2NX"
-MGR_GDRIVE_ID="11gKehkaCHKPAYbjOcVDx1IIvNc_2t4j9"
+MGR_GDRIVE_ID="1Qr07fjThXjmIz_DAmW2GZepoWrNIikXR"
 
 mkdir -p "$GITHUB_WORKSPACE/output" "$GITHUB_WORKSPACE/patches"
 AUDIT="$GITHUB_WORKSPACE/output/audit-${VER}.txt"
@@ -190,47 +190,9 @@ echo "✅ Stubs path_mount/path_umount" | tee -a "$AUDIT"
 echo "=== Intégration FinaSU ==="
 rm -rf drivers/kernelsu FinaSU 2>/dev/null || true
 git clone "$FINASU_URL" FinaSU
-git -C FinaSU fetch --tags --force 2>/dev/null || true
-
-# Résolution FINASU_REF avec fallback si tags absents
-if [ "${FINASU_REF}" = "latest" ] || [ -z "${FINASU_REF}" ]; then
-    RESOLVED="$(git -C FinaSU tag -l 'v*' --sort=-v:refname | head -1 || true)"
-    if [ -z "$RESOLVED" ]; then
-        RESOLVED="$(git -C FinaSU describe --tags --abbrev=0 2>/dev/null || true)"
-    fi
-    if [ -z "$RESOLVED" ]; then
-        RESOLVED="$(git -C FinaSU symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@' || true)"
-        RESOLVED="${RESOLVED:-master}"
-        echo "⚠️ Aucun tag FinaSU — fallback branche : $RESOLVED" | tee -a "$AUDIT"
-    else
-        echo "✅ FinaSU tag résolu : $RESOLVED" | tee -a "$AUDIT"
-    fi
-    FINASU_REF="$RESOLVED"
-fi
-
-set +e
-git -C FinaSU checkout -q "$FINASU_REF"
-CO_RC=$?
-if [ $CO_RC -ne 0 ]; then
-    echo "⚠️ checkout $FINASU_REF échoué — fallback master/main" | tee -a "$AUDIT"
-    git -C FinaSU checkout -q master
-    CO_RC=$?
-    if [ $CO_RC -ne 0 ]; then
-        git -C FinaSU checkout -q main
-        CO_RC=$?
-    fi
-fi
-set -e
-if [ $CO_RC -ne 0 ]; then
-    echo "❌ Impossible de checkout FinaSU ($FINASU_REF / master / main)"
-    exit 1
-fi
-FINASU_REF="$(git -C FinaSU describe --tags --always 2>/dev/null || git -C FinaSU rev-parse --short HEAD)"
-echo "FinaSU effectif : $FINASU_REF ($(git -C FinaSU rev-parse --short HEAD))" | tee -a "$AUDIT"
-
-if [ -f FinaSU/kernel/setup.sh ]; then
-    bash FinaSU/kernel/setup.sh --dir "$PWD/FinaSU" || true
-fi
+git -C FinaSU checkout "$FINASU_REF"
+echo "FinaSU : $(git -C FinaSU describe --tags --always)" | tee -a "$AUDIT"
+[ -f FinaSU/kernel/setup.sh ] && bash FinaSU/kernel/setup.sh --dir "$PWD/FinaSU"
 if [ ! -e drivers/kernelsu ]; then
     ln -sfn ../FinaSU/kernel drivers/kernelsu
     grep -q "kernelsu" drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
