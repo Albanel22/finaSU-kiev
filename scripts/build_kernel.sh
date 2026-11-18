@@ -190,7 +190,35 @@ echo "✅ Stubs path_mount/path_umount" | tee -a "$AUDIT"
 echo "=== Intégration FinaSU ==="
 rm -rf drivers/kernelsu FinaSU 2>/dev/null || true
 git clone "$FINASU_URL" FinaSU
-git -C FinaSU checkout "$FINASU_REF"
+# Résolution FINASU_REF avec fallback tags manquants
+if [ "$FINASU_REF" = "latest" ] || [ -z "$FINASU_REF" ]; then
+    # 1) dernier tag annoté / léger v*
+    RESOLVED=$(git -C FinaSU tag -l 'v*' --sort=-v:refname | head -1 || true)
+    # 2) describe si tags locaux incomplets après clone shallow
+    if [ -z "$RESOLVED" ]; then
+        git -C FinaSU fetch --tags --force 2>/dev/null || true
+        RESOLVED=$(git -C FinaSU tag -l 'v*' --sort=-v:refname | head -1 || true)
+    fi
+    # 3) dernier release-like via describe
+    if [ -z "$RESOLVED" ]; then
+        RESOLVED=$(git -C FinaSU describe --tags --abbrev=0 2>/dev/null || true)
+    fi
+    # 4) fallback branche par défaut
+    if [ -z "$RESOLVED" ]; then
+        RESOLVED=$(git -C FinaSU symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@' || true)
+        RESOLVED="${RESOLVED:-master}"
+        echo "⚠️ Aucun tag FinaSU — fallback branche : $RESOLVED" | tee -a "$AUDIT"
+    else
+        echo "✅ FinaSU tag résolu : $RESOLVED" | tee -a "$AUDIT"
+    fi
+    FINASU_REF="$RESOLVED"
+fi
+if ! git -C FinaSU checkout -q "$FINASU_REF" 2>/dev/null; then
+    echo "⚠️ checkout $FINASU_REF échoué — fallback master" | tee -a "$AUDIT"
+    git -C FinaSU checkout -q master || git -C FinaSU checkout -q main
+    FINASU_REF=$(git -C FinaSU rev-parse --abbrev-ref HEAD)
+fi
+echo "FinaSU effectif : $FINASU_REF ($(git -C FinaSU describe --tags --always))" | tee -a "$AUDIT"
 [ -f FinaSU/kernel/setup.sh ] && bash FinaSU/kernel/setup.sh --dir "$PWD/FinaSU"
 if [ ! -e drivers/kernelsu ]; then
     ln -sfn ../FinaSU/kernel drivers/kernelsu
