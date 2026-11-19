@@ -1103,7 +1103,7 @@ if os.path.isfile(p):
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
 
-# --- Golden : security_context_to_sid_live (5 args côté noyau 4.19) ---
+# --- Golden : security_context_to_sid_live → API selinux_state (4.19) ---
 HIDE="$KSU_DIR/feature/selinux_hide.c"
 if [ -f "$HIDE" ] && grep -q "security_context_to_sid_live" "$HIDE"; then
   python3 - "$HIDE" <<'PY'
@@ -1111,15 +1111,9 @@ import sys, re
 p = sys.argv[1]
 c = open(p, encoding="utf-8", errors="replace").read()
 
-# Retirer anciennes définitions forcées
+# Retirer anciennes définitions forcées en fin de fichier
 c = re.sub(
-    r"\n/\* KSU_SID_LIVE_DEFINED_419[\s\S]*?#endif\s*\n#endif\s*\n?\Z",
-    "\n",
-    c,
-)
-# au cas où le marqueur a été renommé
-c = re.sub(
-    r"\n/\* KSU_SID_LIVE_DEFINED_419_OLD[\s\S]*?#endif\s*\n#endif\s*\n?\Z",
+    r"\n/\* KSU_SID_LIVE_DEFINED_419[\s\S]*?\Z",
     "\n",
     c,
 )
@@ -1145,7 +1139,7 @@ if m and "KSU_SID_LIVE_BODY_GUARDED" not in c:
         i += 1
     if end > 0:
         body = c[m.start():end + 1]
-        if "SECSID_NULL, GFP_KERNEL" not in body and "return security_context_to_sid" not in body[:200]:
+        if "&selinux_state" not in body[:300]:
             guarded = (
                 "/* KSU_SID_LIVE_BODY_GUARDED */\n"
                 "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n"
@@ -1157,21 +1151,21 @@ if m and "KSU_SID_LIVE_BODY_GUARDED" not in c:
 if "KSU_SID_LIVE_DEFINED_419" not in c:
     c = c.rstrip() + """
 
-/* KSU_SID_LIVE_DEFINED_419 — 4.19 : security_context_to_sid à 5 args */
+/* KSU_SID_LIVE_DEFINED_419 — 4.19 : security_context_to_sid(state, ...) */
 #include <linux/version.h>
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 #ifndef KSU_SID_LIVE_DEFINED_419
 #define KSU_SID_LIVE_DEFINED_419
 static int security_context_to_sid_live(const char *scontext, u32 scontext_len, u32 *sid)
 {
-	return security_context_to_sid(scontext, scontext_len, sid, SECSID_NULL, GFP_KERNEL);
+	return security_context_to_sid(&selinux_state, scontext, scontext_len, sid, GFP_KERNEL);
 }
 #endif
 #endif
 """
 
 open(p, "w", encoding="utf-8").write(c)
-print("  ✅ selinux_hide.c : live → security_context_to_sid(..., SECSID_NULL, GFP_KERNEL)")
+print("  ✅ selinux_hide.c : live → security_context_to_sid(&selinux_state, ...)")
 PY
 fi
 
