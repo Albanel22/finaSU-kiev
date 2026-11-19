@@ -1103,7 +1103,7 @@ if os.path.isfile(p):
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
 
-# --- Golden : forcer security_context_to_sid_live (3 args) en fin de fichier ---
+# --- Golden : security_context_to_sid_live (5 args côté noyau 4.19) ---
 HIDE="$KSU_DIR/feature/selinux_hide.c"
 if [ -f "$HIDE" ] && grep -q "security_context_to_sid_live" "$HIDE"; then
   python3 - "$HIDE" <<'PY'
@@ -1111,13 +1111,20 @@ import sys, re
 p = sys.argv[1]
 c = open(p, encoding="utf-8", errors="replace").read()
 
-# Nettoyer d'éventuels anciens stubs / gardes partiels
-c = re.sub(r"/\* KSU_SID_LIVE_STUB_419[\s\S]*?#endif\s*\n#endif\s*\n?", "", c)
-c = re.sub(r"/\* KSU_SID_LIVE_BODY_GUARDED \*/\s*\n#if LINUX_VERSION_CODE >= KERNEL_VERSION\(5, 10, 0\)\s*\n", "", c)
-c = re.sub(r"\n#endif /\* >= 5\.10 security_context_to_sid_live \*/\s*\n?", "\n", c)
-c = c.replace("KSU_SID_LIVE_DEFINED_419", "KSU_SID_LIVE_DEFINED_419_OLD")
+# Retirer anciennes définitions forcées
+c = re.sub(
+    r"\n/\* KSU_SID_LIVE_DEFINED_419[\s\S]*?#endif\s*\n#endif\s*\n?\Z",
+    "\n",
+    c,
+)
+# au cas où le marqueur a été renommé
+c = re.sub(
+    r"\n/\* KSU_SID_LIVE_DEFINED_419_OLD[\s\S]*?#endif\s*\n#endif\s*\n?\Z",
+    "\n",
+    c,
+)
 
-# Garder le corps upstream sous >= 5.10 s'il est encore nu
+# Corps upstream long → seulement >= 5.10
 pat = re.compile(
     r"(static int security_context_to_sid_live\s*\(\s*const char \*scontext,\s*u32 scontext_len,\s*u32 \*sid\s*\)\s*\{)",
     re.M,
@@ -1138,8 +1145,7 @@ if m and "KSU_SID_LIVE_BODY_GUARDED" not in c:
         i += 1
     if end > 0:
         body = c[m.start():end + 1]
-        # Ne wrapper que si le corps n'est pas déjà le stub court
-        if "return security_context_to_sid(scontext, scontext_len, sid, GFP_KERNEL)" not in body:
+        if "SECSID_NULL, GFP_KERNEL" not in body and "return security_context_to_sid" not in body[:200]:
             guarded = (
                 "/* KSU_SID_LIVE_BODY_GUARDED */\n"
                 "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n"
@@ -1148,25 +1154,24 @@ if m and "KSU_SID_LIVE_BODY_GUARDED" not in c:
             )
             c = c[:m.start()] + guarded + c[end + 1:]
 
-# Définition 4.19 TOUJOURS en fin de fichier (après les #endif du portage)
 if "KSU_SID_LIVE_DEFINED_419" not in c:
     c = c.rstrip() + """
 
-/* KSU_SID_LIVE_DEFINED_419 — corps garanti pour 4.19 (après tout portage) */
+/* KSU_SID_LIVE_DEFINED_419 — 4.19 : security_context_to_sid à 5 args */
 #include <linux/version.h>
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 #ifndef KSU_SID_LIVE_DEFINED_419
 #define KSU_SID_LIVE_DEFINED_419
 static int security_context_to_sid_live(const char *scontext, u32 scontext_len, u32 *sid)
 {
-	return security_context_to_sid(scontext, scontext_len, sid, GFP_KERNEL);
+	return security_context_to_sid(scontext, scontext_len, sid, SECSID_NULL, GFP_KERNEL);
 }
 #endif
 #endif
 """
 
 open(p, "w", encoding="utf-8").write(c)
-print("  ✅ selinux_hide.c : security_context_to_sid_live forcé en fin de fichier")
+print("  ✅ selinux_hide.c : live → security_context_to_sid(..., SECSID_NULL, GFP_KERNEL)")
 PY
 fi
 
