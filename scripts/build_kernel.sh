@@ -33,8 +33,8 @@ summarize() {
     local SUM="$GITHUB_WORKSPACE/output/build-summary.txt"
     {
         echo "=== RÉSUMÉ DU BUILD (code de sortie $rc) ==="
-        echo "########## VERDICT VALIDATEUR + DIAG ##########"
-        head -n 120 "$SPEC" 2>/dev/null || echo "(spec absente)"
+        echo "########## DIAG / PROTOTYPES / SPEC ##########"
+        head -n 160 "$SPEC" 2>/dev/null || echo "(spec absente)"
         echo ""
         if [ -f "$BL" ]; then
             echo "########## HOOK-SITES MANQUANTS ##########"
@@ -156,7 +156,7 @@ git apply --whitespace=nowarn "$MANUAL_SUSFS_PATCH"
 [ -z "$(find . -name '*.rej' -print)" ] || { echo "❌ rejets résiduels"; exit 1; }
 echo "✅ Patch SUSFS appliqué" | tee -a "$AUDIT"
 
-# CORRECTIF : mon patch manuel écrase la détection SUSFS_KERNEL_READ_NEW du hunk upstream
+# Mon patch manuel écrase la détection SUSFS_KERNEL_READ_NEW du hunk upstream : on la restaure
 python3 - <<'MKEOF' 2>&1 | tee -a "$AUDIT"
 p = "fs/Makefile"
 c = open(p).read()
@@ -217,6 +217,7 @@ echo "FinaSU effectif : $FINASU_DESC ($FINASU_COMMIT)" | tee -a "$AUDIT"
   echo "FINASU_DESC=$FINASU_DESC"
   echo "DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } | tee "$GITHUB_WORKSPACE/output/finasu.lock" | tee -a "$AUDIT"
+
 [ -f FinaSU/kernel/setup.sh ] && bash FinaSU/kernel/setup.sh --dir "$PWD/FinaSU"
 if [ ! -e drivers/kernelsu ]; then
     ln -sfn ../FinaSU/kernel drivers/kernelsu
@@ -226,7 +227,7 @@ fi
 [ -e drivers/kernelsu ] || { echo "❌ drivers/kernelsu absent"; exit 1; }
 KSU_DIR="drivers/kernelsu"
 KSU_REPO_ROOT="$GITHUB_WORKSPACE/kernel_sources/FinaSU"
-echo "✅ FinaSU intégré (drivers/kernelsu existe → les gardes du script de hooks fonctionneront)" | tee -a "$AUDIT"
+echo "✅ FinaSU intégré" | tee -a "$AUDIT"
 
 # ==================== 2g. HOOKS INLINE ====================
 HOOK_SH="$GITHUB_WORKSPACE/patches/susfs_inline_hook_patches.sh"
@@ -243,15 +244,8 @@ grep -q "ksu_handle_execveat_sucompat" fs/exec.c || { echo "❌ fs/exec.c non pa
 grep -q "ksu_handle_setresuid" kernel/sys.c   || { echo "❌ kernel/sys.c non patché"; exit 1; }
 echo "✅ hooks exec + setresuid appliqués" | tee -a "$AUDIT"
 
+# FinaSU définit ksu_handle_sys_read en void, pas en int
 sed -i 's/extern __attribute__((cold)) int ksu_handle_sys_read(unsigned int fd);/extern __attribute__((cold)) void ksu_handle_sys_read(unsigned int fd);/' fs/read_write.c
-
-# Contenu de syscall_hook_patches.sh : informatif, NON exécuté (risque de noms rejetés)
-set +e
-{
-  echo "### syscall_hook_patches.sh (NON exécuté — contenu pour analyse) ###"
-  curl -fL --retry 2 "$REPO_RAW/syscall_hook_patches.sh" 2>/dev/null | head -60 || echo "(absent)"
-} > "$SPEC" 2>&1
-set -e
 
 # ==================== 3. SIGNATURE MANAGER ====================
 MGR_APK="$GITHUB_WORKSPACE/patches/manager.apk"
@@ -286,13 +280,11 @@ if [ -n "$FINASU_EXPECTED_SIZE" ] && [ -n "$FINASU_EXPECTED_HASH" ]; then
     SIG_ARGS="KSU_EXPECTED_SIZE=$FINASU_EXPECTED_SIZE KSU_EXPECTED_HASH=$FINASU_EXPECTED_HASH"
     echo "✅ Signature manager OK" | tee -a "$AUDIT"
 fi
-
 {
   echo "MGR_GDRIVE_ID=$MGR_GDRIVE_ID"
   echo "MGR_SIZE=${FINASU_EXPECTED_SIZE:-}"
   echo "MGR_HASH=${FINASU_EXPECTED_HASH:-}"
 } >> "$GITHUB_WORKSPACE/output/finasu.lock"
-echo "Lock manager → finasu.lock" | tee -a "$AUDIT"
 
 # ==================== 3h. RETRAIT 'static' (O_CLOEXEC PRÉSERVÉ) ====================
 for f in security/selinux/ss/status.c security/selinux/selinuxfs.c security/selinux/status.c; do
@@ -302,21 +294,15 @@ for f in security/selinux/ss/status.c security/selinux/selinuxfs.c security/seli
 done
 [ -f security/selinux/ss/services.c ] && sed -i 's/^static DEFINE_RWLOCK(policy_rwlock)/DEFINE_RWLOCK(policy_rwlock)/' security/selinux/ss/services.c
 
-# O_CLOEXEC est valide sur 4.19 (get_unused_fd_flags / anon_inode_getfile inchangés
-# depuis 3.x). Le stripping provoquait une fuite du FD preinit vers zygote, puis
-# l'abort "Not allowlisted (8)" dans nativeForkSystemServer. NE PAS Y TOUCHER.
-
-# Filet de sécurité : si un build précédent a déjà altéré les sources, on restaure.
+# O_CLOEXEC est valide sur 4.19. Le stripping provoquait la fuite du FD vers zygote
+# puis l'abort "Not allowlisted (8)". NE PAS Y TOUCHER.
+# Filet de sécurité si un build précédent a altéré les sources :
 grep -rl "get_unused_fd_flags(0)" "$KSU_DIR/" 2>/dev/null | while read -r f; do
     sed -i 's/get_unused_fd_flags(0)/get_unused_fd_flags(O_CLOEXEC)/g' "$f"
 done || true
-
-# Vérification dure : plus aucun O_CLOEXEC ne doit avoir disparu
 {
-  echo "=== Contrôle O_CLOEXEC dans FinaSU ==="
+  echo "=== Contrôle O_CLOEXEC ==="
   grep -rn "get_unused_fd_flags" "$KSU_DIR/" 2>/dev/null | head -20
-  echo "--- anon_inode_getfile ---"
-  grep -rn "anon_inode_getfile" "$KSU_DIR/" 2>/dev/null | head -20
 } | tee -a "$AUDIT"
 
 # ==================== 4a. rules.c dual-path ====================
@@ -572,17 +558,20 @@ int handle_sepolicy(void __user *user_data, u64 data_len) { (void)user_data; (vo
 RULESEOF
 echo "✅ rules.c dual-path" | tee -a "$AUDIT"
 
-# ==================== 4b. FIX 4.19 + INJECTION PREINIT ====================
+# ==================== 4b. FIX 4.19 + PREINIT + SHIM SELINUX ====================
 python3 - "$GITHUB_WORKSPACE" <<'FIXEOF' 2>&1 | tee -a "$AUDIT"
 import os, sys, re
 GW = sys.argv[1]
 KR = os.path.join(GW, "kernel_sources")
 KS = os.path.join(KR, "FinaSU", "kernel")
+SPEC = os.path.join(GW, "output", "hooks-spec.txt")
 total = 0
 def read(p):
     with open(p, encoding='utf-8', errors='replace') as f: return f.read()
 def write(p, c):
     with open(p, 'w', encoding='utf-8') as f: f.write(c)
+def spec(s):
+    with open(SPEC, 'a', encoding='utf-8') as f: f.write(s + "\n")
 def inc(c, i):
     if i in c: return c
     L = c.split('\n'); last = -1
@@ -591,6 +580,11 @@ def inc(c, i):
     if last >= 0:
         L.insert(last+1, '#include '+i); return '\n'.join(L)
     return '#include '+i+'\n'+c
+def insert_after_last_include(c, block):
+    last = 0
+    for m in re.finditer(r'^\s*#include\s+[<"].*?[>"]\s*$', c, re.MULTILINE):
+        last = m.end()
+    return (c[:last] + "\n" + block + c[last:]) if last else (block + c)
 
 # FIX 2 : MODULE_IMPORT_NS
 for dp, dn, fn in os.walk(KS):
@@ -636,11 +630,7 @@ if os.path.isfile(p):
     c = read(p)
     if 'SECCOMP_ARCH_NATIVE_NR' in c and 'KSU_SECCOMP_COMPAT' not in c:
         blk='\n#ifndef KSU_SECCOMP_COMPAT\n#define KSU_SECCOMP_COMPAT 1\n#ifndef SECCOMP_ARCH_NATIVE_NR\n#ifdef CONFIG_COMPAT\n#define SECCOMP_ARCH_NATIVE_NR 2\n#else\n#define SECCOMP_ARCH_NATIVE_NR 1\n#endif\n#endif\n#endif\n'
-        L=c.split('\n'); last=-1
-        for n,l in enumerate(L):
-            if l.lstrip().startswith('#include'): last=n
-        if last>=0:
-            L.insert(last+1, blk); write(p,'\n'.join(L)); total+=1; print("  ✅ seccomp_cache.c")
+        write(p, insert_after_last_include(c, blk)); total+=1; print("  ✅ seccomp_cache.c")
 
 # FIX 5 : su_mount_ns.c
 p = os.path.join(KS,"infra/su_mount_ns.c")
@@ -756,12 +746,7 @@ for dp, dn, fn in os.walk(KS):
         p=os.path.join(dp,f); c=read(p); o=c
         if 'TWA_RESUME' in c and '#ifndef TWA_RESUME' not in c:
             c = inc(c, '<linux/version.h>')
-            L=c.split('\n'); last=-1
-            for n,l in enumerate(L):
-                if l.lstrip().startswith('#include'): last=n
-            blk='\n#ifndef TWA_RESUME\n#define TWA_RESUME 0\n#endif\n'
-            if last>=0: L.insert(last+1, blk); c='\n'.join(L)
-            else: c=blk+c
+            c = insert_after_last_include(c, '#ifndef TWA_RESUME\n#define TWA_RESUME 0\n#endif\n')
         if 'put_task_struct' in c:
             c = inc(c,'<linux/sched.h>'); c = inc(c,'<linux/sched/task.h>')
         if any(s in c for s in ('tasklist_lock','init_task','task_pgrp','task_session')) and f.endswith('.c'):
@@ -788,8 +773,6 @@ p = os.path.join(KS,"selinux/sepolicy.c")
 if os.path.isfile(p):
     c = read(p); o = c
     c = inc(c,'<linux/flex_array.h>')
-
-    # 9a. macros avtab (flex_array en 4.19)
     if 'ksu_avtab_htable_get' not in c and '#define KSU_SUPPORT_ADD_TYPE' in c:
         c = c.replace('#define KSU_SUPPORT_ADD_TYPE\n',
           '#define KSU_SUPPORT_ADD_TYPE\n\n'
@@ -804,10 +787,8 @@ if os.path.isfile(p):
                   'for (n = ksu_avtab_htable_get(db->te_avtab, i); n; prev = n, n = n->next) {', 1)
     c = c.replace('db->te_avtab.htable[i] = n->next;',
                   'ksu_avtab_htable_set(db->te_avtab, i, n->next);', 1)
-    c = c.replace('removed.htable[0] = n;',
-                  'ksu_avtab_htable_set(removed, 0, n);', 1)
+    c = c.replace('removed.htable[0] = n;', 'ksu_avtab_htable_set(removed, 0, n);', 1)
 
-    # 9b. add_filename_trans : API 5.9+ vs hashtab 4.19
     old_open = ('static bool add_filename_trans(struct policydb *db, const char *s, const char *t, const char *c, const char *d,\n'
                 '                               const char *o)\n{\n    struct type_datum *src, *tgt, *def;')
     new_open = '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n' + old_open
@@ -821,8 +802,7 @@ out:
     return false;
 }
 #else
-/* 4.19 : filename_trans = {stype,ttype,tclass,name}, datum = {otype},
- *        db->filename_trans est un hashtab, ttypes est un ebitmap */
+/* 4.19 : filename_trans = {stype,ttype,tclass,name}, datum = {otype} */
 static bool add_filename_trans(struct policydb *db, const char *s, const char *t, const char *c, const char *d,
                                const char *o)
 {
@@ -873,7 +853,6 @@ static bool add_filename_trans(struct policydb *db, const char *s, const char *t
     if old_close in c and '#else\n/* 4.19 : filename_trans' not in c:
         c = c.replace(old_close, new_close, 1)
 
-    # 9c. add_type : tableaux 5.10+ vs flex_array 4.19
     m = re.search(r'^static bool add_type\(struct policydb \*db, const char \*type_name, bool attr\)\n\{', c, re.MULTILINE)
     if m and 'KSU_ADD_TYPE_FLEX_ARRAY' not in c:
         start = m.start(); depth = 0; end = -1; i = m.end() - 1
@@ -972,14 +951,11 @@ static bool add_filename_trans(struct policydb *db, const char *s, const char *t
                         '}')
             c = c[:start] + new_func + c[end+1:]
 
-    # 9d. sattr
     old = '    struct ebitmap *sattr = &db->type_attr_map_array[type->value - 1];'
     new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n' + old +
            '\n#else\n    struct ebitmap *sattr = (struct ebitmap *)flex_array_get(db->type_attr_map_array, type->value - 1);\n#endif')
-    if old in c and new not in c:
-        c = c.replace(old, new, 1)
+    if old in c and new not in c: c = c.replace(old, new, 1)
 
-    # 9e. ksu_destroy_sepolicy / ksu_dup_sepolicy
     old = ('void ksu_destroy_sepolicy(struct selinux_policy *pol)\n{\n    policydb_destroy(&pol->policydb);\n'
            '    kfree(pol);\n}\n\nstruct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)\n{')
     if old in c and '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\nvoid ksu_destroy_sepolicy' not in c:
@@ -994,7 +970,7 @@ static bool add_filename_trans(struct policydb *db, const char *s, const char *t
         c = c.replace(oc, nc, 1)
 
     if c != o:
-        write(p,c); total+=1; print("  ✅ sepolicy.c : dual-path COMPLET (avtab + filename_trans + add_type)")
+        write(p,c); total+=1; print("  ✅ sepolicy.c : dual-path COMPLET")
 
 # FIX 10 : minmax.h
 for dp,dn,fn in os.walk(KS):
@@ -1005,7 +981,7 @@ for dp,dn,fn in os.walk(KS):
             c=c.replace('#include <linux/minmax.h>','/* KSU_MINMAX_COMPAT */\n#include <linux/kernel.h>',1)
             write(p,c); total+=1
 
-# FIX 12 : selinux_hide.c
+# FIX 12 : selinux_hide.c — layout 4.19
 p = os.path.join(KS,"feature/selinux_hide.c")
 if os.path.isfile(p):
     c=read(p); o=c
@@ -1041,12 +1017,12 @@ if os.path.isfile(p):
       "#endif /* KSU_SELINUX_HIDE_BACKUP */\n")
     if 'KSU_SELINUX_HIDE_BACKUP' in c and 'ksu_status_lock();' in c and not c.rstrip().endswith('#endif /* KSU_SELINUX_HIDE_BACKUP */'):
         c=c.rstrip('\n')+'\n'+stub
-    if c!=o: write(p,c); total+=1; print("  ✅ selinux_hide.c 4.19")
+    if c!=o: write(p,c); total+=1; print("  ✅ selinux_hide.c layout 4.19")
 
 # ===== FIX 13 : INJECTION DES 2 HOOKS PREINIT =====
 p = os.path.join(KR,"fs/exec.c")
 if os.path.isfile(p):
-    c = read(p); o = c
+    c = read(p)
     if 'ksu_setup_preinit_file' not in c:
         sig = None
         for s in ['static int __do_execve_file(int fd, struct filename *filename,',
@@ -1060,7 +1036,6 @@ if os.path.isfile(p):
                  '#endif\n')
             start = c.index(sig)
             c = c[:start] + ext + c[start:]
-            # délimiter le corps de la fonction
             bstart = c.index(sig)
             i = c.index('{', bstart); depth = 0; bend = -1
             while i < len(c):
@@ -1071,18 +1046,15 @@ if os.path.isfile(p):
                 i+=1
             if bend > 0:
                 body = c[bstart:bend+1]
-                # 1. variable preinit_fd
                 if 'bool is_su_session = false;' in body:
                     body = body.replace('bool is_su_session = false;',
                                         'bool is_su_session = false;\n\tint preinit_fd = 0;',1)
                 else:
                     body = body.replace('\tint retval;', '\tint retval;\n#ifdef CONFIG_KSU_SUSFS\n\tint preinit_fd = 0;\n#endif',1)
-                # 2. setup : après le bloc sucompat (label orig_flow)
                 if 'orig_flow:\n#endif' in body:
                     body = body.replace('orig_flow:\n#endif',
                         'orig_flow:\n#endif\n#ifdef CONFIG_KSU_SUSFS\n'
                         '\tpreinit_fd = ksu_setup_preinit_file(&filename, &argv);\n#endif',1)
-                # 3. post : AVANT chaque putname(filename) (succès ET erreur)
                 put = '\tif (filename)\n\t\tputname(filename);'
                 post=('#ifdef CONFIG_KSU_SUSFS\n'
                       '\tif (unlikely(preinit_fd > 0))\n'
@@ -1100,40 +1072,72 @@ if os.path.isfile(p):
     else:
         print("  ℹ️ fs/exec.c : preinit déjà présent")
 
+# ===== FIX 14 : API SELinux avec `struct selinux_state *` (4.19 backport Android) =====
+# Preuve : le patch SUSFS appelle security_sid_to_context(state, ssid, ...) dans avc.c.
+# FinaSU récent appelle l'API SANS state. On sonde security.h avant d'appliquer.
+sech = os.path.join(KR, "security/selinux/include/security.h")
+needs_state = False
+if os.path.isfile(sech):
+    h = read(sech)
+    needs_state = bool(re.search(r'int\s+security_context_to_sid\s*\(\s*struct\s+selinux_state\s*\*', h))
+    spec("### Prototypes SELinux réels (security.h) ###")
+    for ln in h.split('\n'):
+        if re.search(r'security_(context_to_sid|sid_to_context|compute_av_user)', ln):
+            spec("  " + ln.strip())
+print(f"  ℹ️ security.h : security_context_to_sid prend selinux_state = {needs_state}")
+
+if needs_state:
+    shim = r'''/* ==== KSU_SELINUX_STATE_ARG_419 ====
+ * Ce noyau 4.19 (backport Android selinux_state) attend `struct selinux_state *`
+ * en premier argument ; FinaSU récent appelle l'API sans state.
+ * Macros function-like : le nom interne n'est PAS ré-expandé (règle du
+ * préprocesseur C), donc l'appel atteint bien la fonction du noyau.
+ * Placées après tous les #include pour ne pas réécrire les déclarations.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+#ifndef KSU_SELINUX_STATE_ARG_419
+#define KSU_SELINUX_STATE_ARG_419 1
+#define security_context_to_sid(c, l, s, g) \
+	security_context_to_sid(&selinux_state, (c), (l), (s), (g))
+#define security_context_to_sid_default(c, l, s, d, g) \
+	security_context_to_sid_default(&selinux_state, (c), (l), (s), (d), (g))
+#define security_context_to_sid_force(c, l, s) \
+	security_context_to_sid_force(&selinux_state, (c), (l), (s))
+#define security_sid_to_context(i, c, l) \
+	security_sid_to_context(&selinux_state, (i), (c), (l))
+#define security_sid_to_context_force(i, c, l) \
+	security_sid_to_context_force(&selinux_state, (i), (c), (l))
+#define security_compute_av_user(s, t, c, a) \
+	security_compute_av_user(&selinux_state, (s), (t), (c), (a))
+#endif
+#endif
+'''
+    applied = []
+    for dp, dn, fn in os.walk(KS):
+        for f in fn:
+            if not f.endswith('.c'): continue
+            p = os.path.join(dp, f)
+            c = read(p)
+            if 'KSU_SELINUX_STATE_ARG_419' in c: continue
+            if not re.search(r'\bsecurity_(context_to_sid|sid_to_context|compute_av_user)\s*\(', c):
+                continue
+            c = inc(c, '<linux/version.h>')
+            c = insert_after_last_include(c, shim)
+            write(p, c); total += 1
+            applied.append(os.path.relpath(p, KS))
+    if applied:
+        print("  ✅ FIX 14 shim selinux_state appliqué à : " + ", ".join(applied))
+    spec("\n### Appels SELinux dans selinux_hide.c (après shim) ###")
+    hp = os.path.join(KS, "feature/selinux_hide.c")
+    if os.path.isfile(hp):
+        for n, ln in enumerate(read(hp).split('\n'), 1):
+            if re.search(r'\bsecurity_(context_to_sid|sid_to_context|compute_av_user)', ln):
+                spec(f"  {n}: {ln.strip()}")
+else:
+    print("  ℹ️ FIX 14 non applicable : le noyau n'attend pas selinux_state")
+
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
-
-# --- Golden : stub security_context_to_sid_live (4.19) ---
-HIDE="$KSU_DIR/feature/selinux_hide.c"
-if [ -f "$HIDE" ] && grep -q "security_context_to_sid_live" "$HIDE" \
-   && ! grep -q "KSU_SID_LIVE_STUB_419" "$HIDE"; then
-  python3 - "$HIDE" <<'PY'
-import sys, re
-p = sys.argv[1]
-c = open(p, encoding="utf-8", errors="replace").read()
-if "KSU_SID_LIVE_STUB_419" in c:
-    raise SystemExit(0)
-stub = """
-/* KSU_SID_LIVE_STUB_419 : corps manquant sur chemin 4.19 */
-#include <linux/version.h>
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
-#ifndef KSU_SID_LIVE_STUB_419
-#define KSU_SID_LIVE_STUB_419 1
-static int security_context_to_sid_live(const char *ctx, u32 ctxlen, u32 *sid, gfp_t gfp)
-{
-	return security_context_to_sid(ctx, ctxlen, sid, gfp);
-}
-#endif
-#endif
-"""
-last = 0
-for m in re.finditer(r'#include\s+[<"].*?[>"]\s*\n', c):
-    last = m.end()
-c = (c[:last] + stub + c[last:]) if last else stub + c
-open(p, "w", encoding="utf-8").write(c)
-print("  ✅ selinux_hide.c : stub security_context_to_sid_live (4.19)")
-PY
-fi
 
 # Verdict immédiat du validateur
 echo "=== VERDICT check_susfs_inline.sh ===" | tee -a "$AUDIT"
@@ -1173,8 +1177,7 @@ grep -q "^CONFIG_KSU_HOOK_SUSFS_INLINE=y" out/.config || { echo "❌ INLINE off"
 make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 headers_install 2>&1 | tail -2
 [ -f out/usr/include/linux/unistd.h ] && echo "✅ UAPI headers OK (preinit actif)" | tee -a "$AUDIT"
 
-# 4.19 n'a pas include/uapi/linux/mount.h (ajouté en 5.2).
-# Le runner nolibc l'inclut => shim minimal. MS_* sont dans uapi/linux/fs.h en 4.19.
+# 4.19 n'a pas include/uapi/linux/mount.h (ajouté en 5.2). Le runner nolibc l'inclut.
 if [ ! -f out/usr/include/linux/mount.h ]; then
 cat > out/usr/include/linux/mount.h <<'MNTSHIM'
 #ifndef _LINUX_MOUNT_H
@@ -1185,16 +1188,6 @@ cat > out/usr/include/linux/mount.h <<'MNTSHIM'
 MNTSHIM
 echo "✅ shim out/usr/include/linux/mount.h créé" | tee -a "$AUDIT"
 fi
-
-# Diag : ce que le runner attend réellement de ce header
-set +e
-{
-  echo "### nolibc/sys/mount.h ###"
-  cat FinaSU/kernel/preinit/runner/nolibc/sys/mount.h 2>/dev/null | head -40
-  echo "### headers UAPI linux/ disponibles (mount / fs) ###"
-  ls -la out/usr/include/linux/mount.h out/usr/include/linux/fs.h 2>/dev/null
-} >> "$SPEC" 2>&1
-set -e
 
 # ==================== 6. MOTOROLA ====================
 sed -i 's/if (!check_version(/if (0 \&\& !check_version(/g' kernel/module.c
