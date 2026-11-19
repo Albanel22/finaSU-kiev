@@ -304,7 +304,6 @@ Installez **l'APK dont la signature a été calculée au build**. Le noyau véri
 | [NonGKI_Kernel_Build_2nd](https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd) | **JackA1ltman** | patch SUSFS 4.19 + script des hooks inline |
 | — | **backslashxx** | co-auteur du script de hooks |
 | [KernelSU](https://github.com/tiann/KernelSU) | **tiann** | projet amont |
-| [LineageOS](https://github.com/LineageOS) | équipe LineageOS | sources noyau & ROM |
 | Zygisk Next · MetaModule | auteurs respectifs | injection Zygisk & montage modules |
 
 Le code SUSFS et le driver FinaSU appartiennent à leurs auteurs. Ce dépôt ne contient que le **portage 4.19** : scripts de build, dual-paths de compatibilité et injection des hooks preinit.
