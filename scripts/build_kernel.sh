@@ -5,7 +5,7 @@ GITHUB_WORKSPACE="${GITHUB_WORKSPACE:-$PWD}"
 export GITHUB_WORKSPACE
 
 FINASU_URL="${FINASU_URL:-https://github.com/LyraVoid/FinaSU.git}"
-FINASU_REF="${FINASU_REF:-v1.5.0}"
+FINASU_REF="${FINASU_REF:-latest}"
 KERNEL_PIN="${KERNEL_PIN:-9426323c2acd0865fd565a6dd8a9f39f831cbec3}"
 FINASU_EXPECTED_SIZE="${FINASU_EXPECTED_SIZE:-}"
 FINASU_EXPECTED_HASH="${FINASU_EXPECTED_HASH:-}"
@@ -19,7 +19,7 @@ df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
 DTBO_GDRIVE_ID="11451aa0CCzyVtNTYOK2n6oH6E0PT-2NX"
-MGR_GDRIVE_ID="1Qr07fjThXjmIz_DAmW2GZepoWrNIikXR"
+MGR_GDRIVE_ID="11gKehkaCHKPAYbjOcVDx1IIvNc_2t4j9"
 
 mkdir -p "$GITHUB_WORKSPACE/output" "$GITHUB_WORKSPACE/patches"
 AUDIT="$GITHUB_WORKSPACE/output/audit-${VER}.txt"
@@ -190,8 +190,33 @@ echo "✅ Stubs path_mount/path_umount" | tee -a "$AUDIT"
 echo "=== Intégration FinaSU ==="
 rm -rf drivers/kernelsu FinaSU 2>/dev/null || true
 git clone "$FINASU_URL" FinaSU
-git -C FinaSU checkout "$FINASU_REF"
-echo "FinaSU : $(git -C FinaSU describe --tags --always)" | tee -a "$AUDIT"
+git -C FinaSU fetch --tags --force 2>/dev/null || true
+
+if [ "$FINASU_REF" = "latest" ] || [ -z "$FINASU_REF" ]; then
+    RESOLVED="$(git -C FinaSU tag -l 'v*' --sort=-v:refname | head -1 || true)"
+    [ -z "$RESOLVED" ] && RESOLVED="$(git -C FinaSU describe --tags --abbrev=0 2>/dev/null || true)"
+    [ -z "$RESOLVED" ] && RESOLVED="master"
+    FINASU_REF="$RESOLVED"
+    echo "✅ FinaSU résolu (latest) : $FINASU_REF" | tee -a "$AUDIT"
+fi
+
+set +e
+git -C FinaSU checkout -q "$FINASU_REF"
+CO_RC=$?
+[ $CO_RC -ne 0 ] && git -C FinaSU checkout -q master && CO_RC=$?
+[ $CO_RC -ne 0 ] && git -C FinaSU checkout -q main && CO_RC=$?
+set -e
+[ $CO_RC -eq 0 ] || { echo "❌ checkout FinaSU impossible"; exit 1; }
+
+FINASU_COMMIT="$(git -C FinaSU rev-parse HEAD)"
+FINASU_DESC="$(git -C FinaSU describe --tags --always)"
+echo "FinaSU effectif : $FINASU_DESC ($FINASU_COMMIT)" | tee -a "$AUDIT"
+{
+  echo "FINASU_REF=$FINASU_REF"
+  echo "FINASU_COMMIT=$FINASU_COMMIT"
+  echo "FINASU_DESC=$FINASU_DESC"
+  echo "DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} | tee "$GITHUB_WORKSPACE/output/finasu.lock" | tee -a "$AUDIT"
 [ -f FinaSU/kernel/setup.sh ] && bash FinaSU/kernel/setup.sh --dir "$PWD/FinaSU"
 if [ ! -e drivers/kernelsu ]; then
     ln -sfn ../FinaSU/kernel drivers/kernelsu
@@ -261,6 +286,13 @@ if [ -n "$FINASU_EXPECTED_SIZE" ] && [ -n "$FINASU_EXPECTED_HASH" ]; then
     SIG_ARGS="KSU_EXPECTED_SIZE=$FINASU_EXPECTED_SIZE KSU_EXPECTED_HASH=$FINASU_EXPECTED_HASH"
     echo "✅ Signature manager OK" | tee -a "$AUDIT"
 fi
+
+{
+  echo "MGR_GDRIVE_ID=$MGR_GDRIVE_ID"
+  echo "MGR_SIZE=${FINASU_EXPECTED_SIZE:-}"
+  echo "MGR_HASH=${FINASU_EXPECTED_HASH:-}"
+} >> "$GITHUB_WORKSPACE/output/finasu.lock"
+echo "Lock manager → finasu.lock" | tee -a "$AUDIT"
 
 # ==================== 3h. RETRAIT 'static' (O_CLOEXEC PRÉSERVÉ) ====================
 for f in security/selinux/ss/status.c security/selinux/selinuxfs.c security/selinux/status.c; do
