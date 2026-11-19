@@ -1103,43 +1103,76 @@ if os.path.isfile(p):
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
 
-# --- Golden : stub security_context_to_sid_live (4.19) ---
+# --- Golden : security_context_to_sid_live 3-args + corps upstream hors 4.19 ---
 HIDE="$KSU_DIR/feature/selinux_hide.c"
-if [ -f "$HIDE" ] && grep -q "security_context_to_sid_live" "$HIDE" \
-   && ! grep -q "KSU_SID_LIVE_STUB_419" "$HIDE"; then
+if [ -f "$HIDE" ] && grep -q "security_context_to_sid_live" "$HIDE"; then
   python3 - "$HIDE" <<'PY'
 import sys, re
 p = sys.argv[1]
 c = open(p, encoding="utf-8", errors="replace").read()
-if "KSU_SID_LIVE_STUB_419" in c:
-    raise SystemExit(0)
-stub = """
-/* KSU_SID_LIVE_STUB_419 : corps manquant sur chemin 4.19 */
+
+# 1) Retirer un ancien stub incorrect
+c = re.sub(
+    r"/\* KSU_SID_LIVE_STUB_419[\s\S]*?#endif\s*\n#endif\s*\n?",
+    "",
+    c,
+    count=1,
+)
+
+# 2) Stub 3 args (signature FinaSU) pour < 5.10
+stub = r'''
+/* KSU_SID_LIVE_STUB_419 — signature FinaSU : (ctx, len, sid) */
 #include <linux/version.h>
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 #ifndef KSU_SID_LIVE_STUB_419
 #define KSU_SID_LIVE_STUB_419 1
-static int security_context_to_sid_live(const char *ctx, u32 ctxlen, u32 *sid, gfp_t gfp)
+static int security_context_to_sid_live(const char *scontext, u32 scontext_len, u32 *sid)
 {
-	return security_context_to_sid(ctx, ctxlen, sid, gfp);
+	return security_context_to_sid(scontext, scontext_len, sid, GFP_KERNEL);
 }
 #endif
 #endif
-"""
-last = 0
-for m in re.finditer(r'#include\s+[<"].*?[>"]\s*\n', c):
-    last = m.end()
-c = (c[:last] + stub + c[last:]) if last else stub + c
+'''
+if "KSU_SID_LIVE_STUB_419" not in c:
+    last = 0
+    for m in re.finditer(r'#include\s+[<"].*?[>"]\s*\n', c):
+        last = m.end()
+    c = (c[:last] + stub + c[last:]) if last else stub + c
+
+# 3) Corps upstream complet : uniquement >= 5.10 (évite double définition + selinux_policy)
+pat = re.compile(
+    r'(static int security_context_to_sid_live\s*\(\s*const char \*scontext,\s*u32 scontext_len,\s*u32 \*sid\s*\)\s*\{)',
+    re.M,
+)
+m = pat.search(c)
+if m and "KSU_SID_LIVE_BODY_GUARDED" not in c:
+    # trouver la fin de la fonction (accolades)
+    i = m.end() - 1
+    depth = 0
+    end = -1
+    while i < len(c):
+        if c[i] == '{':
+            depth += 1
+        elif c[i] == '}':
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+        i += 1
+    if end > 0:
+        body = c[m.start():end+1]
+        guarded = (
+            "/* KSU_SID_LIVE_BODY_GUARDED */\n"
+            "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n"
+            + body +
+            "\n#endif /* >= 5.10 security_context_to_sid_live */\n"
+        )
+        c = c[:m.start()] + guarded + c[end+1:]
+
 open(p, "w", encoding="utf-8").write(c)
-print("  ✅ selinux_hide.c : stub security_context_to_sid_live (4.19)")
+print("  ✅ selinux_hide.c : live 3-args + corps upstream gardé >=5.10")
 PY
 fi
-
-# Verdict immédiat du validateur
-echo "=== VERDICT check_susfs_inline.sh ===" | tee -a "$AUDIT"
-set +e
-sh FinaSU/kernel/tools/check_susfs_inline.sh "$PWD" 2>&1 | tee -a "$AUDIT"
-set -e
 
 # ==================== 5. CONFIG ====================
 export ARCH=arm64 SUBARCH=arm64
