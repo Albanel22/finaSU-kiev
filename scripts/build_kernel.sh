@@ -1015,11 +1015,16 @@ if os.path.isfile(p):
       "static void security_compute_av_user_with_policy(struct selinux_policy *p, u32 ssid, u32 tsid, u16 tc, struct av_decision *avd)\n"
       "{\n    avd->allowed = 0; avd->auditallow = 0; avd->auditdeny = 0xffffffff; avd->seqno = 0; avd->flags = 0;\n}\n\n"
       "/* KSU_SID_LIVE_419 : definition manquante sur le chemin 4.19.\n"
-      " * Signature a 3 parametres, identique a la declaration ligne ~98.\n"
-      " * Appel a 4 arguments : la macro KSU_SELINUX_STATE_ARG_419 prepends &selinux_state.\n"
-      " * Sur 4.19 il n'y a qu'une seule politique (modifiee en place), donc live == courante. */\n"
+      " * Signature a 3 parametres = celle de la declaration ligne ~98.\n"
+      " * On neutralise la macro eventuelle puis on appelle explicitement\n"
+      " * l'API 4.19 a 5 arguments (state en premier). Deterministe que la\n"
+      " * macro KSU_SELINUX_STATE_ARG_419 soit active ou non.\n"
+      " * Sur 4.19 une seule politique (modifiee en place) => live == courante. */\n"
+      "#ifdef security_context_to_sid\n"
+      "#undef security_context_to_sid\n"
+      "#endif\n"
       "static int security_context_to_sid_live(const char *scontext, u32 scontext_len, u32 *sid)\n"
-      "{\n    return security_context_to_sid(scontext, scontext_len, sid, GFP_KERNEL);\n}\n"
+      "{\n    return security_context_to_sid(&selinux_state, scontext, scontext_len, sid, GFP_KERNEL);\n}\n"
       "#endif /* KSU_SELINUX_HIDE_BACKUP */\n")
     if 'KSU_SELINUX_HIDE_BACKUP' in c and 'ksu_status_lock();' in c and not c.rstrip().endswith('#endif /* KSU_SELINUX_HIDE_BACKUP */'):
         c=c.rstrip('\n')+'\n'+stub
