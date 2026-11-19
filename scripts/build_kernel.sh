@@ -1103,7 +1103,7 @@ if os.path.isfile(p):
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
 
-# --- Golden : security_context_to_sid_live 3-args + corps upstream hors 4.19 ---
+# --- Golden : forcer security_context_to_sid_live (3 args) en fin de fichier ---
 HIDE="$KSU_DIR/feature/selinux_hide.c"
 if [ -f "$HIDE" ] && grep -q "security_context_to_sid_live" "$HIDE"; then
   python3 - "$HIDE" <<'PY'
@@ -1111,66 +1111,62 @@ import sys, re
 p = sys.argv[1]
 c = open(p, encoding="utf-8", errors="replace").read()
 
-# 1) Retirer un ancien stub incorrect
-c = re.sub(
-    r"/\* KSU_SID_LIVE_STUB_419[\s\S]*?#endif\s*\n#endif\s*\n?",
-    "",
-    c,
-    count=1,
-)
+# Nettoyer d'éventuels anciens stubs / gardes partiels
+c = re.sub(r"/\* KSU_SID_LIVE_STUB_419[\s\S]*?#endif\s*\n#endif\s*\n?", "", c)
+c = re.sub(r"/\* KSU_SID_LIVE_BODY_GUARDED \*/\s*\n#if LINUX_VERSION_CODE >= KERNEL_VERSION\(5, 10, 0\)\s*\n", "", c)
+c = re.sub(r"\n#endif /\* >= 5\.10 security_context_to_sid_live \*/\s*\n?", "\n", c)
+c = c.replace("KSU_SID_LIVE_DEFINED_419", "KSU_SID_LIVE_DEFINED_419_OLD")
 
-# 2) Stub 3 args (signature FinaSU) pour < 5.10
-stub = r'''
-/* KSU_SID_LIVE_STUB_419 — signature FinaSU : (ctx, len, sid) */
-#include <linux/version.h>
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
-#ifndef KSU_SID_LIVE_STUB_419
-#define KSU_SID_LIVE_STUB_419 1
-static int security_context_to_sid_live(const char *scontext, u32 scontext_len, u32 *sid)
-{
-	return security_context_to_sid(scontext, scontext_len, sid, GFP_KERNEL);
-}
-#endif
-#endif
-'''
-if "KSU_SID_LIVE_STUB_419" not in c:
-    last = 0
-    for m in re.finditer(r'#include\s+[<"].*?[>"]\s*\n', c):
-        last = m.end()
-    c = (c[:last] + stub + c[last:]) if last else stub + c
-
-# 3) Corps upstream complet : uniquement >= 5.10 (évite double définition + selinux_policy)
+# Garder le corps upstream sous >= 5.10 s'il est encore nu
 pat = re.compile(
-    r'(static int security_context_to_sid_live\s*\(\s*const char \*scontext,\s*u32 scontext_len,\s*u32 \*sid\s*\)\s*\{)',
+    r"(static int security_context_to_sid_live\s*\(\s*const char \*scontext,\s*u32 scontext_len,\s*u32 \*sid\s*\)\s*\{)",
     re.M,
 )
 m = pat.search(c)
 if m and "KSU_SID_LIVE_BODY_GUARDED" not in c:
-    # trouver la fin de la fonction (accolades)
     i = m.end() - 1
     depth = 0
     end = -1
     while i < len(c):
-        if c[i] == '{':
+        if c[i] == "{":
             depth += 1
-        elif c[i] == '}':
+        elif c[i] == "}":
             depth -= 1
             if depth == 0:
                 end = i
                 break
         i += 1
     if end > 0:
-        body = c[m.start():end+1]
-        guarded = (
-            "/* KSU_SID_LIVE_BODY_GUARDED */\n"
-            "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n"
-            + body +
-            "\n#endif /* >= 5.10 security_context_to_sid_live */\n"
-        )
-        c = c[:m.start()] + guarded + c[end+1:]
+        body = c[m.start():end + 1]
+        # Ne wrapper que si le corps n'est pas déjà le stub court
+        if "return security_context_to_sid(scontext, scontext_len, sid, GFP_KERNEL)" not in body:
+            guarded = (
+                "/* KSU_SID_LIVE_BODY_GUARDED */\n"
+                "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n"
+                + body
+                + "\n#endif /* >= 5.10 security_context_to_sid_live */\n"
+            )
+            c = c[:m.start()] + guarded + c[end + 1:]
+
+# Définition 4.19 TOUJOURS en fin de fichier (après les #endif du portage)
+if "KSU_SID_LIVE_DEFINED_419" not in c:
+    c = c.rstrip() + """
+
+/* KSU_SID_LIVE_DEFINED_419 — corps garanti pour 4.19 (après tout portage) */
+#include <linux/version.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+#ifndef KSU_SID_LIVE_DEFINED_419
+#define KSU_SID_LIVE_DEFINED_419
+static int security_context_to_sid_live(const char *scontext, u32 scontext_len, u32 *sid)
+{
+	return security_context_to_sid(scontext, scontext_len, sid, GFP_KERNEL);
+}
+#endif
+#endif
+"""
 
 open(p, "w", encoding="utf-8").write(c)
-print("  ✅ selinux_hide.c : live 3-args + corps upstream gardé >=5.10")
+print("  ✅ selinux_hide.c : security_context_to_sid_live forcé en fin de fichier")
 PY
 fi
 
