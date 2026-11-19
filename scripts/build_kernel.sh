@@ -1103,6 +1103,38 @@ if os.path.isfile(p):
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
 
+# --- Golden : stub security_context_to_sid_live (4.19) ---
+HIDE="$KSU_DIR/feature/selinux_hide.c"
+if [ -f "$HIDE" ] && grep -q "security_context_to_sid_live" "$HIDE" \
+   && ! grep -q "KSU_SID_LIVE_STUB_419" "$HIDE"; then
+  python3 - "$HIDE" <<'PY'
+import sys, re
+p = sys.argv[1]
+c = open(p, encoding="utf-8", errors="replace").read()
+if "KSU_SID_LIVE_STUB_419" in c:
+    raise SystemExit(0)
+stub = """
+/* KSU_SID_LIVE_STUB_419 : corps manquant sur chemin 4.19 */
+#include <linux/version.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+#ifndef KSU_SID_LIVE_STUB_419
+#define KSU_SID_LIVE_STUB_419 1
+static int security_context_to_sid_live(const char *ctx, u32 ctxlen, u32 *sid, gfp_t gfp)
+{
+	return security_context_to_sid(ctx, ctxlen, sid, gfp);
+}
+#endif
+#endif
+"""
+last = 0
+for m in re.finditer(r'#include\s+[<"].*?[>"]\s*\n', c):
+    last = m.end()
+c = (c[:last] + stub + c[last:]) if last else stub + c
+open(p, "w", encoding="utf-8").write(c)
+print("  ✅ selinux_hide.c : stub security_context_to_sid_live (4.19)")
+PY
+fi
+
 # Verdict immédiat du validateur
 echo "=== VERDICT check_susfs_inline.sh ===" | tee -a "$AUDIT"
 set +e
