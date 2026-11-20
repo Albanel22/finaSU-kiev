@@ -6,9 +6,11 @@
 [![Device](https://img.shields.io/badge/device-kiev-green)]()
 [![FinaSU](https://img.shields.io/badge/FinaSU-v1.6.4+-orange)]()
 [![Hook](https://img.shields.io/badge/hook-SUSFS%20Inline-purple)]()
-[![Quick Start]
-(https://fina.mysqil.com/en/-yellow).](.)
+
 ---
+
+Quick Start
+https://fina.mysqil.com/en/guide/get-started/
 
 ## Résultat (baseline Golden)
 
