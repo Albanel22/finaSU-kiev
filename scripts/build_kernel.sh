@@ -1112,35 +1112,47 @@ if os.path.isfile(p):
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
 
-# --- Golden : stub security_context_to_sid_live (4.19) ---
+# --- GOLDEN : Correction complète selinux_hide.c pour 4.19 ---
 HIDE="$KSU_DIR/feature/selinux_hide.c"
-if [ -f "$HIDE" ] && grep -q "security_context_to_sid_live" "$HIDE" \
-   && ! grep -q "KSU_SID_LIVE_STUB_419" "$HIDE"; then
+if [ -f "$HIDE" ]; then
   python3 - "$HIDE" <<'PY'
 import sys, re
 p = sys.argv[1]
 c = open(p, encoding="utf-8", errors="replace").read()
-if "KSU_SID_LIVE_STUB_419" in c:
+if "KSU_SELINUX_419_PATCHED" in c:
     raise SystemExit(0)
+
+# 1. Corriger les appels aux fonctions SELinux qui ont reçu un backport de l'argument 'state'
+c = re.sub(r'security_context_to_sid\((?!&selinux_state)', r'security_context_to_sid(&selinux_state, ', c)
+c = re.sub(r'security_sid_to_context\((?!&selinux_state)', r'security_sid_to_context(&selinux_state, ', c)
+
+# 2. Remplacer ou commenter toute définition existante de security_context_to_sid_live pour éviter "conflicting types"
+c = re.sub(
+    r'(^static int security_context_to_sid_live\s*\([^)]+\)\s*\{.*?\n\})',
+    r'/* COMMENTED FOR 4.19 COMPAT: \1 */',
+    c,
+    flags=re.MULTILINE | re.DOTALL
+)
+
+# 3. Injecter le stub correct
 stub = """
-/* KSU_SID_LIVE_STUB_419 : corps manquant sur chemin 4.19 */
+/* KSU_SELINUX_419_PATCHED */
 #include <linux/version.h>
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
-#ifndef KSU_SID_LIVE_STUB_419
-#define KSU_SID_LIVE_STUB_419 1
 static int security_context_to_sid_live(const char *ctx, u32 ctxlen, u32 *sid, gfp_t gfp)
 {
-	return security_context_to_sid(ctx, ctxlen, sid, gfp);
+	return security_context_to_sid(&selinux_state, ctx, ctxlen, sid, gfp);
 }
 #endif
-#endif
 """
+
 last = 0
 for m in re.finditer(r'#include\s+[<"].*?[>"]\s*\n', c):
     last = m.end()
 c = (c[:last] + stub + c[last:]) if last else stub + c
+
 open(p, "w", encoding="utf-8").write(c)
-print("  ✅ selinux_hide.c : stub security_context_to_sid_live (4.19)")
+print("  ✅ selinux_hide.c : corrigé pour la compatibilité 4.19 (arguments selinux_state et stub unique)")
 PY
 fi
 
@@ -1242,7 +1254,7 @@ cat > .cargo/config.toml <<EOF
 [target.aarch64-linux-android]
 linker = "$NDK/bin/aarch64-linux-android26-clang"
 [env]
-CC_aarch64_linux_android = "$NDK/bin/aarch64-linux26-clang"
+CC_aarch64_linux_android = "$NDK/bin/aarch64-linux-android26-clang"
 CXX_aarch64_linux_android = "$NDK/bin/aarch64-linux-android26-clang++"
 AR_aarch64_linux_android = "$NDK/bin/llvm-ar"
 BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android = "--sysroot=$NDK/sysroot -I$NDK/sysroot/usr/include/aarch64-linux-android"
