@@ -1014,43 +1014,38 @@ for dp,dn,fn in os.walk(KS):
             c=c.replace('#include <linux/minmax.h>','/* KSU_MINMAX_COMPAT */\n#include <linux/kernel.h>',1)
             write(p,c); total+=1
 
-# FIX 12 : selinux_hide.c
-p = os.path.join(KS,"feature/selinux_hide.c")
-if os.path.isfile(p):
-    c=read(p); o=c
-    compat=("/* ==== Compat 4.19 ==== */\n#include <linux/version.h>\n"
-      "#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n"
-      "#define KSU_SELINUX_HIDE_BACKUP 0\nstruct selinux_policy *backup_sepolicy;\n"
-      "#define symtab_search(s,name) hashtab_search(&(s)->table, name)\n"
-      "#define ksu_status_lock()   mutex_lock(&selinux_state.ss->status_lock)\n"
-      "#define ksu_status_unlock() mutex_unlock(&selinux_state.ss->status_lock)\n"
-      "#define ksu_status_page     (selinux_state.ss->status_page)\n#else\n"
-      "#define KSU_SELINUX_HIDE_BACKUP 1\n"
-      "#define ksu_status_lock()   mutex_lock(&selinux_state.status_lock)\n"
-      "#define ksu_status_unlock() mutex_unlock(&selinux_state.status_lock)\n"
-      "#define ksu_status_page     (selinux_state.status_page)\n#endif\n\n")
-    if 'KSU_SELINUX_HIDE_BACKUP' not in c:
-        c=c.replace('static DEFINE_MUTEX(selinux_hide_mutex);', compat+'static DEFINE_MUTEX(selinux_hide_mutex);',1)
-    c=c.replace('mutex_lock(&selinux_state.status_lock);','ksu_status_lock();')
-    c=c.replace('mutex_unlock(&selinux_state.status_lock);','ksu_status_unlock();')
-    c=c.replace('selinux_state.status_page','ksu_status_page')
-    od="void ksu_selinux_hide_drop_backup_if_unused()\n{\n    mutex_lock(&selinux_hide_mutex);"
-    nd="void ksu_selinux_hide_drop_backup_if_unused()\n{\n#if KSU_SELINUX_HIDE_BACKUP\n    mutex_lock(&selinux_hide_mutex);"
-    if od in c and nd not in c: c=c.replace(od,nd,1)
-    ot="    mutex_unlock(&selinux_hide_mutex);\n}\n\n/*\n * Caveat:  Mutates scontext."
-    nt="    mutex_unlock(&selinux_hide_mutex);\n#endif\n}\n\n#if KSU_SELINUX_HIDE_BACKUP\n/*\n * Caveat:  Mutates scontext."
-    if ot in c and nt not in c: c=c.replace(ot,nt,1)
-    stub=("\n#else\n\nstatic int security_context_to_sid_with_policy(struct selinux_policy *p, const char *s, u32 sl,\n"
-      "    u32 *sid, u32 dsid, gfp_t g, u32 *osid, int *orc)\n{\n    if (osid) *osid = SECSID_NULL;\n"
-      "    if (orc) *orc = -EOPNOTSUPP;\n    return -EOPNOTSUPP;\n}\n\n"
-      "static int security_sid_to_context_with_policy(struct selinux_policy *p, u32 sid, char **s, u32 *sl)\n"
-      "{\n    if (s) *s = NULL;\n    *sl = 0;\n    return -EOPNOTSUPP;\n}\n\n"
-      "static void security_compute_av_user_with_policy(struct selinux_policy *p, u32 ssid, u32 tsid, u16 tc, struct av_decision *avd)\n"
-      "{\n    avd->allowed = 0; avd->auditallow = 0; avd->auditdeny = 0xffffffff; avd->seqno = 0; avd->flags = 0;\n}\n"
-      "#endif /* KSU_SELINUX_HIDE_BACKUP */\n")
-    if 'KSU_SELINUX_HIDE_BACKUP' in c and 'ksu_status_lock();' in c and not c.rstrip().endswith('#endif /* KSU_SELINUX_HIDE_BACKUP */'):
-        c=c.rstrip('\n')+'\n'+stub
-    if c!=o: write(p,c); total+=1; print("  ✅ selinux_hide.c 4.19")
+# ==================== FIX SELINUX_HIDE 4.19 ====================
+python3 - "$KSU_DIR/feature/selinux_hide.c" <<'PYEOF'
+import sys, re
+
+p = sys.argv[1]
+try:
+    with open(p, "r", encoding="utf-8", errors="replace") as f:
+        c = f.read()
+except Exception as e:
+    print(f"  ⚠️ Could not read {p}: {e}")
+    sys.exit(0)
+
+# 1. Renommer la fonction wrapper pour éviter l'erreur "conflicting types"
+c = re.sub(r'(\bstatic\s+int\s+)security_context_to_sid_live\s*\(', r'\1ksu_sec_ctx_to_sid_live(', c)
+
+# 2. Corriger l'appel interne de ce wrapper s'il existe
+c = c.replace('return security_context_to_sid(ctx, ctxlen, sid, gfp);', 
+              'return security_context_to_sid(&selinux_state, ctx, ctxlen, sid, gfp);')
+c = c.replace('return security_context_to_sid(ctx, ctxlen, sid);', 
+              'return security_context_to_sid(&selinux_state, ctx, ctxlen, sid);')
+
+# 3. Corriger TOUS les autres appels à ces fonctions SELinux en ajoutant &selinux_state,
+# Cela gère le backport de LineageOS 4.19 où 'state' est le premier argument.
+c = re.sub(r'\bsecurity_context_to_sid\((?!&selinux_state,)', r'security_context_to_sid(&selinux_state, ', c)
+c = re.sub(r'\bsecurity_sid_to_context\((?!&selinux_state,)', r'security_sid_to_context(&selinux_state, ', c)
+c = re.sub(r'\bsecurity_compute_av_user\((?!&selinux_state,)', r'security_compute_av_user(&selinux_state, ', c)
+
+with open(p, "w", encoding="utf-8") as f:
+    f.write(c)
+
+print("  ✅ selinux_hide.c: patched for 4.19 selinux_state backport")
+PYEOF
 
 # ===== FIX 13 : INJECTION DES 2 HOOKS PREINIT =====
 p = os.path.join(KR,"fs/exec.c")
