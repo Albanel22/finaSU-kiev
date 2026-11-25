@@ -1054,7 +1054,11 @@ if os.path.isfile(p):
       "static int security_sid_to_context_with_policy(struct selinux_policy *p, u32 sid, char **s, u32 *sl)\n"
       "{\n    if (s) *s = NULL;\n    *sl = 0;\n    return -EOPNOTSUPP;\n}\n\n"
       "static void security_compute_av_user_with_policy(struct selinux_policy *p, u32 ssid, u32 tsid, u16 tc, struct av_decision *avd)\n"
-      "{\n    avd->allowed = 0; avd->auditallow = 0; avd->auditdeny = 0xffffffff; avd->seqno = 0; avd->flags = 0;\n}\n"
+      "{\n    avd->allowed = 0; avd->auditallow = 0; avd->auditdeny = 0xffffffff; avd->seqno = 0; avd->flags = 0;\n}\n\n"
+      "/* 4.19 : definition manquante de _live (l'originale est dans la branche >=5.10).\n"
+      " * Signature alignee sur la declaration en tete de fichier : 3 params, sans gfp. */\n"
+      "static int security_context_to_sid_live(const char *scontext, u32 scontext_len, u32 *sid)\n"
+      "{\n    return security_context_to_sid(&selinux_state, scontext, scontext_len, sid, GFP_KERNEL);\n}\n"
       "#endif /* KSU_SELINUX_HIDE_BACKUP */\n")
     if 'KSU_SELINUX_HIDE_BACKUP' in c and not c.rstrip().endswith('#endif /* KSU_SELINUX_HIDE_BACKUP */'):
         c = c.rstrip('\n')+'\n'+stub
