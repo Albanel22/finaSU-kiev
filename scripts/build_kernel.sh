@@ -34,7 +34,7 @@ summarize() {
     {
         echo "=== RÉSUMÉ DU BUILD (code de sortie $rc) ==="
         echo "########## VERDICT VALIDATEUR + DIAG ##########"
-        head -n 120 "$SPEC" 2>/dev/null || echo "(spec absente)"
+        head -n 160 "$SPEC" 2>/dev/null || echo "(spec absente)"
         echo ""
         if [ -f "$BL" ]; then
             echo "########## HOOK-SITES MANQUANTS ##########"
@@ -47,7 +47,7 @@ summarize() {
             tail -n 25 "$BL"
         else
             echo "pas de build.log : arrêt avant compilation"
-            tail -n 30 "$AUDIT" 2>/dev/null
+            tail -n 40 "$AUDIT" 2>/dev/null
         fi
     } > "$SUM" 2>&1
     cat "$SUM"
@@ -311,8 +311,7 @@ grep -rl "get_unused_fd_flags(0)" "$KSU_DIR/" 2>/dev/null | while read -r f; do
     sed -i 's/get_unused_fd_flags(0)/get_unused_fd_flags(O_CLOEXEC)/g' "$f"
 done || true
 
-# CORRECTION CRITIQUE : supercall.c alloue le FD du driver via une variable fd_flags
-# Mon sed d'origine a pu en retirer O_CLOEXEC. On force le bit à l'allocation.
+# supercall.c alloue le FD du driver via une variable fd_flags : on force le bit.
 SC="$KSU_DIR/supercall/supercall.c"
 if [ -f "$SC" ]; then
     sed -i 's/get_unused_fd_flags(fd_flags)/get_unused_fd_flags(fd_flags | O_CLOEXEC)/' "$SC"
@@ -999,7 +998,7 @@ static bool add_filename_trans(struct policydb *db, const char *s, const char *t
           'void ksu_destroy_sepolicy(struct selinux_policy *pol) { (void)pol; }\n'
           'struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)\n'
           '{\n    (void)old_pol;\n    return ERR_PTR(-EOPNOTSUPP);\n}\n#endif\n')
-    if oc in c and '#else\n/* 4.19 : pas de struct sel_policy' not in c:
+    if oc in c and '#else\n/* 4.19 : pas de struct selinux_policy' not in c:
         c = c.replace(oc, nc, 1)
 
     if c != o:
@@ -1014,38 +1013,77 @@ for dp,dn,fn in os.walk(KS):
             c=c.replace('#include <linux/minmax.h>','/* KSU_MINMAX_COMPAT */\n#include <linux/kernel.h>',1)
             write(p,c); total+=1
 
-# ==================== FIX SELINUX_HIDE 4.19 ====================
-python3 - "$KSU_DIR/feature/selinux_hide.c" <<'PYEOF'
-import sys, re
+# FIX 12 : selinux_hide.c — layout 4.19 + argument selinux_state
+p = os.path.join(KS,"feature/selinux_hide.c")
+if os.path.isfile(p):
+    c = read(p); o = c
 
-p = sys.argv[1]
-try:
-    with open(p, "r", encoding="utf-8", errors="replace") as f:
-        c = f.read()
-except Exception as e:
-    print(f"  ⚠️ Could not read {p}: {e}")
-    sys.exit(0)
+    # 12a. remplacements AVANT insertion du bloc compat (évite macro auto-référente)
+    c = c.replace('mutex_lock(&selinux_state.status_lock);','ksu_status_lock();')
+    c = c.replace('mutex_unlock(&selinux_state.status_lock);','ksu_status_unlock();')
+    c = c.replace('selinux_state.status_page','ksu_status_page')
 
-# 1. Renommer la fonction wrapper pour éviter l'erreur "conflicting types"
-c = re.sub(r'(\bstatic\s+int\s+)security_context_to_sid_live\s*\(', r'\1ksu_sec_ctx_to_sid_live(', c)
+    # 12b. bloc compat
+    compat=("/* ==== Compat 4.19 ==== */\n#include <linux/version.h>\n"
+      "#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n"
+      "#define KSU_SELINUX_HIDE_BACKUP 0\nstruct selinux_policy *backup_sepolicy;\n"
+      "#define symtab_search(s,name) hashtab_search(&(s)->table, name)\n"
+      "#define ksu_status_lock()   mutex_lock(&selinux_state.ss->status_lock)\n"
+      "#define ksu_status_unlock() mutex_unlock(&selinux_state.ss->status_lock)\n"
+      "#define ksu_status_page     (selinux_state.ss->status_page)\n#else\n"
+      "#define KSU_SELINUX_HIDE_BACKUP 1\n"
+      "#define ksu_status_lock()   mutex_lock(&selinux_state.status_lock)\n"
+      "#define ksu_status_unlock() mutex_unlock(&selinux_state.status_lock)\n"
+      "#define ksu_status_page     (selinux_state.status_page)\n#endif\n\n")
+    if 'KSU_SELINUX_HIDE_BACKUP' not in c:
+        c = c.replace('static DEFINE_MUTEX(selinux_hide_mutex);',
+                      compat+'static DEFINE_MUTEX(selinux_hide_mutex);',1)
 
-# 2. Corriger l'appel interne de ce wrapper s'il existe
-c = c.replace('return security_context_to_sid(ctx, ctxlen, sid, gfp);', 
-              'return security_context_to_sid(&selinux_state, ctx, ctxlen, sid, gfp);')
-c = c.replace('return security_context_to_sid(ctx, ctxlen, sid);', 
-              'return security_context_to_sid(&selinux_state, ctx, ctxlen, sid);')
+    # 12c. neutraliser le chemin backup (inexistant en 4.19)
+    od="void ksu_selinux_hide_drop_backup_if_unused()\n{\n    mutex_lock(&selinux_hide_mutex);"
+    nd="void ksu_selinux_hide_drop_backup_if_unused()\n{\n#if KSU_SELINUX_HIDE_BACKUP\n    mutex_lock(&selinux_hide_mutex);"
+    if od in c and nd not in c: c=c.replace(od,nd,1)
+    ot="    mutex_unlock(&selinux_hide_mutex);\n}\n\n/*\n * Caveat:  Mutates scontext."
+    nt="    mutex_unlock(&selinux_hide_mutex);\n#endif\n}\n\n#if KSU_SELINUX_HIDE_BACKUP\n/*\n * Caveat:  Mutates scontext."
+    if ot in c and nt not in c: c=c.replace(ot,nt,1)
 
-# 3. Corriger TOUS les autres appels à ces fonctions SELinux en ajoutant &selinux_state,
-# Cela gère le backport de LineageOS 4.19 où 'state' est le premier argument.
-c = re.sub(r'\bsecurity_context_to_sid\((?!&selinux_state,)', r'security_context_to_sid(&selinux_state, ', c)
-c = re.sub(r'\bsecurity_sid_to_context\((?!&selinux_state,)', r'security_sid_to_context(&selinux_state, ', c)
-c = re.sub(r'\bsecurity_compute_av_user\((?!&selinux_state,)', r'security_compute_av_user(&selinux_state, ', c)
+    # 12d. stubs des variantes _with_policy (absentes en 4.19)
+    stub=("\n#else\n\nstatic int security_context_to_sid_with_policy(struct selinux_policy *p, const char *s, u32 sl,\n"
+      "    u32 *sid, u32 dsid, gfp_t g, u32 *osid, int *orc)\n{\n    if (osid) *osid = SECSID_NULL;\n"
+      "    if (orc) *orc = -EOPNOTSUPP;\n    return -EOPNOTSUPP;\n}\n\n"
+      "static int security_sid_to_context_with_policy(struct selinux_policy *p, u32 sid, char **s, u32 *sl)\n"
+      "{\n    if (s) *s = NULL;\n    *sl = 0;\n    return -EOPNOTSUPP;\n}\n\n"
+      "static void security_compute_av_user_with_policy(struct selinux_policy *p, u32 ssid, u32 tsid, u16 tc, struct av_decision *avd)\n"
+      "{\n    avd->allowed = 0; avd->auditallow = 0; avd->auditdeny = 0xffffffff; avd->seqno = 0; avd->flags = 0;\n}\n"
+      "#endif /* KSU_SELINUX_HIDE_BACKUP */\n")
+    if 'KSU_SELINUX_HIDE_BACKUP' in c and not c.rstrip().endswith('#endif /* KSU_SELINUX_HIDE_BACKUP */'):
+        c = c.rstrip('\n')+'\n'+stub
 
-with open(p, "w", encoding="utf-8") as f:
-    f.write(c)
+    # 12e. 4.19 : ces fonctions prennent 'struct selinux_state *' en 1er argument.
+    #      On n'ajoute l'argument qu'aux APPELS, jamais aux prototypes/définitions.
+    #      Les variantes _live / _with_policy ne sont PAS touchées (ancrage sur '(').
+    SEL_FNS = ('security_context_to_sid',
+               'security_context_to_sid_default',
+               'security_context_to_sid_force',
+               'security_sid_to_context',
+               'security_sid_to_context_force',
+               'security_compute_av',
+               'security_compute_av_user')
+    outl = []
+    for line in c.split('\n'):
+        s = line.strip()
+        if (s.startswith('extern') or s.startswith('int security_')
+                or s.startswith('void security_') or s.startswith('static int security_')
+                or s.startswith('static void security_')):
+            outl.append(line); continue
+        for fname in SEL_FNS:
+            line = re.sub(r'\b' + fname + r'\((?!&selinux_state)',
+                          fname + '(&selinux_state, ', line)
+        outl.append(line)
+    c = '\n'.join(outl)
 
-print("  ✅ selinux_hide.c: patched for 4.19 selinux_state backport")
-PYEOF
+    if c != o:
+        write(p,c); total+=1; print("  ✅ selinux_hide.c 4.19 (compat + selinux_state)")
 
 # ===== FIX 13 : INJECTION DES 2 HOOKS PREINIT =====
 p = os.path.join(KR,"fs/exec.c")
@@ -1064,7 +1102,6 @@ if os.path.isfile(p):
                  '#endif\n')
             start = c.index(sig)
             c = c[:start] + ext + c[start:]
-            # délimiter le corps de la fonction
             bstart = c.index(sig)
             i = c.index('{', bstart); depth = 0; bend = -1
             while i < len(c):
@@ -1075,18 +1112,15 @@ if os.path.isfile(p):
                 i+=1
             if bend > 0:
                 body = c[bstart:bend+1]
-                # 1. variable preinit_fd
                 if 'bool is_su_session = false;' in body:
                     body = body.replace('bool is_su_session = false;',
                                         'bool is_su_session = false;\n\tint preinit_fd = 0;',1)
                 else:
                     body = body.replace('\tint retval;', '\tint retval;\n#ifdef CONFIG_KSU_SUSFS\n\tint preinit_fd = 0;\n#endif',1)
-                # 2. setup : après le bloc sucompat (label orig_flow)
                 if 'orig_flow:\n#endif' in body:
                     body = body.replace('orig_flow:\n#endif',
                         'orig_flow:\n#endif\n#ifdef CONFIG_KSU_SUSFS\n'
                         '\tpreinit_fd = ksu_setup_preinit_file(&filename, &argv);\n#endif',1)
-                # 3. post : AVANT chaque putname(filename) (succès ET erreur)
                 put = '\tif (filename)\n\t\tputname(filename);'
                 post=('#ifdef CONFIG_KSU_SUSFS\n'
                       '\tif (unlikely(preinit_fd > 0))\n'
@@ -1107,49 +1141,18 @@ if os.path.isfile(p):
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
 
-# --- GOLDEN : Correction complète selinux_hide.c pour 4.19 ---
-HIDE="$KSU_DIR/feature/selinux_hide.c"
-if [ -f "$HIDE" ]; then
-  python3 - "$HIDE" <<'PY'
-import sys, re
-p = sys.argv[1]
-c = open(p, encoding="utf-8", errors="replace").read()
-if "KSU_SELINUX_419_PATCHED" in c:
-    raise SystemExit(0)
-
-# 1. Corriger les appels aux fonctions SELinux qui ont reçu un backport de l'argument 'state'
-c = re.sub(r'security_context_to_sid\((?!&selinux_state)', r'security_context_to_sid(&selinux_state, ', c)
-c = re.sub(r'security_sid_to_context\((?!&selinux_state)', r'security_sid_to_context(&selinux_state, ', c)
-
-# 2. Remplacer ou commenter toute définition existante de security_context_to_sid_live pour éviter "conflicting types"
-c = re.sub(
-    r'(^static int security_context_to_sid_live\s*\([^)]+\)\s*\{.*?\n\})',
-    r'/* COMMENTED FOR 4.19 COMPAT: \1 */',
-    c,
-    flags=re.MULTILINE | re.DOTALL
-)
-
-# 3. Injecter le stub correct
-stub = """
-/* KSU_SELINUX_419_PATCHED */
-#include <linux/version.h>
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
-static int security_context_to_sid_live(const char *ctx, u32 ctxlen, u32 *sid, gfp_t gfp)
+# --- DIAG : prototypes SELinux réels + appels de selinux_hide.c ---
+set +e
 {
-	return security_context_to_sid(&selinux_state, ctx, ctxlen, sid, gfp);
-}
-#endif
-"""
-
-last = 0
-for m in re.finditer(r'#include\s+[<"].*?[>"]\s*\n', c):
-    last = m.end()
-c = (c[:last] + stub + c[last:]) if last else stub + c
-
-open(p, "w", encoding="utf-8").write(c)
-print("  ✅ selinux_hide.c : corrigé pour la compatibilité 4.19 (arguments selinux_state et stub unique)")
-PY
-fi
+  echo "### Prototypes SELinux du noyau (security.h) ###"
+  grep -nE "int security_context_to_sid|int security_sid_to_context|void security_compute_av" \
+      security/selinux/include/security.h 2>/dev/null | head -25
+  echo
+  echo "### selinux_hide.c : appels SELinux après patch ###"
+  grep -nE "security_context_to_sid|security_sid_to_context|security_compute_av|_live" \
+      drivers/kernelsu/feature/selinux_hide.c 2>/dev/null | head -40
+} >> "$SPEC" 2>&1
+set -e
 
 # Verdict immédiat du validateur
 echo "=== VERDICT check_susfs_inline.sh ===" | tee -a "$AUDIT"
@@ -1180,7 +1183,7 @@ for o in KSU KSU_HOOK_SUSFS_INLINE KSU_SUSFS KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MO
          COMPAT COMPAT_32BIT_TIME ; do
     ../scripts/config --set-val CONFIG_$o y
 done
-# CORRECTION CRITIQUE : désactiver KSU_DEBUG pour retirer la règle shell->su
+# Désactiver KSU_DEBUG : retire la règle shell->su et la bannière DEBUG
 ../scripts/config --set-val CONFIG_KSU_DEBUG n
 ../scripts/config --set-val CONFIG_KSU_HOOK_TRACEPOINT n
 cd ..
@@ -1192,7 +1195,6 @@ make O=out LLVM=1 $CC_ARGS CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CRO
 [ -f out/usr/include/linux/unistd.h ] && echo "✅ UAPI headers OK (preinit actif)" | tee -a "$AUDIT"
 
 # 4.19 n'a pas include/uapi/linux/mount.h (ajouté en 5.2).
-# Le runner nolibc l'inclut => shim minimal. MS_* sont dans uapi/linux/fs.h en 4.19.
 if [ ! -f out/usr/include/linux/mount.h ]; then
 cat > out/usr/include/linux/mount.h <<'MNTSHIM'
 #ifndef _LINUX_MOUNT_H
@@ -1204,7 +1206,6 @@ MNTSHIM
 echo "✅ shim out/usr/include/linux/mount.h créé" | tee -a "$AUDIT"
 fi
 
-# Diag : ce que le runner attend réellement de ce header
 set +e
 {
   echo "### nolibc/sys/mount.h ###"
