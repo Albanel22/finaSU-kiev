@@ -12,7 +12,7 @@ FINASU_EXPECTED_HASH="${FINASU_EXPECTED_HASH:-}"
 VER="finasu-A"
 KSUD_FALLBACK_REF="${KSUD_FALLBACK_REF:-v3.4.2}"
 
-REPO_RAW="https://raw.githubusercontent.com/Albanel22/finaSU-kiev/finaSU-kiev-Qwen2/patches"
+REPO_RAW="https://raw.githubusercontent.com/Albanel22/finaSU-kiev/finaSU-Grok4-Latest/patches"
 
 echo "=== Build FinaSU ($FINASU_REF) — 4.19 + SuSFS + INLINE + preinit ==="
 df -h
