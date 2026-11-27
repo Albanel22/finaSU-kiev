@@ -964,7 +964,9 @@ static bool add_filename_trans(struct policydb *db, const char *s, const char *t
         ebitmap_set_bit(&db->role_val_to_struct[i]->types, value - 1, 1);
     }
     return true;
-    }
+}
+'''
+    
             wrapped = orig_func.replace(
                 'static bool add_type(struct policydb *db, const char *type_name, bool attr)\n{',
                 'static bool add_type_5_10(struct policydb *db, const char *type_name, bool attr)\n{', 1)
