@@ -235,7 +235,7 @@ curl -fL --retry 3 "$REPO_RAW/susfs_inline_hook_patches" -o "$HOOK_SH" || true
 if [ ! -s "$HOOK_SH" ] || ! grep -q "ksu_handle_execveat" "$HOOK_SH"; then
     echo "❌ script de hooks inline absent/invalide"; exit 1
 fi
-sed -i '/^    security\/selinux\/hooks\.c$/d' "$HOOK_SH"
+sed -i '/^[[:space:]]*security\/selinux\/hooks\.c[[:space:]]*$/d' "$HOOK_SH"
 echo "=== Application des hooks inline ===" | tee -a "$AUDIT"
 set +e; bash "$HOOK_SH" 2>&1 | tee -a "$AUDIT"; set -e
 
@@ -581,7 +581,7 @@ RULESEOF
 echo "✅ rules.c dual-path" | tee -a "$AUDIT"
 
 # ==================== 4b. FIX 4.19 + INJECTION PREINIT ====================
-python3 - "$GITHUB_WORKSPACE" <<'FIXEOF' 2>&1 | tee -a "$AUDIT"
+cat > "$GITHUB_WORKSPACE/patches/fix419.py" <<'FIXEOF'
 import os, sys, re
 GW = sys.argv[1]
 KR = os.path.join(GW, "kernel_sources")
@@ -988,19 +988,15 @@ static bool add_filename_trans(struct policydb *db, const char *s, const char *t
     if old in c and new not in c:
         c = c.replace(old, new, 1)
 
-    # 9e. ksu_destroy_sepolicy / ksu_dup_sepolicy
+        # 9e. ksu_destroy_sepolicy / ksu_dup_sepolicy
     old = ('void ksu_destroy_sepolicy(struct selinux_policy *pol)\n{\n    policydb_destroy(&pol->policydb);\n'
            '    kfree(pol);\n}\n\nstruct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)\n{')
     if old in c and '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\nvoid ksu_destroy_sepolicy' not in c:
         c = c.replace(old, '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n' + old, 1)
     oc = 'out_free_data:\n    kvfree(data);\n\n    return ERR_PTR(ret);\n}\n'
-        nc = (oc + '#else\n'
+    nc = (oc + '#else\n'
           '/* 4.19 : pas de struct selinux_policy ; policydb modifie en place dans rules.c */\n'
-          'void ksu_destroy_sepolicy(struct selinux_policy *pol) {\n'
-          '    if (!pol) return;\n'
-          '    policydb_destroy(&pol->policydb);\n'
-          '    kfree(pol);\n'
-          '}\n'
+          'void ksu_destroy_sepolicy(struct selinux_policy *pol) { (void)pol; }\n'
           'struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)\n'
           '{\n    (void)old_pol;\n    return ERR_PTR(-EOPNOTSUPP);\n}\n#endif\n')
     if oc in c and '#else\n/* 4.19 : pas de struct selinux_policy' not in c:
@@ -1073,6 +1069,10 @@ if os.path.isfile(p):
 
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
+
+python3 -c "import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)" \
+    "$GITHUB_WORKSPACE/patches/fix419.py"
+python3 "$GITHUB_WORKSPACE/patches/fix419.py" "$GITHUB_WORKSPACE" 2>&1 | tee -a "$AUDIT"
 
 # ==================== 4c. PORTAGE SELINUX (fichier externe) ====================
 FIXSEL="$GITHUB_WORKSPACE/patches/fix_selinux.py"
