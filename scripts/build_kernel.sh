@@ -964,8 +964,7 @@ static bool add_filename_trans(struct policydb *db, const char *s, const char *t
         ebitmap_set_bit(&db->role_val_to_struct[i]->types, value - 1, 1);
     }
     return true;
-}
-'''
+    }
             wrapped = orig_func.replace(
                 'static bool add_type(struct policydb *db, const char *type_name, bool attr)\n{',
                 'static bool add_type_5_10(struct policydb *db, const char *type_name, bool attr)\n{', 1)
@@ -995,7 +994,11 @@ static bool add_filename_trans(struct policydb *db, const char *s, const char *t
     oc = 'out_free_data:\n    kvfree(data);\n\n    return ERR_PTR(ret);\n}\n'
     nc = (oc + '#else\n'
           '/* 4.19 : pas de struct selinux_policy ; policydb modifié en place dans rules.c */\n'
-          'void ksu_destroy_sepolicy(struct selinux_policy *pol) { (void)pol; }\n'
+          void ksu_destroy_sepolicy(struct selinux_policy *pol) {
+    if (!pol) return;
+    policydb_destroy(&pol->policydb);
+    kfree(pol);
+}\n'
           'struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)\n'
           '{\n    (void)old_pol;\n    return ERR_PTR(-EOPNOTSUPP);\n}\n#endif\n')
     if oc in c and '#else\n/* 4.19 : pas de struct selinux_policy' not in c:
@@ -1013,82 +1016,82 @@ for dp,dn,fn in os.walk(KS):
             c=c.replace('#include <linux/minmax.h>','/* KSU_MINMAX_COMPAT */\n#include <linux/kernel.h>',1)
             write(p,c); total+=1
 
-# FIX 12 : selinux_hide.c — layout 4.19 + argument selinux_state
+# FIX 11b : alias de type partage (avant tout usage)
+p = os.path.join(KS,"selinux/selinux.h")
+if os.path.isfile(p):
+    c = read(p)
+    if 'KSU_SELINUX_POLICY_ALIAS' not in c:
+        write(p, ('/* KSU_SELINUX_POLICY_ALIAS */\n#include <linux/version.h>\n'
+                  '#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n'
+                  '#define selinux_policy selinux_ss\n#endif\n\n') + c)
+        total+=1; print("  ✅ selinux.h : alias selinux_policy->selinux_ss")
+
+# FIX 12 : selinux_hide.c — ponts 4.19, implémentations ACTIVES
 p = os.path.join(KS,"feature/selinux_hide.c")
 if os.path.isfile(p):
     c = read(p); o = c
-
-    # 12a. remplacements AVANT insertion du bloc compat (évite macro auto-référente)
-    c = c.replace('mutex_lock(&selinux_state.status_lock);','ksu_status_lock();')
-    c = c.replace('mutex_unlock(&selinux_state.status_lock);','ksu_status_unlock();')
-    c = c.replace('selinux_state.status_page','ksu_status_page')
-
-    # 12b. bloc compat
-    compat=("/* ==== Compat 4.19 ==== */\n#include <linux/version.h>\n"
-      "#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n"
-      "#define KSU_SELINUX_HIDE_BACKUP 0\nstruct selinux_policy *backup_sepolicy;\n"
-      "#define symtab_search(s,name) hashtab_search(&(s)->table, name)\n"
-      "#define ksu_status_lock()   mutex_lock(&selinux_state.ss->status_lock)\n"
-      "#define ksu_status_unlock() mutex_unlock(&selinux_state.ss->status_lock)\n"
-      "#define ksu_status_page     (selinux_state.ss->status_page)\n#else\n"
-      "#define KSU_SELINUX_HIDE_BACKUP 1\n"
-      "#define ksu_status_lock()   mutex_lock(&selinux_state.status_lock)\n"
-      "#define ksu_status_unlock() mutex_unlock(&selinux_state.status_lock)\n"
-      "#define ksu_status_page     (selinux_state.status_page)\n#endif\n\n")
-    if 'KSU_SELINUX_HIDE_BACKUP' not in c:
+    if 'KSU_SELINUX_419' not in c:
+        c = c.replace('mutex_lock(&selinux_state.status_lock);','ksu_status_lock();')
+        c = c.replace('mutex_unlock(&selinux_state.status_lock);','ksu_status_unlock();')
+        c = c.replace('selinux_state.status_page','ksu_status_page')
+        c = c.replace('rcu_dereference(selinux_state.policy)','KSU_LIVE_POLICY()')
+        c = c.replace('&policydb->type_attr_map_array[scontext->type - 1]',
+                      'ksu_type_attr_map(policydb, scontext->type - 1)')
+        c = c.replace('&policydb->type_attr_map_array[tcontext->type - 1]',
+                      'ksu_type_attr_map(policydb, tcontext->type - 1)')
+        c = c.replace('policydb->type_val_to_struct[scontext->type - 1]',
+                      'ksu_type_val_to_struct(policydb, scontext->type - 1)')
+        c = c.replace('policydb->type_val_to_struct[tcontext->type - 1]',
+                      'ksu_type_val_to_struct(policydb, tcontext->type - 1)')
+        # sidtab_entry / sid2str : absents en 4.19
+        c = re.sub(r'^([ \t]*)static int sidtab_entry_to_string\(',
+                   r'#if !KSU_SELINUX_419\n\1static int sidtab_entry_to_string(',
+                   c, count=1, flags=re.M)
+        c = re.sub(r'(sidtab_sid2str_put\(sidtab, entry, \*scontext, \*scontext_len\);\s*\n\s*return rc;\s*\n\})',
+                   r'\1\n#endif /* !KSU_SELINUX_419 */', c, count=1)
+        c = c.replace('struct sidtab_entry *entry;',
+                      '#if !KSU_SELINUX_419\n    struct sidtab_entry *entry;\n#endif')
+        c = c.replace('entry = sidtab_search_entry(sidtab, sid);',
+                      '#if KSU_SELINUX_419\n'
+                      '    {\n        struct context *c419 = sidtab_search(sidtab, sid);\n'
+                      '        if (!c419) { rc = -EINVAL; goto out_unlock; }\n'
+                      '        rc = context_struct_to_string(policydb, c419, scontext, scontext_len);\n'
+                      '    }\n#else\n'
+                      '    entry = sidtab_search_entry(sidtab, sid);')
+        c = c.replace('rc = sidtab_entry_to_string(policydb, sidtab, entry, scontext, scontext_len);',
+                      'rc = sidtab_entry_to_string(policydb, sidtab, entry, scontext, scontext_len);\n#endif')
+        compat = (
+          '/* ==== KSU_SELINUX_419 ==== */\n#include <linux/version.h>\n'
+          '#include <linux/flex_array.h>\n'
+          '#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n'
+          '#define KSU_SELINUX_419 1\n'
+          'extern struct selinux_policy *backup_sepolicy;\n'
+          '#define symtab_search(s,name) hashtab_search(&(s)->table, name)\n'
+          '#define ksu_status_lock()   mutex_lock(&selinux_state.ss->status_lock)\n'
+          '#define ksu_status_unlock() mutex_unlock(&selinux_state.ss->status_lock)\n'
+          '#define ksu_status_page     (selinux_state.ss->status_page)\n'
+          '#define KSU_LIVE_POLICY()   (selinux_state.ss)\n'
+          '#define ksu_type_attr_map(p,i) ((struct ebitmap *)flex_array_get((p)->type_attr_map_array,(i)))\n'
+          '#define ksu_type_val_to_struct(p,i) ((struct type_datum *)flex_array_get_ptr((p)->type_val_to_struct_array,(i)))\n'
+          '#else\n#define KSU_SELINUX_419 0\n'
+          '#define ksu_status_lock()   mutex_lock(&selinux_state.status_lock)\n'
+          '#define ksu_status_unlock() mutex_unlock(&selinux_state.status_lock)\n'
+          '#define ksu_status_page     (selinux_state.status_page)\n'
+          '#define KSU_LIVE_POLICY()   rcu_dereference(selinux_state.policy)\n'
+          '#define ksu_type_attr_map(p,i) (&(p)->type_attr_map_array[(i)])\n'
+          '#define ksu_type_val_to_struct(p,i) ((p)->type_val_to_struct[(i)])\n'
+          '#endif\n\n')
         c = c.replace('static DEFINE_MUTEX(selinux_hide_mutex);',
-                      compat+'static DEFINE_MUTEX(selinux_hide_mutex);',1)
-
-    # 12c. neutraliser le chemin backup (inexistant en 4.19)
-    od="void ksu_selinux_hide_drop_backup_if_unused()\n{\n    mutex_lock(&selinux_hide_mutex);"
-    nd="void ksu_selinux_hide_drop_backup_if_unused()\n{\n#if KSU_SELINUX_HIDE_BACKUP\n    mutex_lock(&selinux_hide_mutex);"
-    if od in c and nd not in c: c=c.replace(od,nd,1)
-    ot="    mutex_unlock(&selinux_hide_mutex);\n}\n\n/*\n * Caveat:  Mutates scontext."
-    nt="    mutex_unlock(&selinux_hide_mutex);\n#endif\n}\n\n#if KSU_SELINUX_HIDE_BACKUP\n/*\n * Caveat:  Mutates scontext."
-    if ot in c and nt not in c: c=c.replace(ot,nt,1)
-
-    # 12d. stubs des variantes _with_policy (absentes en 4.19)
-    stub=("\n#else\n\nstatic int security_context_to_sid_with_policy(struct selinux_policy *p, const char *s, u32 sl,\n"
-      "    u32 *sid, u32 dsid, gfp_t g, u32 *osid, int *orc)\n{\n    if (osid) *osid = SECSID_NULL;\n"
-      "    if (orc) *orc = -EOPNOTSUPP;\n    return -EOPNOTSUPP;\n}\n\n"
-      "static int security_sid_to_context_with_policy(struct selinux_policy *p, u32 sid, char **s, u32 *sl)\n"
-      "{\n    if (s) *s = NULL;\n    *sl = 0;\n    return -EOPNOTSUPP;\n}\n\n"
-      "static void security_compute_av_user_with_policy(struct selinux_policy *p, u32 ssid, u32 tsid, u16 tc, struct av_decision *avd)\n"
-      "{\n    avd->allowed = 0; avd->auditallow = 0; avd->auditdeny = 0xffffffff; avd->seqno = 0; avd->flags = 0;\n}\n\n"
-      "/* 4.19 : definition manquante de _live (l'originale est dans la branche >=5.10).\n"
-      " * Signature alignee sur la declaration en tete de fichier : 3 params, sans gfp. */\n"
-      "static int security_context_to_sid_live(const char *scontext, u32 scontext_len, u32 *sid)\n"
-      "{\n    return security_context_to_sid(&selinux_state, scontext, scontext_len, sid, GFP_KERNEL);\n}\n"
-      "#endif /* KSU_SELINUX_HIDE_BACKUP */\n")
-    if 'KSU_SELINUX_HIDE_BACKUP' in c and not c.rstrip().endswith('#endif /* KSU_SELINUX_HIDE_BACKUP */'):
-        c = c.rstrip('\n')+'\n'+stub
-
-    # 12e. 4.19 : ces fonctions prennent 'struct selinux_state *' en 1er argument.
-    #      On n'ajoute l'argument qu'aux APPELS, jamais aux prototypes/définitions.
-    #      Les variantes _live / _with_policy ne sont PAS touchées (ancrage sur '(').
-    SEL_FNS = ('security_context_to_sid',
-               'security_context_to_sid_default',
-               'security_context_to_sid_force',
-               'security_sid_to_context',
-               'security_sid_to_context_force',
-               'security_compute_av',
-               'security_compute_av_user')
-    outl = []
-    for line in c.split('\n'):
-        s = line.strip()
-        if (s.startswith('extern') or s.startswith('int security_')
-                or s.startswith('void security_') or s.startswith('static int security_')
-                or s.startswith('static void security_')):
-            outl.append(line); continue
-        for fname in SEL_FNS:
-            line = re.sub(r'\b' + fname + r'\((?!&selinux_state)',
-                          fname + '(&selinux_state, ', line)
-        outl.append(line)
-    c = '\n'.join(outl)
-
+                      compat + 'static DEFINE_MUTEX(selinux_hide_mutex);', 1)
+        # garde-fou exporte : les hooks noyau ne peuvent pas voir backup_sepolicy
+        helper = ('/* KSU_HIDE_READY_419 : garde-fou pour les hooks noyau */\n'
+                  'bool ksu_selinux_hide_ready(void)\n{\n'
+                  '\treturn ksu_selinux_hide_enabled && backup_sepolicy;\n}\n\n')
+        c = c.replace('ssize_t my_write_context(struct file *file, char *buf, size_t size)',
+                      helper + 'ssize_t my_write_context(struct file *file, char *buf, size_t size)', 1)
     if c != o:
-        write(p,c); total+=1; print("  ✅ selinux_hide.c 4.19 (compat + selinux_state)")
-
+        write(p,c); total+=1; print("  ✅ selinux_hide.c : ponts 4.19, implémentations actives")
+        
 # ===== FIX 13 : INJECTION DES 2 HOOKS PREINIT =====
 p = os.path.join(KR,"fs/exec.c")
 if os.path.isfile(p):
@@ -1144,6 +1147,60 @@ if os.path.isfile(p):
 
 print(f"  ✅ portage 4.19 : {total} fichier(s)")
 FIXEOF
+
+# ==================== FIX 14 : HOOKS SELINUX MANQUANTS ====================
+python3 - "$GITHUB_WORKSPACE" <<'HK' 2>&1 | tee -a "$AUDIT"
+import os, re, sys
+KR = os.path.join(sys.argv[1], "kernel_sources")
+def rd(p):
+    with open(p, encoding='utf-8', errors='replace') as f: return f.read()
+def wr(p,c):
+    with open(p,'w',encoding='utf-8') as f: f.write(c)
+
+# hooks.c : selinux_setprocattr -> my_setprocattr
+p = os.path.join(KR,"security/selinux/hooks.c")
+if os.path.isfile(p):
+    c = rd(p); o = c
+    if 'KSU_HOOK_SETPROCATTR_419' not in c:
+        m = re.search(r'^static int selinux_setprocattr\(struct task_struct \*p,', c, re.M)
+        if m:
+            d = ('#ifdef CONFIG_KSU_SUSFS\n/* KSU_HOOK_SETPROCATTR_419 */\n'
+                 'extern bool ksu_selinux_hide_ready(void);\n'
+                 'extern int my_setprocattr(const char *name, void *value, size_t size);\n#endif\n')
+            c = c[:m.start()] + d + c[m.start():]
+            c = c.replace('char *str = value;',
+                'char *str = value;\n#ifdef CONFIG_KSU_SUSFS\n'
+                '\tif (p == current && current_uid().val >= 10000 &&\n'
+                '\t    !strcmp(name, "current") && ksu_selinux_hide_ready())\n'
+                '\t\treturn my_setprocattr(name, value, size);\n#endif\n', 1)
+            wr(p,c); print("  ✅ hooks.c : my_setprocattr branché")
+        else:
+            print("  ❌ hooks.c : signature selinux_setprocattr introuvable")
+
+# selinuxfs.c : sel_write_context / sel_write_access -> my_write_*
+p = os.path.join(KR,"security/selinux/selinuxfs.c")
+if os.path.isfile(p):
+    c = rd(p); o = c
+    if 'KSU_HOOK_SELINUXFS_419' not in c:
+        d = ('\n#ifdef CONFIG_KSU_SUSFS\n/* KSU_HOOK_SELINUXFS_419 */\n'
+             'extern bool ksu_selinux_hide_ready(void);\n'
+             'extern ssize_t my_write_context(struct file *file, char *buf, size_t size);\n'
+             'extern ssize_t my_write_access(struct file *file, char *buf, size_t size);\n#endif\n')
+        last = 0
+        for mm in re.finditer(r'^#include[^\n]*\n', c, re.M): last = mm.end()
+        c = c[:last] + d + c[last:]
+        n = 0
+        for fn, mine in (('sel_write_context','my_write_context'),
+                         ('sel_write_access','my_write_access')):
+            pat = r'(static ssize_t ' + fn + r'\(struct file \*file, char \*buf, size_t size\)\s*\n\{)'
+            rep = (r'\1' + '\n#ifdef CONFIG_KSU_SUSFS\n'
+                   '\tif (current_uid().val >= 10000 && ksu_selinux_hide_ready())\n'
+                   '\t\treturn ' + mine + '(file, buf, size);\n#endif\n')
+            c2 = re.sub(pat, rep, c, count=1)
+            if c2 != c: c = c2; n += 1
+            else: print("  ❌ selinuxfs.c : " + fn + " introuvable")
+        wr(p,c); print(f"  ✅ selinuxfs.c : {n}/2 hooks branchés")
+HK
 
 # --- DIAG : prototypes SELinux réels + appels de selinux_hide.c ---
 set +e
