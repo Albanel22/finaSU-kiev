@@ -12,7 +12,7 @@ FINASU_EXPECTED_HASH="${FINASU_EXPECTED_HASH:-}"
 VER="finasu-A"
 KSUD_FALLBACK_REF="${KSUD_FALLBACK_REF:-v3.4.2}"
 
-REPO_RAW="https://raw.githubusercontent.com/Albanel22/finaSU-kiev/finaSU-Qwen-Duck/patches"
+REPO_RAW="https://raw.githubusercontent.com/Albanel22/finaSU-kiev/finaSU-Qwen-Duck2/patches"
 
 echo "=== Build FinaSU ($FINASU_REF) — 4.19 + SuSFS + INLINE + preinit (CORRIGÉ) ==="
 df -h
@@ -1076,7 +1076,7 @@ python3 "$GITHUB_WORKSPACE/patches/fix419.py" "$GITHUB_WORKSPACE" 2>&1 | tee -a 
 
 # ==================== 4c. PORTAGE SELINUX (fichier externe) ====================
 FIXSEL="$GITHUB_WORKSPACE/patches/fix_selinux.py"
-curl -fL --retry 3 "$REPO_RAW/fix_selinux.py" -o "$FIXSEL"
+curl -fL --retry 3 "https://raw.githubusercontent.com/Albanel22/finaSU-kiev/finaSU-Qwen-Duck2/patches/fix_selinux.py" -o "$FIXSEL"
 python3 -c "import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)" "$FIXSEL"
 python3 "$FIXSEL" "$GITHUB_WORKSPACE" 2>&1 | tee -a "$AUDIT"
 
