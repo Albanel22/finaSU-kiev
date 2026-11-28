@@ -1076,14 +1076,17 @@ python3 "$GITHUB_WORKSPACE/patches/fix419.py" "$GITHUB_WORKSPACE" 2>&1 | tee -a 
 
 # ==================== 4c. PORTAGE SELINUX (fichier externe) ====================
 FIXSEL="$GITHUB_WORKSPACE/patches/fix_selinux.py"
-curl -fL --retry 3 "https://raw.githubusercontent.com/Albanel22/finaSU-kiev/finaSU-Qwen-Duck2/patches/fix_selinux.py" -o "$FIXSEL"
+curl -fL --retry 3 "$REPO_RAW/fix_selinux.py?v=$(date +%s)" -o "$FIXSEL"
+
+# Garde-fou : échouer en 5 s si le fichier n'est pas à jour
 if grep -q 'hashtab_search(&(s)->table' "$FIXSEL"; then
-    echo "❌ fix_selinux.py OBSOLÈTE sur GitHub (macro avec '&'). Poussez la version corrigée." | tee -a "$AUDIT"
+    echo "❌ fix_selinux.py OBSOLÈTE (macro avec '&')" | tee -a "$AUDIT"
     exit 1
 fi
 echo "✅ fix_selinux.py à jour (macro sans '&')" | tee -a "$AUDIT"
+
 python3 -c "import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)" "$FIXSEL"
-python3 "$FIXSEL" "$GITHUB_WORKSPACE" 2>&1 | tee -a "$AFIXSEL"
+python3 "$FIXSEL" "$GITHUB_WORKSPACE" 2>&1 | tee -a "$AUDIT"
 
 # ==================== FIX 14 : HOOKS SELINUX MANQUANTS ====================
 python3 - "$GITHUB_WORKSPACE" <<'HK' 2>&1 | tee -a "$AUDIT"
