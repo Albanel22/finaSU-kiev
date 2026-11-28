@@ -5,7 +5,7 @@ GITHUB_WORKSPACE="${GITHUB_WORKSPACE:-$PWD}"
 export GITHUB_WORKSPACE
 
 FINASU_URL="${FINASU_URL:-https://github.com/LyraVoid/FinaSU.git}"
-FINASU_REF="${FINASU_REF:-v1.6.4}"
+FINASU_REF="${FINASU_REF:-latest}"
 KERNEL_PIN="${KERNEL_PIN:-9426323c2acd0865fd565a6dd8a9f39f831cbec3}"
 FINASU_EXPECTED_SIZE="${FINASU_EXPECTED_SIZE:-}"
 FINASU_EXPECTED_HASH="${FINASU_EXPECTED_HASH:-}"
@@ -19,7 +19,7 @@ df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
 DTBO_GDRIVE_ID="11451aa0CCzyVtNTYOK2n6oH6E0PT-2NX"
-MGR_GDRIVE_ID="11gKehkaCHKPAYbjOcVDx1IIvNc_2t4j9"
+MGR_GDRIVE_ID="1IwM0KkOPp_DgkI6k5MN2Eb-kydTLdxA5"
 
 mkdir -p "$GITHUB_WORKSPACE/output" "$GITHUB_WORKSPACE/patches"
 AUDIT="$GITHUB_WORKSPACE/output/audit-${VER}.txt"
@@ -1080,7 +1080,7 @@ curl -fL --retry 3 "https://raw.githubusercontent.com/Albanel22/finaSU-kiev/fina
 python3 -c "import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)" "$FIXSEL"
 python3 "$FIXSEL" "$GITHUB_WORKSPACE" 2>&1 | tee -a "$AUDIT"
 
-# ==================== 4c2. FIX SELINUX_HIDE.C POUR 4.19 ====================
+# ==================== 4c2. FIX SELINUX_HIDE.C POUR 4.19 (HASHTAB + ALIAS) ====================
 cat > "$GITHUB_WORKSPACE/patches/fix_selinux_hide_419.py" <<'FIXHIDE'
 import os, sys, re
 
@@ -1104,7 +1104,6 @@ c = rd(p); o = c
 
 # === 1. Forcer l'inclusion de selinux.h qui contient le define selinux_policy -> selinux_ss ===
 if '#include "../selinux/selinux.h"' not in c and '#include "selinux/selinux.h"' not in c:
-    # Insérer après le dernier #include existant
     lines = c.split('\n')
     last_inc = -1
     for i, l in enumerate(lines):
@@ -1118,8 +1117,6 @@ if '#include "../selinux/selinux.h"' not in c and '#include "selinux/selinux.h"'
     print("  ✅ selinux_hide.c : include selinux.h ajouté")
 
 # === 2. Corriger les pointeurs hashtab : en 4.19 symtab[] est un tableau inline ===
-#     policydb->symtab[SYM_TYPES] est de type struct hashtab (pas struct hashtab *)
-#     Donc &policydb->symtab[X] donne struct hashtab ** au lieu de struct hashtab *
 hashtab_fixes = [
     ('&policydb->symtab[SYM_TYPES]',   'policydb->symtab[SYM_TYPES]'),
     ('&policydb->symtab[SYM_ROLES]',   'policydb->symtab[SYM_ROLES]'),
@@ -1136,10 +1133,7 @@ for old, new in hashtab_fixes:
         c = c.replace(old, new)
         print(f"  ✅ selinux_hide.c : fix hashtab '{old}' -> '{new}' ({count} occurrences)")
 
-# === 3. Wrapper pour compatibilité selinux_policy* / selinux_ss* ===
-#     Les fonctions internes de selinux_hide.c prennent struct selinux_policy *
-#     mais en 4.19 backup_sepolicy est en fait un selinux_ss *.
-#     Le define dans selinux.h devrait suffire, mais ajoutons un guard explicite.
+# === 3. Guard explicite compat selinux_policy / selinux_ss ===
 guard = """/* KSU_SELINUX_HIDE_419_COMPAT */
 #include <linux/version.h>
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
@@ -1149,7 +1143,6 @@ guard = """/* KSU_SELINUX_HIDE_419_COMPAT */
 #endif
 """
 if 'KSU_SELINUX_HIDE_419_COMPAT' not in c:
-    # Insérer tout en haut du fichier (après SPDX si présent)
     spdx = re.search(r'(// SPDX-License-Identifier:[^\n]*\n)', c)
     pos = spdx.end() if spdx else 0
     c = c[:pos] + guard + c[pos:]
@@ -1164,7 +1157,7 @@ FIXHIDE
 
 python3 "$GITHUB_WORKSPACE/patches/fix_selinux_hide_419.py" "$GITHUB_WORKSPACE" 2>&1 | tee -a "$AUDIT"
 
-# ==================== 4d. FIX TYPES SELINUX_HIDE & SEPOLICY ====================
+# ==================== 4d. FIX TYPES SEPOLICY.C (ALIAS FORCE) ====================
 python3 - "$GITHUB_WORKSPACE" <<'FIXSEL2' 2>&1 | tee -a "$AUDIT"
 import os, sys, re
 
@@ -1177,38 +1170,10 @@ def rd(p):
 def wr(p, c):
     with open(p, 'w', encoding='utf-8') as f: f.write(c)
 
-# 1. Corriger selinux_hide.c : forcer l'include de selinux.h + fix hashtab
-p = os.path.join(KS, "feature/selinux_hide.c")
-if os.path.isfile(p):
-    c = rd(p); o = c
-    
-    # S'assurer que selinux.h (qui contient le define selinux_policy -> selinux_ss) est inclus
-    if '#include "../selinux/selinux.h"' not in c and '#include "selinux/selinux.h"' not in c:
-        c = c.replace('#include <linux/version.h>', 
-                      '#include <linux/version.h>\n#include "../selinux/selinux.h"', 1)
-        print("  ✅ selinux_hide.c : include selinux.h ajouté")
-
-    # Fix hashtab : retirer les '&' superflus devant policydb->symtab[...]
-    # En 4.19, symtab est un tableau inline, pas un pointeur
-    patterns = [
-        (r'&policydb->symtab\[SYM_TYPES\]', 'policydb->symtab[SYM_TYPES]'),
-        (r'&policydb->symtab\[SYM_ROLES\]', 'policydb->symtab[SYM_ROLES]'),
-        (r'&policydb->symtab\[SYM_CLASSES\]', 'policydb->symtab[SYM_CLASSES]'),
-        (r'&policydb->symtab\[SYM_COMMONS\]', 'policydb->symtab[SYM_COMMONS]'),
-    ]
-    for old, new in patterns:
-        if old in c:
-            c = c.replace(old, new)
-            print(f"  ✅ selinux_hide.c : fix hashtab {old} -> {new}")
-    
-    if c != o: wr(p, c)
-
-# 2. Corriger sepolicy.c : s'assurer que le define est actif AVANT toute utilisation
 p = os.path.join(KS, "selinux/sepolicy.c")
 if os.path.isfile(p):
     c = rd(p); o = c
     
-    # Le define doit être TOUT EN HAUT, avant tout include qui pourrait utiliser selinux_policy
     guard = """/* KSU_SELINUX_POLICY_ALIAS_FORCE */
 #include <linux/version.h>
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
@@ -1216,12 +1181,8 @@ if os.path.isfile(p):
 #endif
 """
     if 'KSU_SELINUX_POLICY_ALIAS_FORCE' not in c:
-        # Insérer après le premier commentaire SPDX/License si présent, sinon au début
         spdx = re.search(r'(// SPDX-License-Identifier:[^\n]*\n)', c)
-        if spdx:
-            pos = spdx.end()
-        else:
-            pos = 0
+        pos = spdx.end() if spdx else 0
         c = c[:pos] + guard + c[pos:]
         print("  ✅ sepolicy.c : alias selinux_policy forcé en tête")
     
@@ -1362,7 +1323,7 @@ set -e
 sed -i 's/if (!check_version(/if (0 \&\& !check_version(/g' kernel/module.c
 printf "\n#include <linux/notifier.h>\n#include <linux/module.h>\nstatic BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);\nint panel_register_notifier(struct notifier_block *nb){return blocking_notifier_chain_register(&motorola_panel_notifier_list,nb);}\nEXPORT_SYMBOL(panel_register_notifier);\nint panel_unregister_notifier(struct notifier_block *nb){return blocking_notifier_chain_unregister(&motorola_panel_notifier_list,nb);}\nEXPORT_SYMBOL(panel_unregister_notifier);\nvoid touch_set_state(int s){return;}\nEXPORT_SYMBOL(touch_set_state);\n" >> techpack/display/msm/msm_drv.c
 
-# ==================== 6b. VÉRIFICATION TYPES SELINUX ====================
+# ==================== 6b. VÉRIFICATION PRÉ-BUILD TYPES SELINUX ====================
 echo "=== Vérification pré-build types SELinux ===" | tee -a "$AUDIT"
 if grep -q "struct selinux_policy \*" drivers/kernelsu/feature/selinux_hide.c; then
     if ! grep -q "selinux_policy selinux_ss" drivers/kernelsu/feature/selinux_hide.c && \
@@ -1377,8 +1338,8 @@ if ! grep -q "selinux_policy selinux_ss" drivers/kernelsu/selinux/sepolicy.c; th
 fi
 echo "✅ Types SELinux vérifiés" | tee -a "$AUDIT"
 
-# Vérification pré-build selinux_hide.c
-echo "=== Vérification selinux_hide.c ===" | tee -a "$AUDIT"
+# Vérification pré-build hashtab
+echo "=== Vérification selinux_hide.c hashtab ===" | tee -a "$AUDIT"
 if grep -q '&policydb->symtab\[' drivers/kernelsu/feature/selinux_hide.c; then
     echo "❌ Il reste des &policydb->symtab[] non corrigés !" | tee -a "$AUDIT"
     grep -n '&policydb->symtab\[' drivers/kernelsu/feature/selinux_hide.c | tee -a "$AUDIT"
