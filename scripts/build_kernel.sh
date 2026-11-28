@@ -5,7 +5,7 @@ GITHUB_WORKSPACE="${GITHUB_WORKSPACE:-$PWD}"
 export GITHUB_WORKSPACE
 
 FINASU_URL="${FINASU_URL:-https://github.com/LyraVoid/FinaSU.git}"
-FINASU_REF="${FINASU_REF:-v1.6.4}"
+FINASU_REF="${FINASU_REF:-latest}"
 KERNEL_PIN="${KERNEL_PIN:-9426323c2acd0865fd565a6dd8a9f39f831cbec3}"
 FINASU_EXPECTED_SIZE="${FINASU_EXPECTED_SIZE:-}"
 FINASU_EXPECTED_HASH="${FINASU_EXPECTED_HASH:-}"
@@ -19,7 +19,7 @@ df -h
 
 BOOT_GDRIVE_ID="1AhWuM99TFBEBLHHPzJSjbSh3rKx7UGis"
 DTBO_GDRIVE_ID="11451aa0CCzyVtNTYOK2n6oH6E0PT-2NX"
-MGR_GDRIVE_ID="11gKehkaCHKPAYbjOcVDx1IIvNc_2t4j9"
+MGR_GDRIVE_ID="1IwM0KkOPp_DgkI6k5MN2Eb-kydTLdxA5"
 
 mkdir -p "$GITHUB_WORKSPACE/output" "$GITHUB_WORKSPACE/patches"
 AUDIT="$GITHUB_WORKSPACE/output/audit-${VER}.txt"
@@ -1145,6 +1145,69 @@ if os.path.isfile(p):
         wr(p,c); print(f"  ✅ selinuxfs.c : {n}/2 hooks branchés")
 HK
 
+# ==================== FIX 14b. HOOK SETPROCATTR TOLÉRANT ====================
+python3 - "$GITHUB_WORKSPACE" <<'HK2' 2>&1 | tee -a "$AUDIT"
+import os, re, sys
+p = os.path.join(sys.argv[1], "kernel_sources", "security/selinux/hooks.c")
+if not os.path.isfile(p):
+    print("  ❌ hooks.c absent"); sys.exit(0)
+c = open(p, encoding="utf-8", errors="replace").read()
+if "KSU_HOOK_SETPROCATTR_419" in c:
+    print("  ℹ️ hooks.c : hook déjà présent"); sys.exit(0)
+
+L = c.split("\n")
+print("  --- Diagnostic : lignes mentionnant selinux_setprocattr ---")
+for i, l in enumerate(L):
+    if "selinux_setprocattr" in l:
+        print("  L%d: %s" % (i + 1, l.rstrip()))
+
+# Recherche TOLÉRANTE : attributs optionnels (__nocfi...), nom de paramètre libre
+m = re.search(r"^static\s+int\s+(?:__\w+\s+)*selinux_setprocattr\s*\(", c, re.M)
+if not m:
+    m = re.search(r"^static[^\n;=]*\bselinux_setprocattr\s*\(", c, re.M)
+if not m:
+    print("  ❌ définition introuvable — voir diagnostic ci-dessus"); sys.exit(0)
+
+brace = c.index("{", c.index(")", m.start()))
+sig = c[m.start():brace]
+print("  ✅ signature : %s" % " ".join(sig.split()))
+
+# Le paramètre task_struct existe-t-il ? On adapte la condition.
+mp = re.search(r"struct\s+task_struct\s*\*\s*(\w+)", sig)
+cond = ("%s == current && " % mp.group(1)) if mp else ""
+
+# Fin du bloc de déclarations du corps
+TYPE = re.compile(r"^(struct|union|enum|const|unsigned|void|char|short|int|long|bool|"
+                  r"size_t|ssize_t|u8|u16|u32|u64|s8|s16|s32|s64|atomic_t|\w+_t)\b")
+body = brace + 1
+bl = c[body:].split("\n")
+last = -1
+for k, l in enumerate(bl):
+    s = l.strip()
+    if not s or s.startswith(("/*", "*", "//")):
+        continue
+    if s.endswith(";") and TYPE.match(s):
+        last = k; continue
+    break
+ins = body + len("\n".join(bl[:last + 1])) + 1 if last >= 0 else body
+
+decl = ("#ifdef CONFIG_KSU_SUSFS\n/* KSU_HOOK_SETPROCATTR_419 */\n"
+        "extern bool ksu_selinux_hide_ready(void);\n"
+        "extern int my_setprocattr(const char *name, void *value, size_t size);\n#endif\n")
+hook = ("\n#ifdef CONFIG_KSU_SUSFS\n"
+        "\tif (%s current_uid().val >= 10000 && !strcmp(name, \"current\") &&\n"
+        "\t    ksu_selinux_hide_ready())\n"
+        "\t\treturn my_setprocattr(name, value, size);\n#endif\n" % cond)
+
+c = c[:m.start()] + decl + c[m.start():]
+shift = len(decl)
+c = c[:ins + shift] + hook + c[
+
++ shift:]
+open(p, "w", encoding="utf-8").write(c)
+print("  ✅ hooks.c : my_setprocattr branché (condition : %s)" % (cond or "sans task_struct"))
+HK2
+
 # --- DIAG : prototypes SELinux réels + appels de selinux_hide.c ---
 set +e
 {
@@ -1235,6 +1298,12 @@ echo "✅ Compilation réussie"
 sha256sum out/arch/arm64/boot/Image | cut -d' ' -f1 > /tmp/khash.txt
 cp out/arch/arm64/boot/Image "$GITHUB_WORKSPACE/output/Image-${VER}"
 grep -E " (ksu_handle_|ksu_preinit|ksu_sucompat)" out/System.map | head -20 | tee -a "$AUDIT"
+
+echo "=== Vérification hooks SELinux-hide ===" | tee -a "$AUDIT"
+echo "setprocattr : $(grep -c 'KSU_HOOK_SETPROCATTR_419' security/selinux/hooks.c)" | tee -a "$AUDIT"
+echo "selinuxfs   : $(grep -c 'KSU_HOOK_SELINUXFS_419' security/selinux/selinuxfs.c)" | tee -a "$AUDIT"
+grep -E " (my_setprocattr|my_write_context|my_write_access|ksu_selinux_hide_ready|backup_sepolicy)$" \
+    out/System.map | tee -a "$AUDIT"
 
 # ==================== 8. KSUD ====================
 cd "$GITHUB_WORKSPACE"
