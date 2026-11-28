@@ -1078,12 +1078,15 @@ python3 "$GITHUB_WORKSPACE/patches/fix419.py" "$GITHUB_WORKSPACE" 2>&1 | tee -a 
 FIXSEL="$GITHUB_WORKSPACE/patches/fix_selinux.py"
 curl -fL --retry 3 "$REPO_RAW/fix_selinux.py?v=$(date +%s)" -o "$FIXSEL"
 
-# Garde-fou : échouer en 5 s si le fichier n'est pas à jour
-if grep -q 'hashtab_search(&(s)->table' "$FIXSEL"; then
-    echo "❌ fix_selinux.py OBSOLÈTE (macro avec '&')" | tee -a "$AUDIT"
+# Garde-fou PRÉCIS : on cible la ligne #define (colonne 0), pas les chaînes
+# de réparation ni les commentaires qui contiennent légitimement '&(s)->table'.
+if grep -q '^#define symtab_search(s, name) hashtab_search((s)->table, name)' "$FIXSEL"; then
+    echo "✅ fix_selinux.py à jour (macro sans '&')" | tee -a "$AUDIT"
+else
+    echo "❌ fix_selinux.py : macro symtab_search absente ou incorrecte" | tee -a "$AUDIT"
+    grep -n '^#define symtab_search' "$FIXSEL" | tee -a "$AUDIT"
     exit 1
 fi
-echo "✅ fix_selinux.py à jour (macro sans '&')" | tee -a "$AUDIT"
 
 python3 -c "import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)" "$FIXSEL"
 python3 "$FIXSEL" "$GITHUB_WORKSPACE" 2>&1 | tee -a "$AUDIT"
