@@ -1145,68 +1145,47 @@ if os.path.isfile(p):
         wr(p,c); print(f"  ✅ selinuxfs.c : {n}/2 hooks branchés")
 HK
 
-# ==================== FIX 14b. HOOK SETPROCATTR TOLÉRANT ====================
-python3 - "$GITHUB_WORKSPACE" <<'HK2' 2>&1 | tee -a "$AUDIT"
-import os, re, sys
-p = os.path.join(sys.argv[1], "kernel_sources", "security/selinux/hooks.c")
-if not os.path.isfile(p):
-    print("  ❌ hooks.c absent"); sys.exit(0)
-c = open(p, encoding="utf-8", errors="replace").read()
-if "KSU_HOOK_SETPROCATTR_419" in c:
-    print("  ℹ️ hooks.c : hook déjà présent"); sys.exit(0)
+# ==================== FIX 14b-RESTORE. RESTAURATION hooks.c ====================
+# FIX 14b a corrompu hooks.c. On restaure depuis git, puis on réapplique
+# UNIQUEMENT les hunks SUSFS concernant ce fichier (s'il y en a).
 
-L = c.split("\n")
-print("  --- Diagnostic : lignes mentionnant selinux_setprocattr ---")
-for i, l in enumerate(L):
-    if "selinux_setprocattr" in l:
-        print("  L%d: %s" % (i + 1, l.rstrip()))
+# 1. Sauvegarde + diagnostic de la région cassée (pour analyse)
+cp security/selinux/hooks.c "$GITHUB_WORKSPACE/output/hooks.c.corrompu" 2>/dev/null || true
+{
+  echo "=== Région endommagée (lignes 6315-6355) ==="
+  sed -n '6315,6355p' security/selinux/hooks.c
+} | tee -a "$AUDIT"
 
-# Recherche TOLÉRANTE : attributs optionnels (__nocfi...), nom de paramètre libre
-m = re.search(r"^static\s+int\s+(?:__\w+\s+)*selinux_setprocattr\s*\(", c, re.M)
-if not m:
-    m = re.search(r"^static[^\n;=]*\bselinux_setprocattr\s*\(", c, re.M)
-if not m:
-    print("  ❌ définition introuvable — voir diagnostic ci-dessus"); sys.exit(0)
+# 2. Restauration depuis le commit épinglé
+git checkout -- security/selinux/hooks.c
+echo "✅ hooks.c restauré depuis HEAD" | tee -a "$AUDIT"
 
-brace = c.index("{", c.index(")", m.start()))
-sig = c[m.start():brace]
-print("  ✅ signature : %s" % " ".join(sig.split()))
+# 3. Réappliquer les hunks SUSFS pour hooks.c uniquement (no-op si absents)
+set +e
+git apply --include='security/selinux/hooks.c' --whitespace=nowarn "$SUSFS_419_PATCH" 2>&1 | tee -a "$AUDIT"
+set -e
 
-# Le paramètre task_struct existe-t-il ? On adapte la condition.
-mp = re.search(r"struct\s+task_struct\s*\*\s*(\w+)", sig)
-cond = ("%s == current && " % mp.group(1)) if mp else ""
+# 4. Vérifications dures
+if grep -q "my_setprocattr\|KSU_HOOK_SETPROCATTR_419" security/selinux/hooks.c; then
+    echo "❌ Résidu KSU dans hooks.c après restauration" | tee -a "$AUDIT"
+    exit 1
+fi
+if git diff --quiet -- security/selinux/hooks.c; then
+    echo "✅ hooks.c pristine — état exact du build rc=0" | tee -a "$AUDIT"
+else
+    echo "ℹ️ hooks.c : patchs SUSFS légitimes réappliqués" | tee -a "$AUDIT"
+    git diff --stat -- security/selinux/hooks.c | tee -a "$AUDIT"
+fi
 
-# Fin du bloc de déclarations du corps
-TYPE = re.compile(r"^(struct|union|enum|const|unsigned|void|char|short|int|long|bool|"
-                  r"size_t|ssize_t|u8|u16|u32|u64|s8|s16|s32|s64|atomic_t|\w+_t)\b")
-body = brace + 1
-bl = c[body:].split("\n")
-last = -1
-for k, l in enumerate(bl):
-    s = l.strip()
-    if not s or s.startswith(("/*", "*", "//")):
-        continue
-    if s.endswith(";") and TYPE.match(s):
-        last = k; continue
-    break
-ins = body + len("\n".join(bl[:last + 1])) + 1 if last >= 0 else body
-
-decl = ("#ifdef CONFIG_KSU_SUSFS\n/* KSU_HOOK_SETPROCATTR_419 */\n"
-        "extern bool ksu_selinux_hide_ready(void);\n"
-        "extern int my_setprocattr(const char *name, void *value, size_t size);\n#endif\n")
-hook = ("\n#ifdef CONFIG_KSU_SUSFS\n"
-        "\tif (%s current_uid().val >= 10000 && !strcmp(name, \"current\") &&\n"
-        "\t    ksu_selinux_hide_ready())\n"
-        "\t\treturn my_setprocattr(name, value, size);\n#endif\n" % cond)
-
-c = c[:m.start()] + decl + c[m.start():]
-shift = len(decl)
-c = c[:ins + shift] + hook + c[
-
-+ shift:]
-open(p, "w", encoding="utf-8").write(c)
-print("  ✅ hooks.c : my_setprocattr branché (condition : %s)" % (cond or "sans task_struct"))
-HK2
+# 5. DIAGNOSTIC lecture seule : la vraie signature (pour un hook correct plus tard)
+{
+  echo "=== Occurrences de selinux_setprocattr ==="
+  grep -n "selinux_setprocattr" security/selinux/hooks.c
+} | tee -a "$AUDIT"
+LN=$(grep -n "^static.*selinux_setprocattr(" security/selinux/hooks.c | head -1 | cut -d: -f1)
+if [ -n "$LN" ]; then
+    { echo "=== Corps réel (25 lignes à partir de L$LN) ==="; sed -n "${LN},$((LN+25))p" security/selinux/hooks.c; } | tee -a "$AUDIT"
+fi
 
 # --- DIAG : prototypes SELinux réels + appels de selinux_hide.c ---
 set +e
