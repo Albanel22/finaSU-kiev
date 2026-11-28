@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """Portage SELinux-hide de FinaSU v1.6.4 vers LineageOS 4.19 (sm8250).
 Fonde sur la lecture de selinux_hide.c, ss/services.h et ss/policydb.h.
+
+CORRECTIONS :
+  - Noyau 4.19 : struct symtab { struct hashtab *table; } -> table est un
+    POINTEUR. La macro symtab_search doit utiliser (s)->table SANS '&'.
+    (Aligne sur FinaSU amont, sepolicy.c, guard < 5.9.0.)
+  - Alias selinux_policy -> selinux_ss force en tete de selinux_hide.c ET
+    sepolicy.c (sepolicy.c n'inclut pas selinux.h).
 """
 import os, re, sys
 
@@ -17,6 +24,21 @@ def wr(p, c):
     with open(p, "w", encoding="utf-8") as f:
         f.write(c)
 
+ALIAS_GUARD = ("/* KSU_SELINUX_POLICY_ALIAS_FORCE */\n"
+               "#include <linux/version.h>\n"
+               "#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n"
+               "#ifndef selinux_policy\n"
+               "#define selinux_policy selinux_ss\n"
+               "#endif\n"
+               "#endif\n")
+
+def prepend_guard(c):
+    if "KSU_SELINUX_POLICY_ALIAS_FORCE" in c:
+        return c
+    m = re.search(r"// SPDX-License-Identifier:[^\n]*\n", c)
+    pos = m.end() if m else 0
+    return c[:pos] + ALIAS_GUARD + c[pos:]
+
 # ---- A : alias de type. 4.19 n'a pas struct selinux_policy ; selinux_ss
 #         possede les trois champs utilises (sidtab, policydb, latest_granting).
 p = os.path.join(KS, "selinux/selinux.h")
@@ -26,7 +48,9 @@ if os.path.isfile(p):
         wr(p, "/* KSU_SELINUX_POLICY_ALIAS */\n"
               "#include <linux/version.h>\n"
               "#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n"
+              "#ifndef selinux_policy\n"
               "#define selinux_policy selinux_ss\n"
+              "#endif\n"
               "#endif\n\n" + c)
         n += 1
         print("  OK    selinux.h : alias selinux_policy -> selinux_ss")
@@ -81,7 +105,10 @@ if os.path.isfile(p):
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 #define KSU_SELINUX_419 1
 extern struct selinux_policy *backup_sepolicy;
-#define symtab_search(s, name) hashtab_search(&(s)->table, name)
+/* 4.19 : struct symtab { struct hashtab *table; } -> table est un POINTEUR.
+ * Surtout PAS de '&' : &(s)->table produirait un hashtab** (les 9 erreurs).
+ * Aligne sur FinaSU amont (sepolicy.c, guard < 5.9.0). */
+#define symtab_search(s, name) hashtab_search((s)->table, name)
 #define ksu_status_lock()   mutex_lock(&selinux_state.ss->status_lock)
 #define ksu_status_unlock() mutex_unlock(&selinux_state.ss->status_lock)
 #define ksu_status_page     (selinux_state.ss->status_page)
@@ -113,9 +140,15 @@ bool ksu_selinux_hide_ready(void)
 """
         c = c.replace("ssize_t my_write_context(struct file *file, char *buf, size_t size)",
                       helper + "ssize_t my_write_context(struct file *file, char *buf, size_t size)", 1)
+
+    # Reparation inconditionnelle : si un ancien portage a laisse le '&', on le retire.
+    c = c.replace("hashtab_search(&(s)->table, name)", "hashtab_search((s)->table, name)")
+    # Alias force en tete, avant tout prototype (idempotent).
+    c = prepend_guard(c)
+
     if c != o:
         wr(p, c); n += 1
-        print("  OK    selinux_hide.c : ponts 4.19, implementations actives")
+        print("  OK    selinux_hide.c : ponts 4.19 + macro symtab_search corrigee + alias")
 
 # ---- C : ksu_destroy_sepolicy doit vraiment detruire en 4.19
 p = os.path.join(KS, "selinux/sepolicy.c")
@@ -126,9 +159,12 @@ if os.path.isfile(p):
                   "    if (!pol) return;\n"
                   "    policydb_destroy(&pol->policydb);\n"
                   "    kfree(pol);\n}")
+    # sepolicy.c n'inclut PAS selinux.h : sans alias force ici,
+    # 'struct selinux_policy' reste incomplet au dereferencement (pol->policydb).
+    c = prepend_guard(c)
     if c != o:
         wr(p, c); n += 1
-        print("  OK    sepolicy.c : ksu_destroy_sepolicy reel")
+        print("  OK    sepolicy.c : ksu_destroy_sepolicy reel + alias force")
 
 # ---- D : moteur de backup dans rules.c
 p = os.path.join(KS, "selinux/rules.c")
@@ -307,5 +343,15 @@ if os.path.isfile(p):
                 print("  ECHEC selinuxfs.c : " + fn + " introuvable")
         wr(p, c); n += 1
         print("  OK    selinuxfs.c : %d/2 hooks branches" % got)
+
+# ---- Verification finale : la macro ne doit plus contenir de '&'
+p = os.path.join(KS, "feature/selinux_hide.c")
+if os.path.isfile(p):
+    c = rd(p)
+    if re.search(r"hashtab_search\(\s*&\s*\(s\)\s*->\s*table", c):
+        print("  ERREUR : macro symtab_search contient encore '&' !")
+        sys.exit(1)
+    n_calls = len(re.findall(r"\bsymtab_search\s*\(", c)) - 1
+    print("  OK    verification : macro sans '&', %d appels symtab_search (attendu 9)" % n_calls)
 
 print("  === fix_selinux : %d fichier(s) modifies ===" % n)
