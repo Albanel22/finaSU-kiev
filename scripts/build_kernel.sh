@@ -1080,6 +1080,72 @@ curl -fL --retry 3 "https://raw.githubusercontent.com/Albanel22/finaSU-kiev/fina
 python3 -c "import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)" "$FIXSEL"
 python3 "$FIXSEL" "$GITHUB_WORKSPACE" 2>&1 | tee -a "$AUDIT"
 
+# ==================== 4d. FIX TYPES SELINUX_HIDE & SEPOLICY ====================
+python3 - "$GITHUB_WORKSPACE" <<'FIXSEL2' 2>&1 | tee -a "$AUDIT"
+import os, sys, re
+
+GW = sys.argv[1]
+KR = os.path.join(GW, "kernel_sources")
+KS = os.path.join(KR, "FinaSU", "kernel")
+
+def rd(p):
+    with open(p, encoding='utf-8', errors='replace') as f: return f.read()
+def wr(p, c):
+    with open(p, 'w', encoding='utf-8') as f: f.write(c)
+
+# 1. Corriger selinux_hide.c : forcer l'include de selinux.h + fix hashtab
+p = os.path.join(KS, "feature/selinux_hide.c")
+if os.path.isfile(p):
+    c = rd(p); o = c
+    
+    # S'assurer que selinux.h (qui contient le define selinux_policy -> selinux_ss) est inclus
+    if '#include "../selinux/selinux.h"' not in c and '#include "selinux/selinux.h"' not in c:
+        c = c.replace('#include <linux/version.h>', 
+                      '#include <linux/version.h>\n#include "../selinux/selinux.h"', 1)
+        print("  ✅ selinux_hide.c : include selinux.h ajouté")
+
+    # Fix hashtab : retirer les '&' superflus devant policydb->symtab[...]
+    # En 4.19, symtab est un tableau inline, pas un pointeur
+    patterns = [
+        (r'&policydb->symtab\[SYM_TYPES\]', 'policydb->symtab[SYM_TYPES]'),
+        (r'&policydb->symtab\[SYM_ROLES\]', 'policydb->symtab[SYM_ROLES]'),
+        (r'&policydb->symtab\[SYM_CLASSES\]', 'policydb->symtab[SYM_CLASSES]'),
+        (r'&policydb->symtab\[SYM_COMMONS\]', 'policydb->symtab[SYM_COMMONS]'),
+    ]
+    for old, new in patterns:
+        if old in c:
+            c = c.replace(old, new)
+            print(f"  ✅ selinux_hide.c : fix hashtab {old} -> {new}")
+    
+    if c != o: wr(p, c)
+
+# 2. Corriger sepolicy.c : s'assurer que le define est actif AVANT toute utilisation
+p = os.path.join(KS, "selinux/sepolicy.c")
+if os.path.isfile(p):
+    c = rd(p); o = c
+    
+    # Le define doit être TOUT EN HAUT, avant tout include qui pourrait utiliser selinux_policy
+    guard = """/* KSU_SELINUX_POLICY_ALIAS_FORCE */
+#include <linux/version.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+#define selinux_policy selinux_ss
+#endif
+"""
+    if 'KSU_SELINUX_POLICY_ALIAS_FORCE' not in c:
+        # Insérer après le premier commentaire SPDX/License si présent, sinon au début
+        spdx = re.search(r'(// SPDX-License-Identifier:[^\n]*\n)', c)
+        if spdx:
+            pos = spdx.end()
+        else:
+            pos = 0
+        c = c[:pos] + guard + c[pos:]
+        print("  ✅ sepolicy.c : alias selinux_policy forcé en tête")
+    
+    if c != o: wr(p, c)
+
+print("  === fix_types_selinux terminé ===")
+FIXSEL2
+
 # ==================== FIX 14 : HOOKS SELINUX MANQUANTS ====================
 python3 - "$GITHUB_WORKSPACE" <<'HK' 2>&1 | tee -a "$AUDIT"
 import os, re, sys
@@ -1211,6 +1277,21 @@ set -e
 # ==================== 6. MOTOROLA ====================
 sed -i 's/if (!check_version(/if (0 \&\& !check_version(/g' kernel/module.c
 printf "\n#include <linux/notifier.h>\n#include <linux/module.h>\nstatic BLOCKING_NOTIFIER_HEAD(motorola_panel_notifier_list);\nint panel_register_notifier(struct notifier_block *nb){return blocking_notifier_chain_register(&motorola_panel_notifier_list,nb);}\nEXPORT_SYMBOL(panel_register_notifier);\nint panel_unregister_notifier(struct notifier_block *nb){return blocking_notifier_chain_unregister(&motorola_panel_notifier_list,nb);}\nEXPORT_SYMBOL(panel_unregister_notifier);\nvoid touch_set_state(int s){return;}\nEXPORT_SYMBOL(touch_set_state);\n" >> techpack/display/msm/msm_drv.c
+
+# ==================== 6b. VÉRIFICATION TYPES SELINUX ====================
+echo "=== Vérification pré-build types SELinux ===" | tee -a "$AUDIT"
+if grep -q "struct selinux_policy \*" drivers/kernelsu/feature/selinux_hide.c; then
+    if ! grep -q "selinux_policy selinux_ss" drivers/kernelsu/feature/selinux_hide.c && \
+       ! grep -q "#include.*selinux\.h" drivers/kernelsu/feature/selinux_hide.c; then
+        echo "❌ selinux_hide.c utilise selinux_policy sans alias ni include !" | tee -a "$AUDIT"
+        exit 1
+    fi
+fi
+if ! grep -q "selinux_policy selinux_ss" drivers/kernelsu/selinux/sepolicy.c; then
+    echo "❌ sepolicy.c : alias selinux_policy manquant en tête !" | tee -a "$AUDIT"
+    exit 1
+fi
+echo "✅ Types SELinux vérifiés" | tee -a "$AUDIT"
 
 # ==================== 7. COMPILATION ====================
 set +eo pipefail
