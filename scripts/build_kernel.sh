@@ -1077,99 +1077,13 @@ python3 "$GITHUB_WORKSPACE/patches/fix419.py" "$GITHUB_WORKSPACE" 2>&1 | tee -a 
 # ==================== 4c. PORTAGE SELINUX (fichier externe) ====================
 FIXSEL="$GITHUB_WORKSPACE/patches/fix_selinux.py"
 curl -fL --retry 3 "https://raw.githubusercontent.com/Albanel22/finaSU-kiev/finaSU-Qwen-Duck2/patches/fix_selinux.py" -o "$FIXSEL"
+if grep -q 'hashtab_search(&(s)->table' "$FIXSEL"; then
+    echo "❌ fix_selinux.py OBSOLÈTE sur GitHub (macro avec '&'). Poussez la version corrigée." | tee -a "$AUDIT"
+    exit 1
+fi
+echo "✅ fix_selinux.py à jour (macro sans '&')" | tee -a "$AUDIT"
 python3 -c "import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)" "$FIXSEL"
-python3 "$FIXSEL" "$GITHUB_WORKSPACE" 2>&1 | tee -a "$AUDIT"
-
-# ==================== 4c2. FIX MACRO symtab_search (CAUSE RACINE DES 9 ERREURS hashtab**) ====================
-# Noyau 4.19 : struct symtab { struct hashtab *table; } -> table est un POINTEUR.
-# FinaSU sepolicy.c utilise (s)->table [correct]. fix_selinux.py injecte &(s)->table [faux].
-# On corrige la macro APRÈS coup. Le '&' est dans la macro, PAS aux sites d'appel.
-python3 - "$GITHUB_WORKSPACE" <<'FIXMACRO' 2>&1 | tee -a "$AUDIT"
-import os, re, sys
-
-GW = sys.argv[1]
-KS = os.path.join(GW, "kernel_sources", "FinaSU", "kernel")
-
-def rd(p):
-    with open(p, encoding="utf-8", errors="replace") as f: return f.read()
-def wr(p, c):
-    with open(p, "w", encoding="utf-8") as f: f.write(c)
-
-# ---------- 1. selinux_hide.c : LA macro symtab_search ----------
-p = os.path.join(KS, "feature", "selinux_hide.c")
-if not os.path.isfile(p):
-    print("  ❌ selinux_hide.c introuvable"); sys.exit(1)
-c = rd(p); o = c
-
-bad  = "#define symtab_search(s, name) hashtab_search(&(s)->table, name)"
-good = "#define symtab_search(s, name) hashtab_search((s)->table, name)"
-if bad in c:
-    c = c.replace(bad, good)
-    print("  ✅ macro symtab_search : '&' supprimé (forme exacte)")
-else:
-    pat = re.compile(r"#define\s+symtab_search\(\s*s\s*,\s*name\s*\)\s+hashtab_search\(\s*&\s*\(s\)\s*->\s*table\s*,\s*name\s*\)")
-    if pat.search(c):
-        c = pat.sub(good, c)
-        print("  ✅ macro symtab_search : '&' supprimé (regex)")
-    elif re.search(r"#define\s+symtab_search\(", c):
-        print("  ℹ️ macro symtab_search déjà correcte")
-    else:
-        anchor = "#define KSU_SELINUX_419 1"
-        if anchor in c:
-            c = c.replace(anchor, anchor + "\n" + good, 1)
-            print("  ✅ macro symtab_search correcte injectée")
-        else:
-            print("  ❌ bloc compat KSU_SELINUX_419 absent — fix_selinux.py a-t-il tourné ?"); sys.exit(1)
-
-# symtab_insert : même traitement si présent (inoffensif)
-c = c.replace("hashtab_insert(&(s)->table, name, datum)",
-              "hashtab_insert((s)->table, name, datum)")
-
-# Guard alias en tête (filet de sécurité, idempotent)
-guard = ("/* KSU_SELINUX_HIDE_419_ALIAS */\n"
-         "#include <linux/version.h>\n"
-         "#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n"
-         "#ifndef selinux_policy\n"
-         "#define selinux_policy selinux_ss\n"
-         "#endif\n"
-         "#endif\n")
-if "KSU_SELINUX_HIDE_419_ALIAS" not in c:
-    m = re.search(r"// SPDX-License-Identifier:[^\n]*\n", c)
-    pos = m.end() if m else 0
-    c = c[:pos] + guard + c[pos:]
-
-if c != o: wr(p, c)
-
-# Vérification dure
-final = rd(p)
-if re.search(r"hashtab_search\(\s*&\s*\(s\)\s*->\s*table", final):
-    print("  ❌ Il reste un '&' dans la macro symtab_search !"); sys.exit(1)
-n = len(re.findall(r"\bsymtab_search\s*\(", final)) - 1  # -1 = la définition de la macro
-print(f"  ✅ selinux_hide.c : macro corrigée, {n} appels symtab_search() prêts (attendu : 9)")
-
-# ---------- 2. sepolicy.c : alias forcé en tête ----------
-# sepolicy.c n'inclut PAS selinux.h (vérifié dans FinaSU v1.6.4) : l'alias de
-# fix_selinux.py n'y est pas visible, or ksu_destroy_sepolicy() y déréférence pol->policydb.
-p = os.path.join(KS, "selinux", "sepolicy.c")
-if os.path.isfile(p):
-    c = rd(p)
-    guard = ("/* KSU_SELINUX_POLICY_ALIAS_FORCE */\n"
-             "#include <linux/version.h>\n"
-             "#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n"
-             "#ifndef selinux_policy\n"
-             "#define selinux_policy selinux_ss\n"
-             "#endif\n"
-             "#endif\n")
-    if "KSU_SELINUX_POLICY_ALIAS_FORCE" not in c:
-        m = re.search(r"// SPDX-License-Identifier:[^\n]*\n", c)
-        pos = m.end() if m else 0
-        wr(p, c[:pos] + guard + c[pos:])
-        print("  ✅ sepolicy.c : alias selinux_policy→selinux_ss forcé en tête")
-    else:
-        print("  ℹ️ sepolicy.c : alias déjà présent")
-
-print("  === fix_macro_symtab terminé ===")
-FIXMACRO
+python3 "$FIXSEL" "$GITHUB_WORKSPACE" 2>&1 | tee -a "$AFIXSEL"
 
 # ==================== FIX 14 : HOOKS SELINUX MANQUANTS ====================
 python3 - "$GITHUB_WORKSPACE" <<'HK' 2>&1 | tee -a "$AUDIT"
