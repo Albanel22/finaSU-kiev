@@ -1080,8 +1080,8 @@ curl -fL --retry 3 "https://raw.githubusercontent.com/Albanel22/finaSU-kiev/fina
 python3 -c "import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)" "$FIXSEL"
 python3 "$FIXSEL" "$GITHUB_WORKSPACE" 2>&1 | tee -a "$AUDIT"
 
-# ==================== 4c2. FIX SELINUX_HIDE.C POUR 4.19 (HASHTAB + ALIAS) ====================
-cat > "$GITHUB_WORKSPACE/patches/fix_selinux_hide_419.py" <<'FIXHIDE'
+# ==================== 4c2. FIX SELINUX_HIDE.C POUR 4.19 (ADAPTÉ AU SOURCE RÉEL) ====================
+cat > "$GITHUB_WORKSPACE/patches/fix_selinux_hide_419_final.py" <<'FIXHIDE_FINAL'
 import os, sys, re
 
 GW = sys.argv[1]
@@ -1101,8 +1101,31 @@ if not os.path.isfile(p):
     print("  ❌ selinux_hide.c introuvable"); sys.exit(1)
 
 c = rd(p); o = c
+changed = False
 
-# === 1. Forcer l'inclusion de selinux.h qui contient le define selinux_policy -> selinux_ss ===
+# ============================================================
+# 1. GUARD selinux_policy -> selinux_ss EN TOUTE PREMIÈRE POSITION
+#    Doit être AVANT tout #include qui pourrait référencer selinux_policy
+# ============================================================
+guard = """/* KSU_SELINUX_HIDE_419_COMPAT - MUST BE FIRST */
+#include <linux/version.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+#ifndef selinux_policy
+#define selinux_policy selinux_ss
+#endif
+#endif
+"""
+if 'KSU_SELINUX_HIDE_419_COMPAT' not in c:
+    # Insérer après SPDX si présent, sinon au tout début
+    spdx = re.search(r'(// SPDX-License-Identifier:[^\n]*\n)', c)
+    pos = spdx.end() if spdx else 0
+    c = c[:pos] + guard + c[pos:]
+    changed = True
+    print("  ✅ Guard selinux_policy->selinux_ss ajouté en tête")
+
+# ============================================================
+# 2. FORCER include selinux.h (contient le define canonique)
+# ============================================================
 if '#include "../selinux/selinux.h"' not in c and '#include "selinux/selinux.h"' not in c:
     lines = c.split('\n')
     last_inc = -1
@@ -1114,48 +1137,105 @@ if '#include "../selinux/selinux.h"' not in c and '#include "selinux/selinux.h"'
     else:
         lines.insert(0, '#include "../selinux/selinux.h"')
     c = '\n'.join(lines)
-    print("  ✅ selinux_hide.c : include selinux.h ajouté")
+    changed = True
+    print("  ✅ Include selinux.h ajouté")
 
-# === 2. Corriger les pointeurs hashtab : en 4.19 symtab[] est un tableau inline ===
-hashtab_fixes = [
-    ('&policydb->symtab[SYM_TYPES]',   'policydb->symtab[SYM_TYPES]'),
-    ('&policydb->symtab[SYM_ROLES]',   'policydb->symtab[SYM_ROLES]'),
-    ('&policydb->symtab[SYM_CLASSES]', 'policydb->symtab[SYM_CLASSES]'),
-    ('&policydb->symtab[SYM_COMMONS]', 'policydb->symtab[SYM_COMMONS]'),
-    ('&policydb->symtab[SYM_USERS]',   'policydb->symtab[SYM_USERS]'),
-    ('&policydb->symtab[SYM_BOOLS]',   'policydb->symtab[SYM_BOOLS]'),
-    ('&policydb->symtab[SYM_LEVELS]',  'policydb->symtab[SYM_LEVELS]'),
-    ('&policydb->symtab[SYM_CATS]',    'policydb->symtab[SYM_CATS]'),
+# ============================================================
+# 3. FIX type_attr_map_array : flex_array en 4.19
+#    &policydb->type_attr_map_array[X] → flex_array_get(policydb->type_attr_map_array, X)
+# ============================================================
+tam_pattern = r'&\s*policydb\s*->\s*type_attr_map_array\s*\[\s*([^]]+)\s*\]'
+tam_matches = re.findall(tam_pattern, c)
+if tam_matches:
+    c = re.sub(tam_pattern, r'(struct ebitmap *)flex_array_get(policydb->type_attr_map_array, \1)', c)
+    changed = True
+    print(f"  ✅ Fix type_attr_map_array flex_array ({len(tam_matches)} occurrences)")
+
+# ============================================================
+# 4. FIX type_val_to_struct : flex_array en 4.19
+#    policydb->type_val_to_struct[X] → flex_array_get_ptr(...)
+# ============================================================
+tvs_pattern = r'policydb\s*->\s*type_val_to_struct\s*\[\s*([^]]+)\s*\]'
+tvs_matches = re.findall(tvs_pattern, c)
+if tvs_matches:
+    c = re.sub(tvs_pattern, r'(struct type_datum *)flex_array_get_ptr(policydb->type_val_to_struct_array, \1)', c)
+    changed = True
+    print(f"  ✅ Fix type_val_to_struct flex_array ({len(tvs_matches)} occurrences)")
+
+# ============================================================
+# 5. FIX symtab_search(&pol->p_types, ...) → symtab_search(pol->p_types.table, ...)
+#    En 4.19 symtab_search prend un hashtab*, pas un symtab*
+#    MAIS pol->p_types est un struct symtab { struct hashtab table; ... }
+#    Donc &pol->p_types donne struct symtab* au lieu de struct hashtab*
+# ============================================================
+# Note: Dans FinaSU, symtab_search est défini comme macro ou wrapper.
+# Vérifions si le code utilise &pol->p_types directement avec hashtab_search
+st_patterns = [
+    (r'symtab_search\s*\(\s*&\s*(pol|policydb|orig_pol)\s*->\s*p_types\s*,', 
+     r'symtab_search(\1->p_types.table,'),
+    (r'symtab_search\s*\(\s*&\s*(pol|policydb|orig_pol)\s*->\s*p_roles\s*,',
+     r'symtab_search(\1->p_roles.table,'),
+    (r'symtab_search\s*\(\s*&\s*(pol|policydb|orig_pol)\s*->\s*p_users\s*,',
+     r'symtab_search(\1->p_users.table,'),
+    (r'symtab_search\s*\(\s*&\s*(pol|policydb|orig_pol)\s*->\s*p_classes\s*,',
+     r'symtab_search(\1->p_classes.table,'),
+    (r'symtab_search\s*\(\s*&\s*(pol|policydb|orig_pol)\s*->\s*p_bools\s*,',
+     r'symtab_search(\1->p_bools.table,'),
+    (r'symtab_search\s*\(\s*&\s*(pol|policydb|orig_pol)\s*->\s*p_levels\s*,',
+     r'symtab_search(\1->p_levels.table,'),
+    (r'symtab_search\s*\(\s*&\s*(pol|policydb|orig_pol)\s*->\s*p_cats\s*,',
+     r'symtab_search(\1->p_cats.table,'),
 ]
-for old, new in hashtab_fixes:
-    count = c.count(old)
-    if count > 0:
-        c = c.replace(old, new)
-        print(f"  ✅ selinux_hide.c : fix hashtab '{old}' -> '{new}' ({count} occurrences)")
+for pat, repl in st_patterns:
+    matches = re.findall(pat, c)
+    if matches:
+        c = re.sub(pat, repl, c)
+        changed = True
+        print(f"  ✅ Fix symtab_search &symtab→symtab.table ({len(matches)} occurrences)")
 
-# === 3. Guard explicite compat selinux_policy / selinux_ss ===
-guard = """/* KSU_SELINUX_HIDE_419_COMPAT */
-#include <linux/version.h>
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
-#ifndef selinux_policy
-#define selinux_policy selinux_ss
-#endif
-#endif
-"""
-if 'KSU_SELINUX_HIDE_419_COMPAT' not in c:
-    spdx = re.search(r'(// SPDX-License-Identifier:[^\n]*\n)', c)
-    pos = spdx.end() if spdx else 0
-    c = c[:pos] + guard + c[pos:]
-    print("  ✅ selinux_hide.c : guard compat 4.19 ajouté en tête")
+# ============================================================
+# 6. FIX role_val_to_struct[] : tableau inline en 4.19
+#    policydb->role_val_to_struct[val] est déjà correct (tableau de pointeurs)
+#    Pas de modification nécessaire
+# ============================================================
 
-if c != o:
+# ============================================================
+# 7. Ajout include flex_array.h si absent
+# ============================================================
+if '<linux/flex_array.h>' not in c:
+    lines = c.split('\n')
+    last_inc = -1
+    for i, l in enumerate(lines):
+        if l.strip().startswith('#include'):
+            last_inc = i
+    if last_inc >= 0:
+        lines.insert(last_inc + 1, '#include <linux/flex_array.h>')
+    c = '\n'.join(lines)
+    changed = True
+    print("  ✅ Include flex_array.h ajouté")
+
+# ============================================================
+# Écriture et vérification
+# ============================================================
+if changed:
     wr(p, c)
-    print("  ✅ selinux_hide.c : corrections 4.19 appliquées")
+    print("  ✅ selinux_hide.c : toutes corrections 4.19 appliquées")
 else:
     print("  ℹ️ selinux_hide.c : aucune modification nécessaire")
-FIXHIDE
 
-python3 "$GITHUB_WORKSPACE/patches/fix_selinux_hide_419.py" "$GITHUB_WORKSPACE" 2>&1 | tee -a "$AUDIT"
+# Vérifications post-fix
+remaining_tam = re.findall(r'&\s*policydb\s*->\s*type_attr_map_array\s*\[', c)
+if remaining_tam:
+    print(f"  ⚠️ ATTENTION: {len(remaining_tam)} '&type_attr_map_array[' résiduels!")
+
+remaining_tvs = re.findall(r'policydb\s*->\s*type_val_to_struct\s*\[', c)
+if remaining_tvs:
+    print(f"  ⚠️ ATTENTION: {len(remaining_tvs)} 'type_val_to_struct[' non convertis!")
+
+print("  === fix_selinux_hide_419_final terminé ===")
+FIXHIDE_FINAL
+
+python3 "$GITHUB_WORKSPACE/patches/fix_selinux_hide_419_final.py" "$GITHUB_WORKSPACE" 2>&1 | tee -a "$AUDIT"
 
 # ==================== 4d. FIX TYPES SEPOLICY.C (ALIAS FORCE) ====================
 python3 - "$GITHUB_WORKSPACE" <<'FIXSEL2' 2>&1 | tee -a "$AUDIT"
